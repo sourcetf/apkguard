@@ -87,11 +87,11 @@ var (
 // padMethodNames 是膨胀类使用的方法名（与字段名一起在所有类间复用，
 // 从而让新增的 method_ids 条目尽量少，同时类本身仍是「真实」的）。
 const (
-	padFieldInst = "f"
-	padFieldStat = "s"
-	padMethodGet = "a"
-	padMethodSet = "b"
-	padMethodSum = "c"
+	padFieldInst  = "f"
+	padFieldStat  = "s"
+	padMethodGet  = "a"
+	padMethodSet  = "b"
+	padMethodSum  = "c"
 	padMethodBump = "d"
 )
 

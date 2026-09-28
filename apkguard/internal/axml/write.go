@@ -46,7 +46,8 @@ type Edit struct {
 //
 // 代价是池可能不再有序，此时会如实清除 SORTED 标志
 // （清标志只会让系统退化为线性查找，不影响正确性；
-//  但错误地保留标志会让二分查找返回错误结果）。
+//
+//	但错误地保留标志会让二分查找返回错误结果）。
 func (f *File) Rewrite(edit Edit) ([]byte, error) {
 	if len(edit.Replace) == 0 && len(edit.SetAttr) == 0 {
 		return append([]byte(nil), f.data...), nil
@@ -149,9 +150,9 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 				continue
 			}
 			q := p.off - off
-			binary.LittleEndian.PutUint32(blob[q+8:], p.val) // Res_value 的 rawValue
-			binary.LittleEndian.PutUint16(blob[q+12:], 8)    // Res_value.size
-			blob[q+15] = TypeString                          // Res_value.dataType
+			binary.LittleEndian.PutUint32(blob[q+8:], p.val)  // Res_value 的 rawValue
+			binary.LittleEndian.PutUint16(blob[q+12:], 8)     // Res_value.size
+			blob[q+15] = TypeString                           // Res_value.dataType
 			binary.LittleEndian.PutUint32(blob[q+16:], p.val) // Res_value.data
 		}
 		if entries := insByOff[off]; len(entries) > 0 {

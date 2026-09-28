@@ -638,7 +638,9 @@ func (b *builder) remapEncodedArrayValues(off uint32) ([][]byte, error) {
 // 必须是完整的 encoded_value，不能只给类型字节：数值型的值还需要载荷字节
 // （例如 VALUE_INT 0 是 `04 00` 两个字节）。只给一个字节会让拼出的数组
 // 长度少 1 字节，解析时整体错位，ART 判
-//   "Bogus encoded_value value_type" 并拒绝整个 DEX
+//
+//	"Bogus encoded_value value_type" 并拒绝整个 DEX
+//
 // （真实案例：RustDesk 加固后 d1.dex 被拒，其内所有类都无法解析）。
 func defaultEncodedValue(desc string) []byte {
 	if desc == "" {

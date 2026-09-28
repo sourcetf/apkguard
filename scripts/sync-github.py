@@ -107,17 +107,24 @@ def main():
         if len(parts) != 2:
             continue
         meta, path = parts
-        mode, _, _ = meta.split()
-        files.append((path, mode))
+        mode, sha, _ = meta.split()
+        files.append((path, mode, sha))
     if not files:
         die("没有可同步的文件（检查 .gitignore）")
     print("文件数: %d" % len(files))
 
     # 1) 逐个上传 blob
+    #
+    # 内容**取自 git 对象库**（git cat-file blob <sha>），而不是直接读工作区文件。
+    # 这一点很关键：Windows 上 core.autocrlf=true 会让检出的文本文件变成 CRLF，
+    # 直接上传工作区内容会把 CRLF 带进仓库，shell 脚本因而无法执行——
+    # CI 会报 "set: pipefail: invalid option name"——bash 把行尾的回车符当成了选项的一部分。
+    # git 对象库里的内容已经过 .gitattributes 归一化，与 git push 完全一致。
     tree = []
-    for i, (path, mode) in enumerate(files, 1):
-        with open(path, "rb") as fh:
-            content = fh.read()
+    for i, (path, mode, sha) in enumerate(files, 1):
+        content = subprocess.run(
+            ["git", "cat-file", "blob", sha], capture_output=True, check=True
+        ).stdout
         blob = api("POST", "/repos/%s/%s/git/blobs" % (OWNER, REPO), {
             "content": base64.b64encode(content).decode("ascii"),
             "encoding": "base64",

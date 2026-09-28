@@ -136,7 +136,8 @@ func TestArtifactBranchTargets(t *testing.T) {
 // TestRealWorldBranchTargets 检查真实应用载荷的分支目标。
 //
 // 改写会平移指令，分支目标必须重算；算错时 ART 报
-//   "invalid branch target" 并拒绝整个类。
+//
+//	"invalid branch target" 并拒绝整个类。
 func TestRealWorldBranchTargets(t *testing.T) {
 	apk := os.Getenv("RD_APK")
 	if apk == "" {

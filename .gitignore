@@ -26,6 +26,7 @@
 # ---- apkguard：只保留源码 ----
 /apkguard/*.exe
 /apkguard/apkguard
+/apkguard/dist/
 /apkguard/*.txt
 /apkguard/*.err
 /apkguard/*.log

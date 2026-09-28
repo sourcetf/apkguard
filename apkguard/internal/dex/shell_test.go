@@ -8,11 +8,11 @@ import (
 // TestShellJavaName 验证描述符到 Java 点分名的转换。
 func TestShellJavaName(t *testing.T) {
 	cases := map[string]string{
-		"Lcom/a/B;":            "com.a.B",
-		"Lapkguard/App;":       "apkguard.App",
-		"Lfoo/bar/Baz$Qux;":    "foo.bar.Baz$Qux",
-		"Ljava/lang/Object;":   "java.lang.Object",
-		"LDefault;":            "Default",
+		"Lcom/a/B;":          "com.a.B",
+		"Lapkguard/App;":     "apkguard.App",
+		"Lfoo/bar/Baz$Qux;":  "foo.bar.Baz$Qux",
+		"Ljava/lang/Object;": "java.lang.Object",
+		"LDefault;":          "Default",
 	}
 	for in, want := range cases {
 		if got := ShellJavaName(in); got != want {

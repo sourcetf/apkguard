@@ -55,7 +55,7 @@ func TestDeriveMatchesNativeC(t *testing.T) {
 	if tcc == "" {
 		t.Skip("未找到 TCC，跳过 C/Go 派生一致性对拍（安装方式见 native/README.md）")
 	}
-	src := "apkguard.c"   // 与 derive.go 同目录
+	src := "apkguard.c" // 与 derive.go 同目录
 	if _, err := os.Stat(src); err != nil {
 		t.Skipf("找不到 C 源码 %s: %v", src, err)
 	}

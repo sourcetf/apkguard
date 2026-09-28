@@ -599,7 +599,7 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 
 	// ---- 5) 方法（按 class, name, proto 排序）----
 	type methodEntry struct {
-		old            uint32
+		old             uint32
 		cls, name, pkey string
 	}
 	var mentries []methodEntry
