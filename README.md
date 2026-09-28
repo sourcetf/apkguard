@@ -130,6 +130,49 @@ apkguard                     # 双击或直接运行 = 启动图形界面并自�
 - 加固会改变代码布局，**与依赖反射/签名的第三方框架可能存在兼容问题**；
   上生产前建议在目标机型上跑一遍完整回归。
 
+
+---
+
+## 持续集成
+
+工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，三个作业：
+
+| 作业 | 内容 | 触发 |
+|---|---|---|
+| **构建与测试** | gofmt、go vet、内嵌原生库检查、六平台交叉编译（linux/darwin/windows × amd64/arm64）、单元测试、CLI 冒烟测试 | 每次推送 / PR |
+| **端到端** | 装 Android SDK 构建工具 → 从源码构建测试 APK → 用 6 组功能集加固 → apksigner/zipalign 校验 → 生成签名摘要 → 跑产物级守卫 → 全量测试 | 每次推送 / PR |
+| **原生库重建** | 用 NDK 重新编译 3 个 ABI，校验 `.agexpect` 段，并对比仓库中的预编译库以检出「改了 C 代码却没更新 .so」 | 手动触发，或提交信息含 `[native]` |
+
+CLI 冒烟测试里有两条**行为断言**，而不只是「能跑起来」：
+
+- 启用未实现的功能项（如 A6）必须**报错**，而不是静默跳过——否则使用者会以为自己拿到了 VMP/控制流混淆等防护，实际完全没有；
+- 启用签名（E1）却不给密钥库时必须报错。
+
+产物：六平台二进制、加固后的 APK、3 个 ABI 的原生库（保留 14 天）。
+
+### 本地跑同一套检查
+
+GitHub Actions 可能因账号计费无法启动作业（注解会写
+`The job was not started because recent account payments have failed…`，
+注意 **Actions 对公开仓库免费**）。此时用本地 CI 获得同等门禁：
+
+```bash
+export ANDROID_HOME=/path/to/android-sdk     # 跑端到端需要，否则跳过该段
+bash scripts/ci-local.sh
+```
+
+### 两个踩过的 CI 坑（供参考）
+
+1. **`.c` 文件不能放在 Go 包目录里**。Go 会把包目录下的 `.c` 当成 cgo 源文件，
+   包内没有 `import "C"` 时直接报
+   `C source files not allowed when not using cgo or SWIG`。
+   更隐蔽的是它取决于 `CGO_ENABLED`（Linux 默认 1、Windows 默认 0），
+   于是同一份代码本地能过、CI 失败。现在 C 源码放在 `internal/native/csrc/`。
+2. **行尾必须是 LF**。Windows 上 `core.autocrlf=true` 会让检出的 shell 脚本带 CRLF，
+   bash 把行尾回车符当成选项的一部分，CI 报
+   `set: pipefail: invalid option name`。仓库已加 `.gitattributes` 强制 `eol=lf`；
+   同步脚本也从 git 对象库读取内容，避免把工作区的 CRLF 带进仓库。
+
 ---
 
 ## 构建
