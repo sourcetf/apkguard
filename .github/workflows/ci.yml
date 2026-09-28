@@ -15,7 +15,11 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: '1.22'
+  # 本项目不使用 cgo：原生库由 internal/native/build_native.py 用 NDK 交叉编译，
+  # 再通过 go:embed 打进二进制。显式关闭可避免平台差异
+  # （Linux 默认 1、Windows 默认 0），也避免 C 源码被当成 cgo 源文件处理。
+  CGO_ENABLED: '0'
+  GO_VERSION: '1.24'
   BUILD_TOOLS_VERSION: '34.0.0'
   PLATFORM_VERSION: 'android-34'
 

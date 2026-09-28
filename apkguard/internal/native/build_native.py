@@ -20,7 +20,15 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PREBUILT = os.path.join(HERE, "prebuilt")
-SRC = os.path.join(HERE, "apkguard.c")
+# 源码放在 csrc/ 子目录而不是包根目录。
+#
+# Go 工具链会把包目录下的 .c 文件当成 cgo 源文件：当包内没有 import "C" 时，
+# `go build`/`go vet` 会直接报错——
+#   "C source files not allowed when not using cgo or SWIG: apkguard.c"
+# 该行为还与 CGO_ENABLED 有关（Linux 上默认 1、Windows 上默认 0），
+# 因此同一份代码在本地能过、在 CI 上失败。放到子目录后 Go 不再扫描它，
+# 而本脚本仍按显式路径编译。
+SRC = os.path.join(HERE, "csrc", "apkguard.c")
 LIB = "libapkguard.so"
 
 # ABI -> NDK clang 目标三元组。API 24 与签名默认 minSdk 一致。
