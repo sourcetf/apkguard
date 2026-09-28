@@ -139,18 +139,17 @@ def main():
             print("  已上传 %d/%d" % (i, len(files)))
 
     # 2) 建 tree
-    base_tree = None
+    #
+    # **不传 base_tree**：GitHub 的 tree API 会把 base_tree 中「未被本请求覆盖」
+    # 的条目**保留**下来。那样一来，重命名或删除文件就不生效——旧路径会一直留在
+    # 远端（实测踩过：apkguard.c 移到 csrc/ 之后，远端同时存在两份）。
+    # 本脚本每次都上传全部文件，因此直接构建一棵完整的树最准确。
     ref = api("GET", "/repos/%s/%s/git/ref/heads/main" % (OWNER, REPO), ok=(200, 404))
     if ref and ref.get("object"):
-        parent = api("GET", "/repos/%s/%s/git/commits/%s" % (OWNER, REPO, ref["object"]["sha"]))
-        base_tree = parent.get("tree", {}).get("sha")
         print("原有 HEAD: %s" % ref["object"]["sha"][:12])
 
-    body = {"tree": tree}
-    if base_tree:
-        body["base_tree"] = base_tree
-    new_tree = api("POST", "/repos/%s/%s/git/trees" % (OWNER, REPO), body)
-    print("tree: %s" % new_tree["sha"][:12])
+    new_tree = api("POST", "/repos/%s/%s/git/trees" % (OWNER, REPO), {"tree": tree})
+    print("tree: %s（共 %d 个条目）" % (new_tree["sha"][:12], len(tree)))
 
     # 3) 建 commit
     commit_body = {"message": msg, "tree": new_tree["sha"]}
