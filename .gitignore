@@ -6,6 +6,9 @@
 
 /*
 
+# CI 工作流必须入库（根规则 /* 会把它挡住）
+!/.github/
+
 # 说明文档与设计文档
 !/.gitignore
 !/README.md
@@ -22,6 +25,7 @@
 
 # ---- apkguard：只保留源码 ----
 /apkguard/*.exe
+/apkguard/apkguard
 /apkguard/*.txt
 /apkguard/*.err
 /apkguard/*.log
@@ -29,6 +33,7 @@
 /apkguard/t/
 
 # ---- testapp：只保留源码（APK 与密钥库不入库）----
+/testapp/build/
 /testapp/*.apk
 /testapp/*.idsig
 /testapp/*.dex
@@ -66,3 +71,12 @@
 tmpwork/
 tmp/
 *.log
+
+# ---- 例外：native 库的预编译产物必须入库 ----
+#
+# embed.go 用 go:embed prebuilt/*/libapkguard.so 把它打进二进制，
+# 因此干净检出必须先有这些文件，否则 `go build` 直接失败：
+#   pattern prebuilt/*/libapkguard.so: no matching files found
+# 它们是我们自己的构建产物（3 个 ABI 合计 48 KB），属于构建输入，
+# 与「不提交二进制产物」的一般原则不冲突。
+!/apkguard/internal/native/prebuilt/*/libapkguard.so

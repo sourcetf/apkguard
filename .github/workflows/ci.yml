@@ -1,0 +1,245 @@
+name: CI
+
+# 触发条件：
+#   - 推送到 main
+#   - 任意 Pull Request
+#   - 手动触发（Actions 页面 Run workflow）
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 只读权限即可：CI 不写回仓库、不发布 Release
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.22'
+  BUILD_TOOLS_VERSION: '34.0.0'
+  PLATFORM_VERSION: 'android-34'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 作业 1：构建与单元测试（不依赖 Android SDK，跑得快）
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: 构建与测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: apkguard/go.sum
+
+      - name: gofmt 检查
+        working-directory: apkguard
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未通过 gofmt："
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "gofmt 通过"
+
+      - name: go vet
+        working-directory: apkguard
+        run: go vet ./...
+
+      # 内嵌的原生库是 go:embed 的构建输入，缺失会直接导致构建失败。
+      # 这一步专门守住「.so 没随仓库带上来」的情况。
+      - name: 检查内嵌原生库
+        run: |
+          missing=0
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            f="apkguard/internal/native/prebuilt/$abi/libapkguard.so"
+            if [ -f "$f" ]; then
+              printf "  %-14s %6d 字节\n" "$abi" "$(stat -c%s "$f")"
+            else
+              echo "::error::缺少 $f（go:embed 需要它）"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: 交叉编译（多平台）
+        working-directory: apkguard
+        run: |
+          set -e
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            ext=""; [ "$os" = windows ] && ext=".exe"
+            echo "-- $os/$arch"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w" \
+              -o "dist/apkguard-${os}-${arch}${ext}" ./cmd/apkguard
+          done
+          ls -lh dist
+
+      - name: 单元测试
+        working-directory: apkguard
+        run: go test ./... -count=1
+
+      - name: CLI 冒烟测试
+        working-directory: apkguard
+        run: |
+          set -e
+          BIN=./dist/apkguard-linux-amd64
+          chmod +x "$BIN"
+
+          echo "-- 功能项清单"
+          "$BIN" -list | head -6
+
+          # 用 scripts/count-features.py 解析而不是内联 grep：
+          # 默认启用标记是 U+221A（UTF-8 三字节），grep 的 . 是否按字符匹配依赖
+          # locale；且 -list 每个功能项占两行、描述里也会出现 ID，直接数行会错。
+          echo "-- 功能项数量应为 38"
+          n="$("$BIN" -list | python3 scripts/count-features.py)"
+          echo "   解析到 $n 项"
+          [ "$n" -eq 38 ] || { echo "::error::功能项数量不是 38（实际 $n）"; exit 1; }
+
+          # 未实现的功能项必须是显式错误，而不是静默跳过——
+          # 否则使用者会以为自己拿到了 VMP/控制流混淆等防护，实际完全没有。
+          echo "-- 未实现的功能项应被拒绝"
+          if printf 'x' > /tmp/fake.apk; then :; fi
+          out="$("$BIN" -in /tmp/fake.apk -enable A6 2>&1 || true)"
+          echo "$out" | head -3
+          echo "$out" | grep -q "A6" || { echo "::error::启用未实现的 A6 没有报错"; exit 1; }
+
+          echo "-- 缺密钥库时应报错"
+          if "$BIN" -in /tmp/fake.apk -enable E1 2>&1 | grep -q "密钥库"; then
+            echo "   正确报错"
+          else
+            echo "::error::缺少密钥库时未报错"; exit 1
+          fi
+
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: apkguard-binaries
+          path: apkguard/dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 作业 2：端到端（构建真实测试 APK → 加固 → 校验产物 → 产物级守卫）
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: 端到端（真实 APK 加固与校验）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: apkguard/go.sum
+
+      - name: 安装 Android SDK 构建工具
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;${{ env.PLATFORM_VERSION }} build-tools;${{ env.BUILD_TOOLS_VERSION }}'
+          log-accepted-android-sdk-licenses: false
+
+      - name: 确认工具就绪
+        run: |
+          for t in aapt2 d8 zipalign apksigner; do
+            p="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/$t"
+            [ -x "$p" ] && echo "  $t ✓" || { echo "::error::缺少 $t"; exit 1; }
+          done
+          java -version 2>&1 | head -1
+
+      # 1~7 步：构建测试 APK、加固 6 组功能集、校验签名与对齐、
+      # 生成签名摘要、跑产物级守卫、跑全量测试。
+      - name: 运行端到端验证
+        run: bash scripts/e2e.sh
+
+      - name: 上传加固产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardened-apks
+          path: |
+            deliver/*.apk
+            deliver/*.log
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 作业 3：用 NDK 重新编译原生库
+  #
+  # 只在 C 代码/构建脚本变动或手动触发时运行：NDK 下载约 1 GB、耗时较长。
+  # 目的是验证 build_native.py 与 apkguard.c 仍然可编译（3 个 ABI），
+  # 并检出「改了 C 代码却没更新 prebuilt 里的 .so」这种陈旧状态。
+  # ---------------------------------------------------------------------------
+  native:
+    name: 原生库重建（3 个 ABI）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[native]')
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: 安装 NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: 交叉编译原生库
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          python3 internal/native/build_native.py 2>&1 | tee /tmp/native.log || {
+            echo "::error::build_native.py 执行失败"; tail -30 /tmp/native.log; exit 1; }
+
+      - name: 校验产物与摘要回填
+        run: |
+          set -e
+          grep -E '字节|摘要' /tmp/native.log || true
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            f="apkguard/internal/native/prebuilt/$abi/libapkguard.so"
+            [ -s "$f" ] || { echo "::error::未生成 $f"; exit 1; }
+            # 必须含 .agexpect 段（C6 完整性自校验依赖它）
+            if grep -qa 'agexpect' "$f"; then
+              printf "  %-14s %6d 字节  .agexpect ✓\n" "$abi" "$(stat -c%s "$f")"
+            else
+              echo "::error::$abi 缺少 .agexpect 段"; exit 1
+            fi
+          done
+
+      - name: 对比仓库中的预编译库（检测陈旧）
+        run: |
+          set -e
+          if git diff --quiet -- apkguard/internal/native/prebuilt/; then
+            echo "预编译库与本次构建一致 ✓"
+          else
+            echo "::warning::prebuilt 中的 .so 与重新编译的结果不同——"
+            echo "若刚改过 apkguard.c / build_native.py，请提交更新后的 .so。"
+            git --no-pager diff --stat -- apkguard/internal/native/prebuilt/ || true
+          fi
+
+      - name: 上传原生库
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs
+          path: apkguard/internal/native/prebuilt/**/*.so
+          retention-days: 14
