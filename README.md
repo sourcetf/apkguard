@@ -149,6 +149,40 @@ python internal/native/build_native.py       # 需要 Android NDK；输出 3 个
 > 注意：`.so` 通过 `go:embed` 打进二进制，因此**改了 C 代码必须先跑 build_native.py
 > 再 go build**，顺序反了会用到旧库。
 
+
+---
+
+## 同步到 GitHub
+
+本机到 `github.com:443` 的 git 传输不稳定（`Connection was reset` /
+`Empty reply from server`），而 `api.github.com` 可用。
+因此仓库提供了一个**走 Git Data API 的同步脚本**，效果与 `git push` 等价：
+
+```bash
+export GITHUB_TOKEN=<有 repo 权限的 PAT>     # 不要写进文件
+python scripts/sync-github.py -m "提交信息"
+```
+
+脚本流程：`git add -A` → 必要时本地提交 → 逐个文件上传 blob →
+建 tree → 建 commit（父提交取远端 HEAD）→ 移动 `refs/heads/main`。
+每个请求都带重试，适配不稳定的网络。
+
+也可在 git 端口可用时直接 `git push`，两者不冲突。
+
+## 仓库内容约定
+
+本目录是一个 7 GB 的研发工作区（含 Android SDK / NDK / Go 工具链、61 个 APK、
+大量逆向分析产物），但**只有源码与文档入库**（约 1.1 MB）：
+
+- 入库：`apkguard/`（Go 源码）、`testapp/src/`（测试应用源码）、设计文档、实测记录、同步脚本
+- 不入库：`tools/`（工具链，GB 级）、`*.apk` / `*.dex` / `*.so`（二进制产物）、
+  密钥库（`*.jks` / `*.pfx`，含私钥）、分析临时产物
+
+过滤规则见 [`.gitignore`](.gitignore)——采用「先全部忽略、再逐个放行」的写法。
+
+> 密钥库不入库：复现签名流程请自行生成，例如
+> `keytool -genkeypair -keystore test.jks -alias test -keyalg RSA -keysize 2048 -validity 3650 -storepass 123456`
+
 ---
 
 ## 法律与用途
