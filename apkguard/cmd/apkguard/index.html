@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>apkguard · APK 加固工作台</title>
+<style>
+  :root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--line:#2a2f3a;--fg:#e6e9ef;
+        --dim:#9aa3b2;--accent:#4f8cff;--ok:#38d39f;--warn:#ffb454;--err:#ff6b6b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  header{display:flex;align-items:baseline;gap:12px;padding:16px 22px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:.5px}
+  header .sub{color:var(--dim);font-size:12.5px}
+  header .spacer{flex:1}
+  .pill{font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
+  main{display:grid;grid-template-columns:minmax(420px,1fr) minmax(380px,1fr);gap:16px;padding:16px 22px;align-items:start}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:16px}
+  .card h2{margin:0 0 10px;font-size:14px;font-weight:600}
+  .card h2 .hint{font-weight:400;color:var(--dim);font-size:12px;margin-left:6px}
+  .presets{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);padding:6px 12px;transition:.15s}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;padding:11px 20px;width:100%;font-size:15px}
+  button.primary:disabled{opacity:.5;cursor:default}
+  .group{margin-bottom:10px}
+  .group>.gname{color:var(--dim);font-size:12px;margin:8px 0 4px}
+  .feat{display:grid;grid-template-columns:22px 1fr;gap:6px;align-items:start;padding:4px 6px;border-radius:6px}
+  .feat:hover{background:var(--panel2)}
+  .feat input{margin-top:4px}
+  .feat .fname{font-weight:500}
+  .feat .fid{color:var(--dim);font-size:12px;margin-left:6px}
+  .feat .fdesc{color:var(--dim);font-size:12px;display:block}
+  .feat.danger .fname::after{content:"危险区";margin-left:6px;color:var(--err);font-size:11px}
+  .feat.locked{opacity:.55}
+  .feat.locked .fname::after{content:"未实现";margin-left:6px;color:var(--warn);font-size:11px}
+  label.row{display:grid;grid-template-columns:104px 1fr;gap:8px;align-items:center;margin:7px 0}
+  label.row>span{color:var(--dim);font-size:12.5px}
+  input[type=text],input[type=password],input[type=number]{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:7px 9px;font:inherit}
+  input:focus{outline:none;border-color:var(--accent)}
+  details summary{cursor:pointer;color:var(--dim);font-size:12.5px;margin:8px 0}
+  #status{margin-top:12px;min-height:22px;font-size:13px}
+  #status .spin{display:inline-block;width:12px;height:12px;margin-right:8px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .ok{color:var(--ok)} .err{color:var(--err)} .dim{color:var(--dim)}
+  pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:320px;overflow:auto;font-size:12.5px;white-space:pre-wrap}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td{padding:3px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+  td.k{color:var(--dim);white-space:nowrap;width:40%}
+  .out{margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--panel2);border:1px dashed var(--line);font-size:12.5px;word-break:break-all}
+</style>
+</head>
+<body>
+<header>
+  <h1>apkguard</h1><span class="sub">纯 Go APK 加固工作台</span>
+  <span class="spacer"></span><span class="pill" id="cnt">加载中…</span>
+</header>
+<main>
+  <div>
+    <div class="card">
+      <h2>功能项<span class="hint">未实现的项已禁用</span></h2>
+      <div class="presets">
+        <button id="p-rec">推荐配置</button>
+        <button id="p-min">仅混淆</button>
+        <button id="p-shell">加壳链路</button>
+        <button id="p-all">全部（不含危险区）</button>
+        <button id="p-none">全不选</button>
+      </div>
+      <div id="features"></div>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h2>输入与输出</h2>
+      <label class="row"><span>待加固 APK</span><input type="text" id="in" placeholder="C:\path\to\app.apk"></label>
+      <label class="row"><span>输出路径</span><input type="text" id="out" placeholder="留空 = 输入名-protected.apk"></label>
+      <label class="row"><span>随机种子</span><input type="text" id="seed" placeholder="留空每次随机；填固定值可复现"></label>
+    </div>
+    <div class="card">
+      <h2>签名<span class="hint">启用 E1 时必填</span></h2>
+      <label class="row"><span>密钥库</span><input type="text" id="ks" placeholder="C:\path\to\release.jks"></label>
+      <label class="row"><span>库口令</span><input type="password" id="ks_pass"></label>
+      <label class="row"><span>私钥口令</span><input type="password" id="key_pass" placeholder="默认同库口令"></label>
+      <label class="row"><span>类型</span><input type="text" id="ks_type" placeholder="jks / pkcs12，留空自动探测"></label>
+      <label class="row"><span>别名</span><input type="text" id="alias" placeholder="留空取第一个私钥条目"></label>
+    </div>
+    <div class="card">
+      <h2>高级</h2>
+      <details><summary>展开（渠道 / 设备绑定 / 混淆与膨胀参数）</summary>
+        <label class="row"><span>渠道列表</span><input type="text" id="channels" placeholder="huawei,xiaomi（E4）"></label>
+        <label class="row"><span>设备绑定</span><input type="text" id="bind_device" placeholder="android_id（D5）"></label>
+        <label class="row"><span>签名指纹</span><input type="text" id="sig_hash" placeholder="SHA-256 十六进制（D1）"></label>
+        <label class="row"><span>名称前缀</span><input type="text" id="name_prefix" placeholder="A1 混淆类名前缀"></label>
+        <label class="row"><span>保留白名单</span><input type="text" id="keep_rules" placeholder="A1 规则文件路径"></label>
+        <label class="row"><span>最短加密</span><input type="number" id="obf_string_min" placeholder="0 = 全部（A2）"></label>
+        <label class="row"><span>拆分份数</span><input type="number" id="split_count" placeholder="0 = 不拆（B4）"></label>
+        <label class="row"><span>类膨胀数</span><input type="number" id="class_pad_count" placeholder="100（A13）"></label>
+        <label class="row"><span>伪 DEX 块</span><input type="number" id="fake_dex_count" placeholder="1（A9）"></label>
+        <label class="row"><span>时间戳</span><input type="text" id="stamp_time" placeholder="2024-01-01T00:00:00Z（A14）"></label>
+      </details>
+    </div>
+    <div class="card">
+      <h2>执行</h2>
+      <button class="primary" id="run">开始加固</button>
+      <div id="status"></div>
+      <div id="result"></div>
+    </div>
+  </div>
+</main>
+<script>
+const state = {features: [], enabled: {}};
+async function loadFeatures() {
+  const d = await (await fetch('/api/features')).json();
+  const box = document.getElementById('features');
+  box.innerHTML = ''; state.features = [];
+  for (const g of d.groups) {
+    const gd = document.createElement('div');
+    gd.className = 'group';
+    gd.innerHTML = '<div class="gname">' + g.name + '</div>';
+    for (const f of g.features) {
+      state.features.push(f);
+      const row = document.createElement('label');
+      row.className = 'feat' + (f.implemented ? '' : ' locked') + (f.risk === '危险区' ? ' danger' : '');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.disabled = !f.implemented;
+      cb.checked = !!f.default && !!f.implemented;
+      cb.dataset.id = f.id;
+      cb.addEventListener('change', function(){ state.enabled[f.id] = cb.checked; });
+      state.enabled[f.id] = cb.checked;
+      const t = document.createElement('div');
+      t.innerHTML = '<span class="fname">' + f.name + '</span><span class="fid">' + f.id +
+                    '</span><span class="fdesc">' + (f.desc || '') + '</span>';
+      row.appendChild(cb); row.appendChild(t); gd.appendChild(row);
+    }
+    box.appendChild(gd);
+  }
+  document.getElementById('cnt').textContent = '共 ' + d.total + ' 项';
+}
+function setPreset(ids) {
+  for (const f of state.features) {
+    const cb = document.querySelector('input[data-id="' + f.id + '"]');
+    if (!cb) continue;
+    const on = ids === null ? (!!f.implemented && f.risk !== '危险区') : ids.indexOf(f.id) >= 0;
+    cb.checked = on && !!f.implemented;
+    state.enabled[f.id] = cb.checked;
+  }
+}
+const PRESETS = {
+  rec: ['A1','A2','A3','A4','B1','B2','B3','E1','E2','E3','E6'],
+  min: ['A1','A2','A3','A4','E1','E2','E3','E6'],
+  shell: ['A1','A2','A3','A4','B1','B2','B3','B4','E1','E2','E3','E6']
+};
+function val(id) { return (document.getElementById(id).value || '').trim(); }
+function num(id) { const v = val(id); return v === '' ? undefined : Number(v); }
+function collect() {
+  const enabled = {};
+  for (const f of state.features) enabled[f.id] = !!state.enabled[f.id];
+  return {enabled: enabled, in: val('in'), out: val('out'), ks: val('ks'),
+    ks_pass: val('ks_pass'), key_pass: val('key_pass'), ks_type: val('ks_type'),
+    alias: val('alias'), seed: val('seed'), channels: val('channels'),
+    bind_device: val('bind_device'),
+    sig_hashes: val('sig_hash') ? [val('sig_hash')] : undefined,
+    name_prefix: val('name_prefix'), keep_rules: val('keep_rules'),
+    obf_string_min: num('obf_string_min'), split_count: num('split_count'),
+    class_pad_count: num('class_pad_count'), fake_dex_count: num('fake_dex_count'),
+    stamp_time: val('stamp_time')};
+}
+function status(html) { document.getElementById('status').innerHTML = html; }
+async function run() {
+  const btn = document.getElementById('run');
+  btn.disabled = true;
+  document.getElementById('result').innerHTML = '';
+  status('<span class="spin"></span>正在加固，大包可能需要几分钟…');
+  const t0 = Date.now();
+  try {
+    const resp = await fetch('/api/run', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify(collect())});
+    const d = await resp.json();
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    if (!d.ok) {
+      status('<span class="err">加固失败（' + secs + 's）：' + (d.error || '未知错误') + '</span>');
+      return;
+    }
+    status('<span class="ok">加固完成（' + (d.duration || secs + 's') + '）</span>');
+    let html = '<div class="out">输出：' + d.out + '（' + (d.size / 1024).toFixed(1) + ' KB）</div>';
+    if (d.ran && d.ran.length) {
+      html += '<p class="dim">执行了 ' + d.ran.length + ' 项：' + d.ran.join(', ') + '</p>';
+    }
+    if (d.notes && d.notes.length) {
+      html += '<pre>' + d.notes.join('\n') + '</pre>';
+    }
+    const st = d.stats || {}, keys = Object.keys(st).sort();
+    if (keys.length) {
+      html += '<table>' + keys.map(function(k){
+        return '<tr><td class="k">' + k + '</td><td>' + st[k] + '</td></tr>'; }).join('') + '</table>';
+    }
+    document.getElementById('result').innerHTML = html;
+  } catch (e) {
+    status('<span class="err">请求失败：' + e + '</span>');
+  } finally { btn.disabled = false; }
+}
+document.getElementById('run').addEventListener('click', run);
+document.getElementById('p-rec').addEventListener('click', function(){ setPreset(PRESETS.rec); });
+document.getElementById('p-min').addEventListener('click', function(){ setPreset(PRESETS.min); });
+document.getElementById('p-shell').addEventListener('click', function(){ setPreset(PRESETS.shell); });
+document.getElementById('p-all').addEventListener('click', function(){ setPreset(null); });
+document.getElementById('p-none').addEventListener('click', function(){ setPreset([]); });
+loadFeatures();
+</script>
+</body>
+</html>

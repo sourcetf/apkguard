@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.agtest">
+    <!-- 必须声明：Manifest 没有 <uses-sdk> 时 targetSdk 退化为 1，
+         Android 15+ 会直接拒绝安装（INSTALL FAILED DEPRECATED SDK VERSION）。 -->
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+
+    <application android:name="com.agtest.MyApp" android:label="agtest">
+        <provider
+            android:name="com.agtest.HealthProvider"
+            android:authorities="com.agtest.health"
+            android:exported="false" />
+        <activity android:name="com.agtest.MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

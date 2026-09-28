@@ -1,0 +1,1065 @@
+package dex
+
+import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+// 本文件验证 B3（ClassLoader 接管）注入的 Loader 类。
+//
+// 验证方式与 A2/A13 一致：把真实字节码送进测试解释器执行，断言其**行为**，
+// 而不是只看 DEX 结构是否自洽——结构合法但寄存器分配错误的壳代码同样能通过
+// Verify，却会在真机崩溃。这里为 Loader 用到的框架 API 建立一套模拟实现，
+// 其中 javax.crypto 直接用 Go 的标准库做**真实** AES-CBC 解密，
+// 因此「载荷被正确还原」这一点是被真正证明的，而不是被假定。
+
+// ---- 模拟运行时对象 ----
+
+// fakeAssetMgr 模拟 android.content.res.AssetManager。
+type fakeAssetMgr struct{ assets map[string][]byte }
+
+// fakeStream 模拟 java.io.InputStream。
+type fakeStream struct {
+	data []byte
+	pos  int
+}
+
+// fakeField 模拟 java.lang.reflect.Field。
+type fakeField struct {
+	name string
+	val  any
+}
+
+// fakeCipher 模拟 javax.crypto.Cipher，内部用真实 AES-CBC 解密。
+type fakeCipher struct {
+	key []byte
+	iv  []byte
+}
+
+// loaderEnv 汇总模拟运行期间共享的状态。
+type loaderEnv struct {
+	// readOnly 记录被标记只读的文件路径（Android 14+ 要求动态加载的
+	// DEX 必须先 setReadOnly，否则系统拒绝加载）。
+	readOnly []string
+	assets   map[string][]byte
+	// fs 是模拟文件系统：绝对路径 -> 文件内容。
+	fs map[string][]byte
+	// dexPath 是 DexClassLoader 构造时收到的 dexPath。
+	dexPath string
+	// clObj 是 Shell 构造出的 DexClassLoader 实例。
+	clObj any
+}
+
+// loaderFields 是各模拟类的字段表：Java 类名 -> 字段。
+var loaderFields = map[string][]*fakeField{}
+
+// aesCBCDecrypt 用 Go 标准库做 AES-CBC 解密并去除 PKCS#7 填充。
+func aesCBCDecrypt(key, iv, data []byte) ([]byte, error) {
+	blk, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("构造 AES 失败: %w", err)
+	}
+	if len(data) == 0 || len(data)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("密文长度 %d 非法", len(data))
+	}
+	out := make([]byte, len(data))
+	cipher.NewCBCDecrypter(blk, iv).CryptBlocks(out, data)
+	n := int(out[len(out)-1])
+	if n == 0 || n > aes.BlockSize || n > len(out) {
+		return nil, fmt.Errorf("填充字节非法 (%d)", n)
+	}
+	for _, b := range out[len(out)-n:] {
+		if int(b) != n {
+			return nil, fmt.Errorf("填充内容不一致")
+		}
+	}
+	return out[:len(out)-n], nil
+}
+
+// installLoaderMocks 注册 Loader 所需的全部框架 API 模拟。
+//
+// 返回恢复函数，测试结束时调用。
+func installLoaderMocks(env *loaderEnv) func() {
+	prev := map[string]func(in *interp, regs []int) (int32, any, error){}
+	for k, v := range fakeCalls {
+		prev[k] = v
+	}
+	h := map[string]func(in *interp, regs []int) (int32, any, error){}
+	noop := func(in *interp, regs []int) (int32, any, error) { return 0, nil, nil }
+
+	// ---- Context ----
+	h["Landroid/content/Context;->getDir(Ljava/lang/String;I)Ljava/io/File;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			name, ok := in.objs[regs[1]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("getDir 的实参不是字符串")
+			}
+			return 0, &fakeObj{desc: descFile, aux: "/data/user/0/app/" + name.s}, nil
+		}
+	h["Landroid/content/Context;->getAssets()Landroid/content/res/AssetManager;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			return 0, &fakeAssetMgr{assets: env.assets}, nil
+		}
+	h["Landroid/content/Context;->getClassLoader()Ljava/lang/ClassLoader;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			return 0, &fakeObj{desc: descClassLoader}, nil
+		}
+
+	// ---- AssetManager / InputStream ----
+	h["Landroid/content/res/AssetManager;->open(Ljava/lang/String;)Ljava/io/InputStream;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			name, ok := in.objs[regs[1]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("open 的实参不是字符串")
+			}
+			data, ok := env.assets[name.s]
+			if !ok {
+				return 0, nil, errf("assets 中不存在 %q", name.s)
+			}
+			return 0, &fakeStream{data: data}, nil
+		}
+	h["Ljava/io/InputStream;->read([BII)I"] = func(in *interp, regs []int) (int32, any, error) {
+		st, ok := in.objs[regs[0]].(*fakeStream)
+		if !ok {
+			return 0, nil, errf("read 的接收者不是 InputStream")
+		}
+		buf, ok := in.objs[regs[1]].(*fakeBytes)
+		if !ok {
+			return 0, nil, errf("read 的缓冲区不是 byte[]")
+		}
+		off, n := int(in.regs[regs[2]]), int(in.regs[regs[3]])
+		if st.pos >= len(st.data) {
+			return -1, nil, nil
+		}
+		if off < 0 || n < 0 || off > len(buf.b) {
+			return 0, nil, errf("read 的区间非法 off=%d n=%d", off, n)
+		}
+		end := st.pos + n
+		if end > len(st.data) {
+			end = len(st.data)
+		}
+		if off+(end-st.pos) > len(buf.b) {
+			end = st.pos + (len(buf.b) - off)
+		}
+		got := copy(buf.b[off:], st.data[st.pos:end])
+		st.pos += got
+		return int32(got), nil, nil
+	}
+	h["Ljava/io/InputStream;->close()V"] = noop
+
+	// ---- 密码学（真实 AES-CBC）----
+	h["Ljavax/crypto/Cipher;->getInstance(Ljava/lang/String;)Ljavax/crypto/Cipher;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			alg, ok := in.objs[regs[0]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("Cipher.getInstance 的实参不是字符串")
+			}
+			if alg.s != cipherAlg {
+				return 0, nil, errf("Cipher 算法不符: %s", alg.s)
+			}
+			return 0, &fakeCipher{}, nil
+		}
+	h["Ljavax/crypto/Cipher;->init(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			cp, ok := in.objs[regs[0]].(*fakeCipher)
+			if !ok {
+				return 0, nil, errf("init 的接收者不是 Cipher")
+			}
+			if in.regs[regs[1]] != cipherDecryptMode {
+				return 0, nil, errf("Cipher 模式不是解密: %d", in.regs[regs[1]])
+			}
+			sks, ok := in.objs[regs[2]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("init 的密钥不是 SecretKeySpec")
+			}
+			ivs, ok := in.objs[regs[3]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("init 的 IV 不是 IvParameterSpec")
+			}
+			cp.key, _ = sks.aux.([]byte)
+			cp.iv, _ = ivs.aux.([]byte)
+			if len(cp.key) != 32 || len(cp.iv) != 16 {
+				return 0, nil, errf("密钥/IV 长度不符 key=%d iv=%d", len(cp.key), len(cp.iv))
+			}
+			return 0, nil, nil
+		}
+	h["Ljavax/crypto/Cipher;->doFinal([BII)[B"] = func(in *interp, regs []int) (int32, any, error) {
+		cp, ok := in.objs[regs[0]].(*fakeCipher)
+		if !ok {
+			return 0, nil, errf("doFinal 的接收者不是 Cipher")
+		}
+		buf, ok := in.objs[regs[1]].(*fakeBytes)
+		if !ok {
+			return 0, nil, errf("doFinal 的输入不是 byte[]")
+		}
+		off, n := int(in.regs[regs[2]]), int(in.regs[regs[3]])
+		if off < 0 || n < 0 || off+n > len(buf.b) {
+			return 0, nil, errf("doFinal 的区间非法")
+		}
+		plain, err := aesCBCDecrypt(cp.key, cp.iv, buf.b[off:off+n])
+		if err != nil {
+			return 0, nil, err
+		}
+		return 0, &fakeBytes{b: plain}, nil
+	}
+	h["Ljavax/crypto/spec/SecretKeySpec;-><init>([BLjava/lang/String;)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("SecretKeySpec 构造的接收者类型不对")
+			}
+			b, ok := in.objs[regs[1]].(*fakeBytes)
+			if !ok {
+				return 0, nil, errf("SecretKeySpec 的密钥不是 byte[]")
+			}
+			o.aux = append([]byte(nil), b.b...)
+			return 0, nil, nil
+		}
+	h["Ljavax/crypto/spec/IvParameterSpec;-><init>([B)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("IvParameterSpec 构造的接收者类型不对")
+			}
+			b, ok := in.objs[regs[1]].(*fakeBytes)
+			if !ok {
+				return 0, nil, errf("IvParameterSpec 的 IV 不是 byte[]")
+			}
+			o.aux = append([]byte(nil), b.b...)
+			return 0, nil, nil
+		}
+	h["Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			src, ok := in.objs[regs[0]].(*fakeBytes)
+			dst, ok2 := in.objs[regs[2]].(*fakeBytes)
+			if !ok || !ok2 {
+				return 0, nil, errf("arraycopy 的操作数不是 byte[]: src=%T dst=%T 实参寄存器=%v",
+					in.objs[regs[0]], in.objs[regs[2]], regs)
+			}
+			srcPos, dstPos, n := int(in.regs[regs[1]]), int(in.regs[regs[3]]), int(in.regs[regs[4]])
+			if srcPos < 0 || dstPos < 0 || n < 0 || srcPos+n > len(src.b) || dstPos+n > len(dst.b) {
+				return 0, nil, errf("arraycopy 的区间非法 srcPos=%d dstPos=%d n=%d len(src)=%d len(dst)=%d 实参寄存器=%v",
+					srcPos, dstPos, n, len(src.b), len(dst.b), regs)
+			}
+			copy(dst.b[dstPos:dstPos+n], src.b[srcPos:srcPos+n])
+			return 0, nil, nil
+		}
+
+	// ---- 字符串拼接 ----
+	//
+	// new-instance 一律产出 *fakeObj，因此这里用 aux 挂一个 Go 的
+	// strings.Builder 来承载拼接结果，而不是另建一种模拟类型。
+	h["Ljava/lang/StringBuilder;-><init>()V"] = func(in *interp, regs []int) (int32, any, error) {
+		o, ok := in.objs[regs[0]].(*fakeObj)
+		if !ok {
+			return 0, nil, errf("StringBuilder 构造的接收者类型不对")
+		}
+		o.aux = &strings.Builder{}
+		return 0, nil, nil
+	}
+	h["Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("append 的接收者不是 StringBuilder")
+			}
+			s, ok := in.objs[regs[1]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("append 的实参不是字符串")
+			}
+			sb, ok := o.aux.(*strings.Builder)
+			if !ok {
+				return 0, nil, errf("append 前未调用 StringBuilder 构造器")
+			}
+			sb.WriteString(s.s)
+			return 0, o, nil
+		}
+	h["Ljava/lang/StringBuilder;->toString()Ljava/lang/String;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("toString 的接收者不是 StringBuilder")
+			}
+			sb, ok := o.aux.(*strings.Builder)
+			if !ok {
+				return 0, nil, errf("toString 前未调用 StringBuilder 构造器")
+			}
+			return 0, &fakeStr{s: sb.String()}, nil
+		}
+
+	// ---- 文件系统 ----
+	h["Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("File 构造的接收者类型不对")
+			}
+			parent, ok := in.objs[regs[1]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("File 的父路径不是 File")
+			}
+			name, ok := in.objs[regs[2]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("File 的名字不是字符串")
+			}
+			dir, _ := parent.aux.(string)
+			o.aux = dir + "/" + name.s
+			return 0, nil, nil
+		}
+	h["Ljava/io/File;->getAbsolutePath()Ljava/lang/String;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("getAbsolutePath 的接收者不是 File")
+			}
+			p, _ := o.aux.(string)
+			return 0, &fakeStr{s: p}, nil
+		}
+	h["Landroid/content/Context;->getApplicationInfo()Landroid/content/pm/ApplicationInfo;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			return 0, &fakeObj{desc: "Landroid/content/pm/ApplicationInfo;"}, nil
+		}
+	h["Ljava/io/File;->setReadOnly()Z"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("setReadOnly 的接收者不是 File")
+			}
+			p, _ := o.aux.(string)
+			env.readOnly = append(env.readOnly, p)
+			return 1, nil, nil
+		}
+	h["Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("FileOutputStream 构造的接收者类型不对")
+			}
+			f, ok := in.objs[regs[1]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("FileOutputStream 的实参不是 File")
+			}
+			o.aux = f.aux
+			return 0, nil, nil
+		}
+	h["Ljava/io/FileOutputStream;->write([B)V"] = func(in *interp, regs []int) (int32, any, error) {
+		o, ok := in.objs[regs[0]].(*fakeObj)
+		if !ok {
+			return 0, nil, errf("write 的接收者不是 FileOutputStream")
+		}
+		b, ok := in.objs[regs[1]].(*fakeBytes)
+		if !ok {
+			return 0, nil, errf("write 的实参不是 byte[]")
+		}
+		p, _ := o.aux.(string)
+		env.fs[p] = append([]byte(nil), b.b...)
+		return 0, nil, nil
+	}
+	h["Ljava/io/FileOutputStream;->close()V"] = noop
+
+	// ---- ClassLoader ----
+	h["Ldalvik/system/DexClassLoader;-><init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			p, ok := in.objs[regs[1]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("DexClassLoader 的 dexPath 不是字符串")
+			}
+			env.dexPath = p.s
+			env.clObj = in.objs[regs[0]]
+			return 0, nil, nil
+		}
+
+	// ---- 反射 ----
+	h["Ljava/lang/Object;->getClass()Ljava/lang/Class;"] = func(in *interp, regs []int) (int32, any, error) {
+		var d string
+		switch o := in.objs[regs[0]].(type) {
+		case *fakeObj:
+			d = o.desc
+		case *fakeArr:
+			d = o.desc
+		case *fakeStr:
+			d = descString
+		default:
+			return 0, nil, errf("getClass 的接收者类型未知 %T", in.objs[regs[0]])
+		}
+		name := ShellJavaName(d)
+		c, ok := fakeClasses[name]
+		if !ok {
+			c = &fakeCls{name: name}
+			fakeClasses[name] = c
+		}
+		return 0, c, nil
+	}
+	h["Ljava/lang/Class;->forName(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			name, ok := in.objs[regs[0]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("forName 的实参不是字符串")
+			}
+			c, ok := fakeClasses[name.s]
+			if !ok {
+				return 0, nil, errf("forName 未注册类 %q", name.s)
+			}
+			return 0, c, nil
+		}
+	h["Ljava/lang/Class;->getDeclaredFields()[Ljava/lang/reflect/Field;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			c, ok := in.objs[regs[0]].(*fakeCls)
+			if !ok {
+				return 0, nil, errf("getDeclaredFields 的接收者不是 Class")
+			}
+			fs := loaderFields[c.name]
+			items := make([]any, len(fs))
+			for i, f := range fs {
+				items[i] = f
+			}
+			return 0, &fakeArr{desc: descFieldArray, items: items}, nil
+		}
+	h["Ljava/lang/Class;->getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			c, ok := in.objs[regs[0]].(*fakeCls)
+			if !ok {
+				return 0, nil, errf("getDeclaredMethod 的接收者不是 Class")
+			}
+			name, ok := in.objs[regs[1]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("getDeclaredMethod 的实参不是字符串")
+			}
+			for _, m := range c.mths {
+				if m.name == name.s {
+					return 0, m, nil
+				}
+			}
+			return 0, nil, errf("类 %s 上找不到方法 %s", c.name, name.s)
+		}
+	h["Ljava/lang/reflect/Field;->getName()Ljava/lang/String;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			f, ok := in.objs[regs[0]].(*fakeField)
+			if !ok {
+				return 0, nil, errf("Field.getName 的接收者不是 Field")
+			}
+			return 0, &fakeStr{s: f.name}, nil
+		}
+	h["Ljava/lang/reflect/Field;->setAccessible(Z)V"] = noop
+	h["Ljava/lang/reflect/Field;->get(Ljava/lang/Object;)Ljava/lang/Object;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			f, ok := in.objs[regs[0]].(*fakeField)
+			if !ok {
+				return 0, nil, errf("Field.get 的接收者不是 Field")
+			}
+			return 0, f.val, nil
+		}
+	h["Ljava/lang/reflect/Field;->set(Ljava/lang/Object;Ljava/lang/Object;)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			f, ok := in.objs[regs[0]].(*fakeField)
+			if !ok {
+				return 0, nil, errf("Field.set 的接收者不是 Field")
+			}
+			f.val = in.objs[regs[2]]
+			return 0, nil, nil
+		}
+
+	for k, v := range h {
+		fakeCalls[k] = v
+	}
+	// 壳用 StringBuilder 拼接 dexPath 时会读取 File.pathSeparator，
+	// 这是它用到的唯一静态字段。
+	prevStatics := objStatics
+	objStatics = map[string]any{
+		"Ljava/io/File;->pathSeparator": &fakeStr{s: ":"},
+		// 应用的 native 库目录：DexClassLoader 必须拿到它，否则应用加载自己的
+		// .so 会 UnsatisfiedLinkError（真实案例：RustDesk 的 libflutter.so）。
+		"Landroid/content/pm/ApplicationInfo;->nativeLibraryDir": &fakeStr{s: "/data/app/lib/x86_64"},
+	}
+	return func() {
+		fakeCalls = prev
+		objStatics = prevStatics
+	}
+}
+
+// TestLoaderDecryptRoundTrip 验证 Loader 能解出与原始 DEX 逐字节一致的明文。
+//
+// 这是 B1 的核心正确性证据：载荷被 AES 加密后，只有壳侧代码真的按同样的
+// 参数解密，才能还原出原 DEX。任何寄存器分配错误都会让结果对不上。
+func TestLoaderDecryptRoundTrip(t *testing.T) {
+	restore := installLoaderMocks(&loaderEnv{})
+	defer restore()
+
+	key, iv := testPackKey, testPackIV
+	plain := Empty()
+	blob := mustEncrypt(t, plain, key, iv)
+
+	ls := &LoaderSpec{
+		Class:   "Lcom/apkguard/shell/Loader;",
+		Key:     key,
+		TempDir: "ag",
+		Items:   []LoaderItem{{Asset: "assets/pay_ab12.bin", DexName: "d0.dex", Size: len(blob)}},
+	}
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造 Loader 失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if err := Verify(out); err != nil {
+		t.Fatalf("校验失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	env := &loaderEnv{assets: map[string][]byte{"pay_ab12.bin": blob}, fs: map[string][]byte{}}
+	restore2 := installLoaderMocks(env)
+	defer restore2()
+
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, ls.Class)
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+
+	idx, off := findMethod(t, g, ls.Class, "->"+LoaderEntry+"(")
+	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("Loader.a 执行失败: %v", err)
+	}
+
+	got, ok := env.fs["/data/user/0/app/ag/d0.dex"]
+	if !ok {
+		t.Fatalf("未落地解密后的 DEX，已有文件: %v", keysOfBytes(env.fs))
+	}
+	if len(got) != len(plain) {
+		t.Fatalf("解密结果长度不符: %d vs %d", len(got), len(plain))
+	}
+	for i := range plain {
+		if got[i] != plain[i] {
+			t.Fatalf("解密结果第 %d 字节不符", i)
+		}
+	}
+	if !strings.Contains(env.dexPath, "/ag/d0.dex") {
+		t.Fatalf("DexClassLoader 的 dexPath 不含落地文件: %q", env.dexPath)
+	}
+	t.Logf("B3：载荷 AES-CBC 解密还原成功（%d 字节），dexPath=%s", len(got), env.dexPath)
+}
+
+// TestLoaderMarksDexReadOnly 验证落地的 DEX 被标记为只读。
+//
+// Android 14（API 34）起，targetSdk ≥ 34 的应用用 DexClassLoader 加载
+// 「可写」文件会被系统拒绝（Safer dynamic code loading 行为变更）。
+// 因此在写盘之后调用 File.setReadOnly() 不是可选优化，而是现代系统上的
+// 必要条件——少了它，真机上就是在加载那一步直接崩，且不留痕迹。
+func TestLoaderMarksDexReadOnly(t *testing.T) {
+	blob := mustEncrypt(t, Empty(), testPackKey, testPackIV)
+	ls := &LoaderSpec{Class: "Lx/L;", Key: testPackKey, TempDir: "ag",
+		MarkReadOnly: true, // 模拟 targetSdk ≥ 34
+		Items:        []LoaderItem{{Asset: "assets/pay.bin", DexName: "d0.dex", Size: len(blob)}}}
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	env := &loaderEnv{assets: map[string][]byte{"pay.bin": blob}, fs: map[string][]byte{}}
+	restore := installLoaderMocks(env)
+	defer restore()
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, ls.Class)
+
+	idx, off := findMethod(t, g, ls.Class, "->"+LoaderEntry+"(")
+	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("Loader.a 执行失败: %v", err)
+	}
+	if len(env.readOnly) == 0 {
+		t.Fatal("落地后未调用 setReadOnly：Android 14+ 会拒绝加载可写的 DEX")
+	}
+	if env.readOnly[0] != "/data/user/0/app/ag/d0.dex" {
+		t.Fatalf("只读标记落在了错误的文件上: %v", env.readOnly)
+	}
+	t.Logf("已标记只读: %v", env.readOnly)
+}
+
+// TestLoaderInstallsClassLoader 验证接管链路确实把新 ClassLoader 写进了
+// ActivityThread.mBoundApplication.info.mClassLoader。
+//
+// 该字段是系统加载 Application 与四大组件所用的加载器，写不进去的话
+// Manifest 里的 Activity 依然会由旧加载器加载而找不到类。
+func TestLoaderInstallsClassLoader(t *testing.T) {
+	key, iv := testPackKey, testPackIV
+	blob := mustEncrypt(t, Empty(), key, iv)
+
+	ls := &LoaderSpec{
+		Class:   "Lcom/apkguard/shell/Loader;",
+		Key:     key,
+		TempDir: "ag",
+		Items:   []LoaderItem{{Asset: "assets/pay_ab12.bin", DexName: "d0.dex", Size: len(blob)}},
+	}
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造 Loader 失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, ls.Class)
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+
+	// currentActivityThread 通过反射调用返回上面的 ActivityThread 实例。
+	mth := fakeClasses["android.app.ActivityThread"].mths[0]
+	clField := loaderFields["android.app.LoadedApk"][0]
+
+	env := &loaderEnv{assets: map[string][]byte{"pay_ab12.bin": blob}, fs: map[string][]byte{}}
+	restore := installLoaderMocks(env)
+	defer restore()
+
+	idx, off := findMethod(t, g, ls.Class, "->"+LoaderEntry+"(")
+	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("Loader.a 执行失败: %v", err)
+	}
+
+	if env.clObj == nil {
+		t.Fatal("未构造 DexClassLoader")
+	}
+	if clField.val != env.clObj {
+		t.Fatalf("mClassLoader 未被替换为新建的 DexClassLoader：%v", clField.val)
+	}
+	if !mth.accessed {
+		t.Fatal("反射调用 Method.invoke 前未 setAccessible(true)")
+	}
+	t.Log("B3：ClassLoader 已写入 ActivityThread.mBoundApplication.info.mClassLoader")
+}
+
+// TestShellWithLoaderDelegates 验证启用 B3 的壳 Application 能走完整链路：
+// attachBaseContext → 解密载荷 → 接管 ClassLoader → 委托原 Application。
+func TestShellWithLoaderDelegates(t *testing.T) {
+	const origName = "com.orig.MyApp"
+	key, iv := testPackKey, testPackIV
+	blob := mustEncrypt(t, Empty(), key, iv)
+
+	sh := &ShellApp{
+		Class: "Lapkguard/App;",
+		Orig:  origName,
+		Loader: &LoaderSpec{
+			Class:   "Lapkguard/Loader;",
+			Key:     key,
+			TempDir: "ag",
+			Items:   []LoaderItem{{Asset: "assets/pay_ab12.bin", DexName: "d0.dex", Size: len(blob)}},
+		},
+	}
+	add, err := ShellAppAddition(sh)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if err := Verify(out); err != nil {
+		t.Fatalf("校验失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	// 模拟环境：原 Application 类未覆写 attachBaseContext，其父类才有——
+	// 这正是壳必须沿父类链扫描的原因。
+	paramCtx := &fakeCls{name: "android.content.Context"}
+	baseApp := &fakeCls{
+		name: "android.app.Application",
+		mths: []*fakeMth{{name: "attachBaseContext", params: []*fakeCls{paramCtx}}},
+	}
+	fakeClasses[origName] = &fakeCls{name: origName, supers: []*fakeCls{baseApp}}
+	defer delete(fakeClasses, origName)
+
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+
+	// 把两个类的全部方法登记给解释器，使其能进入方法体执行。
+	registerFakeCode(t, g, sh.Class, sh.Loader.Class)
+
+	// 搭好 ActivityThread 字段链，使接管步骤能真正执行。
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+	clField := loaderFields["android.app.LoadedApk"][0]
+
+	env := &loaderEnv{assets: map[string][]byte{"pay_ab12.bin": blob}, fs: map[string][]byte{}}
+	restore := installLoaderMocks(env)
+	defer restore()
+
+	attachIdx, attachOff := findMethod(t, g, sh.Class, "->attachBaseContext(")
+	app := &fakeObj{desc: sh.Class}
+	ctx := &fakeObj{desc: descContext}
+
+	debugCalls = []string{}
+	_, err = runPadMethod(g, attachIdx, attachOff, app, ctx)
+	t.Logf("attachBaseContext 调用轨迹: %v", debugCalls)
+	debugCalls = nil
+	if err != nil {
+		t.Fatalf("attachBaseContext 执行失败: %v", err)
+	}
+
+	cached, ok := objStatics[sh.Class+"->"+shellFieldOrig].(*fakeObj)
+	if !ok {
+		t.Fatal("未把原 Application 实例写入静态字段")
+	}
+	if cached.getField("$attach") != 1 {
+		t.Fatalf("原 Application 的 attachBaseContext 应被调用 1 次，实际 %d", cached.getField("$attach"))
+	}
+	if clField.val != env.clObj || env.clObj == nil {
+		t.Fatal("ClassLoader 未被接管到 ActivityThread")
+	}
+	if _, ok := env.fs["/data/user/0/app/ag/d0.dex"]; !ok {
+		t.Fatal("载荷未落地为 DEX 文件")
+	}
+	t.Log("B2+B3：壳在解密载荷、接管 ClassLoader 之后成功委托原 Application")
+}
+
+// TestShellLoaderRunsWithoutOrigApp 验证原 APK 未声明 android:name 时，
+// 壳**仍然**要完成解密与 ClassLoader 接管。
+//
+// 这是最容易漏掉的一条路径：没有原 Application 需要委托，看上去「无事可做」，
+// 但载荷里装着整个业务 DEX，不接管加载器的话 Manifest 里声明的 Activity
+// 依旧会由旧加载器加载而找不到类——表现为应用能安装、一打开就崩。
+func TestShellLoaderRunsWithoutOrigApp(t *testing.T) {
+	key, iv := testPackKey, testPackIV
+	blob := mustEncrypt(t, Empty(), key, iv)
+
+	sh := &ShellApp{
+		Class: "Lapkguard/App;",
+		// Orig 故意留空：原 APK 的 Manifest 没有 android:name。
+		Loader: &LoaderSpec{
+			Class:   "Lapkguard/Loader;",
+			Key:     key,
+			TempDir: "ag",
+			Items:   []LoaderItem{{Asset: "assets/pay_ab12.bin", DexName: "d0.dex", Size: len(blob)}},
+		},
+	}
+	add, err := ShellAppAddition(sh)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, sh.Class, sh.Loader.Class)
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+	clField := loaderFields["android.app.LoadedApk"][0]
+
+	env := &loaderEnv{assets: map[string][]byte{"pay_ab12.bin": blob}, fs: map[string][]byte{}}
+	restore := installLoaderMocks(env)
+	defer restore()
+
+	attachIdx, attachOff := findMethod(t, g, sh.Class, "->attachBaseContext(")
+	debugCalls = []string{}
+	if _, err := runPadMethod(g, attachIdx, attachOff, &fakeObj{desc: sh.Class}, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("attachBaseContext 执行失败: %v", err)
+	}
+	calls := append([]string(nil), debugCalls...)
+	debugCalls = nil
+
+	// 载荷必须被解密落地，ClassLoader 必须被接管。
+	if _, ok := env.fs["/data/user/0/app/ag/d0.dex"]; !ok {
+		t.Fatalf("载荷未落地（调用轨迹 %v）", calls)
+	}
+	if env.clObj == nil || clField.val != env.clObj {
+		t.Fatalf("ClassLoader 未被接管（调用轨迹 %v）", calls)
+	}
+	// 没有原 Application 时不应去解析原类：委托走的是带显式 ClassLoader 的
+	// 三参 forName，而 Loader 接管 ActivityThread 用的是单参 forName，
+	// 因此只有前者能证明「委托被误执行」。
+	for _, c := range calls {
+		if strings.Contains(c, "forName(Ljava/lang/String;ZLjava/lang/ClassLoader;)") {
+			t.Fatalf("未声明原 Application 时不应执行委托: %v", calls)
+		}
+	}
+	t.Log("B2+B3：未声明 Application 的 APK 依然完成了载荷解密与 ClassLoader 接管")
+}
+
+// TestLoaderMultiplePayloads 验证多份载荷（Multidex）都能被解密，
+// 且 dexPath 由 File.pathSeparator 正确拼接。
+//
+// 真实应用几乎都是多 DEX，这条路径与单载荷完全不同：载荷名成对出现、
+// 每份有各自的 IV、路径要靠 StringBuilder 拼成一份 path list。
+// 只测单载荷的话，拼接逻辑出错也发现不了。
+func TestLoaderMultiplePayloads(t *testing.T) {
+	key := testPackKey
+	// 两份明文长度不同，且各用不同 IV，能暴露「IV/载荷错位」这类错误。
+	plain0 := append(append([]byte(nil), Empty()...), make([]byte, 7)...)
+	plain1 := bytes.Repeat([]byte{0x5a}, 4096)
+	iv0 := testPackIV
+	iv1 := [16]byte{0xff, 0xfe, 0xfd, 0xfc, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	blob0 := mustEncrypt(t, plain0, key, iv0)
+	blob1 := mustEncrypt(t, plain1, key, iv1)
+
+	ls := &LoaderSpec{
+		Class:   "Lcom/apkguard/shell/Loader;",
+		Key:     key,
+		TempDir: "ag",
+		Items: []LoaderItem{
+			{Asset: "assets/a.bin", DexName: "d0.dex", Size: len(blob0)},
+			{Asset: "assets/b.bin", DexName: "d1.dex", Size: len(blob1)},
+		},
+	}
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造 Loader 失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if err := Verify(out); err != nil {
+		t.Fatalf("校验失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, ls.Class)
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+
+	env := &loaderEnv{
+		assets: map[string][]byte{"a.bin": blob0, "b.bin": blob1},
+		fs:     map[string][]byte{},
+	}
+	restore := installLoaderMocks(env)
+	defer restore()
+
+	idx, off := findMethod(t, g, ls.Class, "->"+LoaderEntry+"(")
+	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("Loader.a 执行失败: %v", err)
+	}
+
+	for i, want := range [][]byte{plain0, plain1} {
+		path := fmt.Sprintf("/data/user/0/app/ag/d%d.dex", i)
+		got, ok := env.fs[path]
+		if !ok {
+			t.Fatalf("第 %d 份载荷未落地到 %s（已有 %v）", i, path, keysOfBytes(env.fs))
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("第 %d 份载荷解密结果不符（%d vs %d 字节）", i, len(got), len(want))
+		}
+		if !strings.Contains(env.dexPath, path) {
+			t.Fatalf("dexPath 缺少 %s：%q", path, env.dexPath)
+		}
+	}
+	// 两份路径必须用 pathSeparator 连接，否则 DexClassLoader 只会加载第一份。
+	if n := strings.Count(env.dexPath, ":"); n != 1 {
+		t.Fatalf("dexPath 应以一个分隔符连接两份载荷，实际 %d 个：%q", n, env.dexPath)
+	}
+	t.Logf("B3：多载荷解密与 dexPath 拼接正确：%s", env.dexPath)
+}
+
+// ---- 测试辅助 ----
+
+// testPackKey / testPackIV 是测试用的固定密钥与 IV。
+var (
+	testPackKey = [32]byte{
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+		0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+		0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+		0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x7f,
+	}
+	testPackIV = [16]byte{
+		0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+		0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+	}
+)
+
+// mustEncrypt 用与 internal/pack 一致的算法把明文加密为「IV ‖ 密文」。
+//
+// 这里不直接调用 pack.Encrypt 是为了让本测试自带参照实现：
+// 若 go 侧实现与 Dalvik 侧壳代码同时出错，仍能与这里的独立实现对照出来。
+func mustEncrypt(t *testing.T, plain []byte, key [32]byte, iv [16]byte) []byte {
+	t.Helper()
+	blk, err := aes.NewCipher(key[:])
+	if err != nil {
+		t.Fatalf("构造 AES 失败: %v", err)
+	}
+	n := aes.BlockSize - len(plain)%aes.BlockSize
+	padded := make([]byte, len(plain)+n)
+	copy(padded, plain)
+	for i := len(plain); i < len(padded); i++ {
+		padded[i] = byte(n)
+	}
+	out := make([]byte, 16, 16+len(padded))
+	copy(out, iv[:])
+	body := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(blk, iv[:]).CryptBlocks(body, padded)
+	return append(out, body...)
+}
+
+// installActivityThreadMock 搭出 ActivityThread 的字段链与反射入口，
+// 使 Loader 的接管步骤在模拟环境中可执行。
+//
+// 字段链取自真实框架：ActivityThread.mBoundApplication → AppBindData.info
+// → LoadedApk.mClassLoader。返回被写入的那个字段，供断言检查。
+func installActivityThreadMock() *fakeField {
+	clField := &fakeField{name: "mClassLoader"}
+	loadedApk := &fakeObj{desc: "Landroid/app/LoadedApk;"}
+	bindData := &fakeObj{desc: "Landroid/app/AppBindData;"}
+	thread := &fakeObj{desc: "Landroid/app/ActivityThread;"}
+	loaderFields = map[string][]*fakeField{
+		"android.app.ActivityThread": {{name: "mBoundApplication", val: bindData}},
+		"android.app.AppBindData":    {{name: "info", val: loadedApk}},
+		"android.app.LoadedApk":      {clField},
+	}
+	fakeClasses["android.app.ActivityThread"] = &fakeCls{
+		name: "android.app.ActivityThread",
+		mths: []*fakeMth{{name: "currentActivityThread", ret: thread, retSet: true}},
+	}
+	return clField
+}
+
+// clearActivityThreadMock 拆除 installActivityThreadMock 搭出的环境。
+func clearActivityThreadMock() {
+	loaderFields = map[string][]*fakeField{}
+	delete(fakeClasses, "android.app.ActivityThread")
+}
+
+// registerFakeCode 把指定类的全部方法登记给解释器。
+//
+// 注入类的内部会相互调用（Loader.a 调用 r/c/w/i），解释器必须知道这些方法
+// 在 DEX 中的 code_item 偏移才能进入其方法体执行。
+func registerFakeCode(t *testing.T, g *File, classes ...string) {
+	t.Helper()
+	want := map[string]bool{}
+	for _, c := range classes {
+		want[c] = true
+	}
+	if err := g.Classes(func(_ uint32, cd ClassDef, name string) error {
+		if !want[name] {
+			return nil
+		}
+		pcd, err := g.ParseClassData(cd.ClassDataOff)
+		if err != nil {
+			return err
+		}
+		for _, ms := range [][]EncodedMethod{pcd.DirectMethods, pcd.VirtualMethods} {
+			for _, m := range ms {
+				d, _ := g.MethodDesc(m.Idx)
+				fakeCode[d] = m.CodeOff
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("遍历类失败: %v", err)
+	}
+}
+
+// findMethod 在被测 DEX 中定位指定类的某个方法。
+func findMethod(t *testing.T, g *File, class, descPart string) (uint32, uint32) {
+	t.Helper()
+	var idx, off uint32
+	found := false
+	if err := g.Classes(func(_ uint32, cd ClassDef, name string) error {
+		if name != class {
+			return nil
+		}
+		pcd, err := g.ParseClassData(cd.ClassDataOff)
+		if err != nil {
+			return err
+		}
+		for _, ms := range [][]EncodedMethod{pcd.DirectMethods, pcd.VirtualMethods} {
+			for _, m := range ms {
+				d, _ := g.MethodDesc(m.Idx)
+				if strings.Contains(d, descPart) {
+					idx, off, found = m.Idx, m.CodeOff, true
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("遍历类失败: %v", err)
+	}
+	if !found {
+		t.Fatalf("未找到方法 %s %s", class, descPart)
+	}
+	return idx, off
+}
+
+func keysOfBytes(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestLoaderSkipsReadOnlyWhenNotRequired 验证 targetSdk < 34 时**不**标记只读。
+//
+// 回归防线：只读标记是 Android 14+ 对 targetSdk ≥ 34 应用的要求，
+// 对更低 targetSdk 的应用率先标记会造成 DexPathList 打开文件时
+// EACCES(Permission denied)，表现为启动即 FileNotFoundException 闪退
+// ——真实案例：RustDesk（targetSdk 33）加固后启动崩溃。
+func TestLoaderSkipsReadOnlyWhenNotRequired(t *testing.T) {
+	blob := mustEncrypt(t, Empty(), testPackKey, testPackIV)
+	ls := &LoaderSpec{Class: "Lx/L;", Key: testPackKey, TempDir: "ag",
+		MarkReadOnly: false, // 模拟 targetSdk < 34
+		Items:        []LoaderItem{{Asset: "assets/pay.bin", DexName: "d0.dex", Size: len(blob)}}}
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	env := &loaderEnv{assets: map[string][]byte{"pay.bin": blob}, fs: map[string][]byte{}}
+	restore := installLoaderMocks(env)
+	defer restore()
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, ls.Class)
+
+	idx, off := findMethod(t, g, ls.Class, "->"+LoaderEntry+"(")
+	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("Loader.a 执行失败: %v", err)
+	}
+	if len(env.readOnly) != 0 {
+		t.Fatalf("targetSdk < 34 时不应标记只读，实际标记了 %v", env.readOnly)
+	}
+}

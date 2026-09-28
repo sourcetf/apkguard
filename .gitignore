@@ -1,0 +1,68 @@
+# ---- 白名单式忽略：除下列内容外，根目录一律不入库 ----
+#
+# 本目录是一个 7 GB 的研发工作区（含 Android SDK / NDK / Go 工具链、
+# 61 个 APK、大量逆向分析产物），因此采用「先全部忽略、再逐个放行」的写法，
+# 避免误提交体积巨大的二进制文件。
+
+/*
+
+# 说明文档与设计文档
+!/.gitignore
+!/README.md
+!/*.md
+
+# 项目源码
+!/apkguard/
+!/testapp/
+!/scripts/
+
+# 交付说明与实测记录
+!/deliver/
+!/realworld/
+
+# ---- apkguard：只保留源码 ----
+/apkguard/*.exe
+/apkguard/*.txt
+/apkguard/*.err
+/apkguard/*.log
+/apkguard/e2e.bat
+/apkguard/t/
+
+# ---- testapp：只保留源码（APK 与密钥库不入库）----
+/testapp/*.apk
+/testapp/*.idsig
+/testapp/*.dex
+/testapp/classes/
+/testapp/keystore/
+/testapp/aligned.apk
+
+# ---- deliver：只保留说明 ----
+/deliver/*.apk
+/deliver/*.idsig
+/deliver/*.txt
+
+# ---- realworld：只保留实测记录 ----
+/realworld/*
+!/realworld/*.md
+
+# ---- 通用：二进制与构建产物 ----
+*.exe
+*.dll
+*.so
+*.apk
+*.idsig
+*.dex
+*.jar
+*.zip
+*.jks
+*.pfx
+*.p12
+*.keystore
+*.img
+*.qcow2
+*.vmdk
+
+# 测试/调试临时目录
+tmpwork/
+tmp/
+*.log
