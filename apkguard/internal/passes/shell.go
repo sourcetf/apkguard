@@ -26,6 +26,13 @@ import (
 // 那个壳 DEX 里，必须知道条目名与壳类名。
 const sharedKeyShell = "B2.shell"
 
+// FrameworkComponentFactory 是框架自带的 AppComponentFactory 实现。
+//
+// 壳会把 Manifest 的 android:appComponentFactory 指向它：原工厂类（通常是
+// androidx.core.app.CoreComponentFactory）随业务代码一起进了加密载荷，
+// 而系统在壳接管 ClassLoader **之前**就要实例化这个工厂，那时它不可见。
+const FrameworkComponentFactory = "android.app.AppComponentFactory"
+
 // shellInfo 是 B2 交给 B3/D1 的壳信息。
 type shellInfo struct {
 	// Class 是壳 Application 的类描述符（如 "Lcom/x/App;"）。
@@ -180,13 +187,41 @@ func (a *appReplace) Run(_ context.Context, art *pipeline.Artifact, opts *config
 	}
 
 	// 改写 Manifest 的 android:name。
-	out, err := mf.Rewrite(axml.Edit{SetAttr: []axml.AttrValue{{
+	edits := []axml.AttrValue{{
 		Element: "application",
 		Index:   0,
 		NS:      axml.AndroidNS,
 		Name:    "name",
 		Value:   ShellJavaNameOf(sh.Class),
-	}}})
+	}}
+
+	// android:appComponentFactory 必须一并处理，否则应用**启动即死**。
+	//
+	// 时序原因：这个工厂类由 LoadedApk 在 `makeApplicationInner` 里实例化，
+	// 也就是在壳的 attachBaseContext（我们接管 ClassLoader 的地方）**之前**。
+	// 那时业务 DEX 还在加密载荷里，工厂类根本不存在，于是：
+	//   E LoadedApk: java.lang.ClassNotFoundException:
+	//       Didn't find class "androidx.core.app.CoreComponentFactory"
+	// 实测三个真实应用（RustDesk / Termux / Dhizuku）全部声明了这个属性。
+	//
+	// 处理方式：指向框架默认实现 android.app.AppComponentFactory。它保留了
+	// 「按类名实例化组件」的标准语义；丢失的只有 androidx 的 CompatWrapped
+	// 包装特性（组件实现该内部接口时返回包装对象），对绝大多数应用没有影响。
+	if app := mf.FindElement("application"); app != nil &&
+		app.AttrNS(axml.AndroidNS, "appComponentFactory") != nil {
+		edits = append(edits, axml.AttrValue{
+			Element: "application",
+			Index:   0,
+			NS:      axml.AndroidNS,
+			Name:    "appComponentFactory",
+			Value:   FrameworkComponentFactory,
+		})
+		art.Note("B2：android:appComponentFactory 已指向框架默认实现 %s（原工厂类在载荷里，"+
+			"而系统在壳接管 ClassLoader 之前就要实例化它，不改会让应用启动即 ClassNotFoundException）",
+			FrameworkComponentFactory)
+	}
+
+	out, err := mf.Rewrite(axml.Edit{SetAttr: edits})
 	if err != nil {
 		return fmt.Errorf("改写 Manifest 失败: %w", err)
 	}
@@ -1083,9 +1118,15 @@ func (c *channelMark) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 
 // deviceBind 注入设备绑定校验：只有授权设备能运行。
 //
-// 绑定值必须由使用方在目标设备上采集后传入（-bind-device）：
+// 绑定值必须由使用方在目标设备上采集后传入（-bind-device），采集方式是
+// 「让应用自己报出来」：
 //
-//	adb shell settings get secure android_id
+//	apkguard -debug-shell ... -enable ...D5... -bind-device 占位值
+//	# 装机运行一次，然后
+//	adb logcat -s APKGUARD-D5        # 打印的就是本机标识
+//
+// 不能用 `adb shell settings get secure android_id`：Android 8+ 起 ANDROID_ID
+// 按「应用签名 + 用户 + 设备」作用域化，它读到的是原始值，与应用内读到的不同。
 //
 // 工具无法凭空得知目标设备的标识，这是设备绑定固有的前提。
 // 与其它运行时检测一致：取不到标识时放行（失败开放），只拦「明确不匹配」。
@@ -1103,11 +1144,11 @@ func (d *deviceBind) Run(_ context.Context, art *pipeline.Artifact, opts *config
 	}
 	dev := strings.TrimSpace(opts.BindDevice)
 	if dev == "" {
-		return fmt.Errorf("D5 需要指定要绑定的设备标识（-bind-device），可在目标设备上执行：adb shell settings get secure android_id")
+		return fmt.Errorf("D5 需要指定要绑定的设备标识（-bind-device）。注意 Android 8+ 起 ANDROID_ID 按应用签名作用域化，`adb shell settings get secure android_id` **取不到**应用内看到的那个值；请先用 -debug-shell 出一个排障版，在目标设备上运行一次，从 `adb logcat -s APKGUARD-D5` 拿到本机标识再绑定")
 	}
 	digest := sha256.Sum256([]byte(dev))
 
-	add, err := dex.DevAddition(&dex.DevSpec{Class: cls, Digest: digest})
+	add, err := dex.DevAddition(&dex.DevSpec{Class: cls, Digest: digest, Debug: opts.DebugShell})
 	if err != nil {
 		return err
 	}

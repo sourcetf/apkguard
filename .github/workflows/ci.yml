@@ -72,6 +72,14 @@ jobs:
           done
           exit $missing
 
+      # 同时校验两件不依赖 NDK 的事：
+      #   1) .agexpect 里回填的 .text+.rodata 摘要与当前内容一致；
+      #   2) LOAD 段按 16 KB 对齐（Android 15+ 的页大小要求，
+      #      Google Play 自 2025-11 起对 targetSdk 35 的提交强制检查）。
+      # 第 2 条以前没人管，产物在 16 KB 页设备上会装载失败。
+      - name: 校验原生库摘要与 16KB 页对齐
+        run: python3 apkguard/internal/native/build_native.py --check
+
       - name: 交叉编译（多平台）
         working-directory: apkguard
         run: |

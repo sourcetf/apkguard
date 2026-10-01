@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -19,16 +20,56 @@ import (
 // 用 aapt2 做验证而不是自己解析 ARSC：它是 Android 官方实现，
 // 能确认「改写后的资源表在真实工具链眼里依然合法」——这是自研解析器
 // 无法自证的（用同一份可能出错的代码去校验自己，等于没校验）。
+//
+// 之前只在 ../../../tools/build-tools/*/aapt2**.exe** 里找，Linux 上必然找不到，
+// 于是 CI 里这条 A5/A11 的决定性判据一直被静默跳过。现在按
+// BUILD_TOOLS_DIR > SDK 的 build-tools（取最高版本）> PATH 依次查找，
+// 且同时接受带/不带 .exe 的文件名。
 func findAapt2() string {
-	root := filepath.Join("..", "..", "..", "tools", "build-tools")
-	ents, err := os.ReadDir(root)
-	if err != nil {
-		return ""
+	name := "aapt2"
+	if runtime.GOOS == "windows" {
+		name = "aapt2.exe"
 	}
-	for _, e := range ents {
-		p := filepath.Join(root, e.Name(), "aapt2.exe")
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
+
+	var dirs []string
+	if d := os.Getenv("BUILD_TOOLS_DIR"); d != "" {
+		dirs = append(dirs, d)
+	}
+	sdk := os.Getenv("ANDROID_HOME")
+	if sdk == "" {
+		sdk = os.Getenv("ANDROID_SDK_ROOT")
+	}
+	if sdk != "" {
+		// build-tools 下可能装了多个版本，取版本号最大的那个。
+		if ents, err := os.ReadDir(filepath.Join(sdk, "build-tools")); err == nil {
+			var vers []string
+			for _, e := range ents {
+				if e.IsDir() {
+					vers = append(vers, e.Name())
+				}
+			}
+			sort.Sort(sort.Reverse(sort.StringSlice(vers)))
+			for _, v := range vers {
+				dirs = append(dirs, filepath.Join(sdk, "build-tools", v))
+			}
+		}
+	}
+	dirs = append(dirs, filepath.Join("..", "..", "..", "tools", "build-tools"))
+
+	for _, d := range dirs {
+		// 既接受直接给 build-tools 版本目录，也接受其父目录。
+		for _, cand := range []string{filepath.Join(d, name), filepath.Join(d, "build-tools")} {
+			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+				return cand
+			}
+		}
+		if ents, err := os.ReadDir(d); err == nil {
+			for _, e := range ents {
+				p := filepath.Join(d, e.Name(), name)
+				if st, err := os.Stat(p); err == nil && !st.IsDir() {
+					return p
+				}
+			}
 		}
 	}
 	if p, err := exec.LookPath("aapt2"); err == nil {
@@ -57,6 +98,41 @@ func dumpResourceKeys(t *testing.T, aapt2, apk string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// TestResourceRewriteKeepsArscStored 验证 A5/A11 不会把 resources.arsc 压成 DEFLATE。
+//
+// Android 11+（targetSdk ≥ 30）要求 resources.arsc 以未压缩方式存放，违反时
+// **安装**会被直接拒绝（Failure [-124] ... requires the resources.arsc of
+// installed APKs to be stored uncompressed and aligned on a 4-byte boundary）。
+// 这类问题签名与对齐检查都发现不了：apksigner 与 zipalign -c 都会说 OK。
+func TestResourceRewriteKeepsArscStored(t *testing.T) {
+	art := loadSample(t)
+	e := pipeline.Find(art, arscName)
+	if e == nil {
+		t.Skip("样本没有 resources.arsc")
+	}
+	if !e.IsStored() {
+		t.Skip("样本的 resources.arsc 本来就是压缩存放，跳过")
+	}
+
+	opts := &config.Options{Enabled: map[config.FeatureID]bool{"A5": true, "A11": true}, Seed: "keep"}
+	ctx := context.Background()
+	if err := (&resourceObf{}).Run(ctx, art, opts); err != nil {
+		t.Fatalf("A5 执行失败: %v", err)
+	}
+	if err := (&resourceFlatten{}).Run(ctx, art, opts); err != nil {
+		t.Fatalf("A11 执行失败: %v", err)
+	}
+
+	got := pipeline.Find(art, arscName)
+	if got == nil {
+		t.Fatal("改写后 resources.arsc 消失了")
+	}
+	if !got.IsStored() {
+		t.Fatal("改写后 resources.arsc 变成了压缩存放——Android 11+ 会拒绝安装该 APK")
+	}
+	t.Logf("A5/A11 改写后 resources.arsc 仍为未压缩存放（%d 字节）", got.UncompSize)
 }
 
 // TestResourceRewritePreservesResourceIDs 是 A5/A11 的**决定性判据**。

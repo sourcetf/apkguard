@@ -125,7 +125,7 @@ func run() error {
 	flag.BoolVar(&c.debugShell, "debug-shell", false, "排障：壳启动时逐步弹 Toast 报告进度（含 ClassLoader 接管回读校验）")
 
 	flag.StringVar(&c.sigHash, "sig-hash", "", "D1 签名证书的 SHA-256（十六进制；留空则取密钥库中的证书）")
-	flag.StringVar(&c.bindDev, "bind-device", "", "D5 绑定的设备标识（目标设备上执行 adb shell settings get secure android_id 获取）")
+	flag.StringVar(&c.bindDev, "bind-device", "", "D5 绑定的设备标识：用 -debug-shell 出排障版，在目标设备上跑一次，从 adb logcat -s APKGUARD-D5 读取（Android 8+ 的 ANDROID_ID 按应用签名作用域化，settings get secure android_id 取到的是原始值，不是应用看到的那个）")
 	flag.StringVar(&c.channels, "channels", "", "E4 渠道列表，逗号分隔")
 	flag.IntVar(&c.jobs, "jobs", 0, "E5 并发数（0=CPU 核数）")
 
@@ -452,6 +452,15 @@ func runOnce(opts *config.Options) error {
 	}
 	if err := os.WriteFile(out, res.APK, 0o644); err != nil {
 		return fmt.Errorf("写出 APK 失败: %w", err)
+	}
+	// v4 的签名文件（.idsig）必须单独落盘：它是供增量安装使用的独立文件。
+	// 不写出来则 `-v4` 只是「算了一遍就丢掉」，而 CLI 帮助文本承诺了会生成它。
+	if len(res.IDSig) > 0 {
+		p := out + ".idsig"
+		if err := os.WriteFile(p, res.IDSig, 0o644); err != nil {
+			return fmt.Errorf("写出 v4 签名文件失败: %w", err)
+		}
+		fmt.Printf("v4 签名文件: %s (%d 字节)\n", p, len(res.IDSig))
 	}
 
 	fmt.Printf("\n执行了 %d 个功能项，耗时 %s\n", len(res.Ran), res.Duration.Round(time.Millisecond))

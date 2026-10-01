@@ -40,14 +40,40 @@ TARGETS = {
 
 
 def find_ndk_bin():
-    """定位 NDK 的 clang 目录。"""
-    root = os.path.normpath(os.path.join(HERE, "..", "..", "..", "tools", "android-sdk", "ndk"))
-    if not os.path.isdir(root):
-        return None
-    for name in sorted(os.listdir(root)):
-        b = os.path.join(root, name, "toolchains", "llvm", "prebuilt", "windows-x86_64", "bin")
-        if os.path.isdir(b):
-            return b
+    """定位 NDK 的 clang 目录。
+
+    查找顺序（CI 与本地都能命中）：
+      1. ANDROID_NDK_HOME / ANDROID_NDK_ROOT —— CI 的 nttld/setup-ndk 就是设这两个；
+      2. $ANDROID_HOME/ndk/<版本>（取版本号最大的一个）；
+      3. 历史工作区路径 ../../../tools/android-sdk/ndk/<版本>。
+
+    以前只认第 3 条，于是 CI 的「原生库重建」作业永远找不到 NDK——
+    它设了 ANDROID_NDK_HOME，脚本却不读。
+    """
+    candidates = []
+    for env in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT"):
+        if os.environ.get(env):
+            candidates.append(os.environ[env])
+    sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    if sdk:
+        ndk_root = os.path.join(sdk, "ndk")
+        if os.path.isdir(ndk_root):
+            for name in sorted(os.listdir(ndk_root), reverse=True):
+                candidates.append(os.path.join(ndk_root, name))
+    legacy = os.path.normpath(os.path.join(HERE, "..", "..", "..", "tools", "android-sdk", "ndk"))
+    if os.path.isdir(legacy):
+        for name in sorted(os.listdir(legacy), reverse=True):
+            candidates.append(os.path.join(legacy, name))
+
+    for root in candidates:
+        # host 目录名随平台变化：windows-x86_64 / linux-x86_64 / darwin-x86_64
+        prebuilt = os.path.join(root, "toolchains", "llvm", "prebuilt")
+        if not os.path.isdir(prebuilt):
+            continue
+        for host in sorted(os.listdir(prebuilt)):
+            b = os.path.join(prebuilt, host, "bin")
+            if os.path.isdir(b):
+                return b
     return None
 
 
@@ -92,6 +118,37 @@ def elf_sections(data):
     return out
 
 
+def load_alignments(data):
+    """返回 ELF 中全部 PT_LOAD 段的 p_align。
+
+    Android 15+ 支持 16 KB 页大小，Google Play 从 2025-11 起要求
+    targetSdk 35 的新提交/更新必须支持它；对 native 库而言就是
+    LOAD 段按 16 KB（0x4000）对齐。NDK r26 的默认值是 4 KB（0x1000），
+    所以必须显式链接 `-Wl,-z,max-page-size=16384`。
+    """
+    if data[:4] != b"\x7fELF" or data[5] != 1:
+        raise ValueError("只支持小端 ELF")
+    is64 = data[4] == 2
+    if is64:
+        phoff, = struct.unpack_from("<Q", data, 0x20)
+        phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    else:
+        phoff, = struct.unpack_from("<I", data, 0x1C)
+        phentsize, phnum = struct.unpack_from("<HH", data, 0x2A)
+    out = []
+    for i in range(phnum):
+        off = phoff + i * phentsize
+        p_type, = struct.unpack_from("<I", data, off)
+        if p_type != 1:  # PT_LOAD
+            continue
+        if is64:
+            align, = struct.unpack_from("<Q", data, off + 0x30)
+        else:
+            align, = struct.unpack_from("<I", data, off + 0x1C)
+        out.append(align)
+    return out
+
+
 def expected_digest(data):
     """按与运行时一致的顺序（先是 .text，再是 .rodata）计算期望摘要。"""
     sec = elf_sections(data)
@@ -129,28 +186,48 @@ def verify(path):
 def build(ndk_bin):
     ok = True
     for abi, target in TARGETS.items():
-        cc = os.path.join(ndk_bin, target + ".cmd")
-        if not os.path.exists(cc):
-            print("  跳过 %s：找不到 %s" % (abi, cc))
+        # Windows 的 NDK 提供 <target>.cmd 批处理包装，Linux/macOS 提供同名 shell 脚本。
+        # 只认 .cmd 会让 CI（Linux）在找到 NDK 之后依然全部跳过。
+        cc = None
+        for cand in (target, target + ".cmd"):
+            p = os.path.join(ndk_bin, cand)
+            if os.path.exists(p):
+                cc = p
+                break
+        if cc is None:
+            print("  跳过 %s：找不到 %s（在 %s）" % (abi, target, ndk_bin))
             ok = False
             continue
         outdir = os.path.join(PREBUILT, abi)
         os.makedirs(outdir, exist_ok=True)
         out = os.path.join(outdir, LIB)
-        r = subprocess.run([cc, "-shared", "-O2", "-fPIC", "-DAG_JNI", "-o", out, SRC],
-                           capture_output=True, text=True)
+        # -Wl,-z,max-page-size=16384：Android 15+ 的 16 KB 页大小要求。
+        #
+        # 不指定时 NDK r26 会把 LOAD 段对齐到 4 KB，产物在 16 KB 页设备上
+        # 无法装载（Google Play 自 2025-11 起对 targetSdk 35 的提交强制检查）。
+        # 32 位 ABI 一并设置只是为了让三个 ABI 的产物一致、便于断言，
+        # 代价是几 KB 的填充。
+        r = subprocess.run(
+            [cc, "-shared", "-O2", "-fPIC", "-DAG_JNI",
+             "-Wl,-z,max-page-size=16384", "-o", out, SRC],
+            capture_output=True, text=True)
         if r.returncode != 0:
             print("  编译 %s 失败：\n%s" % (abi, r.stderr))
             ok = False
             continue
         with open(out, "rb") as f:
             data = f.read()
+        aligns = load_alignments(data)
+        if not aligns or min(aligns) < 0x4000:
+            print("  %-12s LOAD 段对齐不足 16 KB：%s" % (abi, [hex(a) for a in aligns]))
+            ok = False
+            continue
         digest, sec = expected_digest(data)
         patch(out, digest, sec)
         good, want, got = verify(out)
-        print("  %-12s %6d 字节  .agexpect@0x%x  摘要=%s  %s"
-              % (abi, len(data), sec[".agexpect"][0], digest.hex()[:16],
-                 "回填一致" if good else "回填不一致！"))
+        print("  %-12s %6d 字节  .agexpect@0x%x  对齐=%s  摘要=%s  %s"
+              % (abi, len(data), sec[".agexpect"][0], hex(min(aligns)),
+                 digest.hex()[:16], "回填一致" if good else "回填不一致！"))
         ok = ok and good
     return ok
 
@@ -165,8 +242,14 @@ def main():
                 ok = False
                 continue
             good, want, got = verify(p)
-            print("  %-12s %s" % (abi, "一致" if good else "不一致 want=%s got=%s" % (want, got)))
-            ok = ok and good
+            with open(p, "rb") as f:
+                aligns = load_alignments(f.read())
+            aligned = bool(aligns) and min(aligns) >= 0x4000
+            print("  %-12s 摘要=%s  LOAD 对齐=%s %s"
+                  % (abi, "一致" if good else "不一致 want=%s got=%s" % (want, got),
+                     hex(min(aligns)) if aligns else "无",
+                     "（16 KB 就绪）" if aligned else "（不足 16 KB！）"))
+            ok = ok and good and aligned
         return 0 if ok else 1
 
     ndk_bin = find_ndk_bin()

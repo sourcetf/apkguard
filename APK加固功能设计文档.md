@@ -856,14 +856,15 @@ apksigner sign \
 
 | 组件 | 用途 | 当前状态 |
 |---|---|---|
-| Go 1.24+ | 主控程序（单二进制 exe） | ✅ 1.24.0 已装 |
-| `apksigner` / `zipalign` | 签名与对齐 | ✅ 0.9 已装 |
-| JDK（JBR 25.0.3） | 密钥库管理 / v1 签名兜底 | ✅ `C:\Program Files\Android\Android Studio\jbr` |
-| `keytool` / `jarsigner` | 密钥库生成与管理 | ✅ |
-| Python 3.12 + `reapk` | DEX 解析/改写/重打包（原型验证） | ✅ reapk 0.1.1 |
-| Python + `androguard` | DEX 分析（已有） | ✅ |
-| PyInstaller 6.22.3 | 打包 exe（Python 方案备用） | ✅ |
-| NDK + clang | native 壳编译（阶段4） | ❌ 待装 |
+| Go 1.24+ | 主控程序（单二进制 exe） | ✅ 已装 |
+| `apksigner` / `zipalign` | 签名与对齐（仅用于**校验**，工具自身不依赖它们） | ✅ build-tools 34.0.0 |
+| JDK | 密钥库生成（`keytool`）、apksigner 校验 | ✅ 21 / JBR |
+| NDK + clang | native 守卫编译（C1/C4/C5/C6/D4），3 个 ABI | ✅ r26（`build_native.py` 自动定位） |
+
+> **实现现状（本表已更新）**：工具本身**不依赖** `reapk`、Python 或 JDK——
+> DEX 的解析/重建/汇编全部是自研 Go 实现（见 `internal/dex/`），
+> native 守卫用 NDK 交叉编译后 `go:embed` 进二进制。
+> 下面「方案 A/B/C」是设计期的选型讨论，**最终选了 C（纯 Go 自研 DEX writer）**。
 
 **关键约束**：Go 生态**没有可用的 DEX 改写库**（`dexfinder`/`avast-apkparser`/`apkingo` 均为只读）。因此 DEX 改写能力需通过以下方式之一获得：
 
@@ -873,7 +874,9 @@ apksigner sign \
 | B | Go 主控 + Python `reapk` | 依赖 Python 运行时 |
 | C | 纯 Go 自研 DEX writer | 工作量最大，但单二进制无依赖 |
 
-**推荐**：短期走 B（reapk 已具备完整 DEX writer + 重打包），长期用 Go 重写 DEX writer 达成"单 exe 无依赖"。
+**结论**：采用 **C**。已实现完整链路——DEX 解析、索引重排、ClassDef/CodeItem 重编码、
+分支与异常表重定位、Dalvik 汇编器（用于生成壳类与检测类），`go test ./...` 全绿，
+并在真实应用（RustDesk，5331 个类）上跑通。
 
 ---
 
@@ -983,7 +986,11 @@ apksigner sign \
 | `androguard` | 4.1.4 | ✅ | DEX 分析 |
 | `cryptography` | 50.0.1 | ✅ | AES-GCM / RSA 签名 |
 | **PyInstaller** | 6.22.3 | ✅ | 打包 exe（Python 方案） |
-| NDK + clang | — | ❌ 待装 | native 壳编译（阶段4） |
+| NDK + clang | r26 | ✅ 已装 | native 守卫编译（阶段4）；`build_native.py` 支持 3 个 ABI |
+
+> 上表的 Python / `reapk` / PyInstaller 属**设计期原型**，最终实现没有采用它们：
+> DEX 读写由 `internal/dex/` 的纯 Go 实现承担（方案 C），native 库由 NDK 交叉编译后
+> `go:embed` 进二进制。因此运行时**不需要** Python/JDK/Android SDK。
 
 ### C.2 reapk 能力验证结果（实测）
 

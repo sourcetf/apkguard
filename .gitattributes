@@ -1,0 +1,22 @@
+# 统一行尾为 LF。
+#
+# 本项目有两处硬依赖 LF：
+#   1) CI 用 bash 跑 scripts/*.sh，行尾带回车符时 bash 会把 \r 当成选项的一部分
+#      （典型报错 set: pipefail: invalid option name）；
+#   2) CI 的 gofmt 检查要求源码为 LF。
+#
+# 没有这个文件时，Windows 上 core.autocrlf=true 的检出会把工作区变成 CRLF，
+# 于是本地 gofmt 全红、提交也容易把 CRLF 带进仓库（历史上已发生过一次）。
+# 强制 eol=lf 后，任何平台检出都是 LF。
+* text=auto eol=lf
+
+# 二进制文件不参与行尾转换
+*.so   binary
+*.png  binary
+*.jpg  binary
+*.jar  binary
+*.apk  binary
+*.dex  binary
+*.jks  binary
+*.pfx  binary
+*.p12  binary

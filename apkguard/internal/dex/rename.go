@@ -25,6 +25,22 @@ type RenameConfig struct {
 	// 「A 改了名而 B 仍引用旧名」的断链。ClassMap 非空时，
 	// 本 DEX 定义的类一律按此表改名，不再自行决策。
 	ClassMap map[string]string
+	// MemberMap 是「外部指定的成员改名表」（旧名称 -> 新名称），键是名称字符串
+	// 本身（方法名与字段名共表）；命中时优先采用。
+	//
+	// 与 ClassMap 同理：多 DEX 场景下同一个名称（例如静态常量 TERMUX_HOME_DIR）
+	// 可能在 A DEX 定义、在 B DEX 引用。各 DEX 独立生成新名会取到不同结果，
+	// 运行时抛
+	//   NoSuchFieldError: No field TERMUX_HOME_DIR of type ... in class ...
+	// 所以成员改名的**决策与命名都必须全局做一次**。表里没有的名称仍按本 DEX
+	// 自己的规则处理（单 DEX 场景照旧）。
+	MemberMap map[string]string
+	// MemberKeep 是「全局禁止改名的成员名」集合。
+	//
+	// 当某个名称被多个 DEX 共用、而其中至少一个 DEX 不同意改名时，必须**一致地
+	// 保留**：只让它不出现在 MemberMap 里是不够的——那样各 DEX 会退回本地决策，
+	// 同意改名的那个 DEX 仍会改名，反而制造出不一致（实测就是这个坑）。
+	MemberKeep map[string]bool
 	// ReflectedNames 是「其它 DEX 中出现过的类名」（Java 名形式）。
 	//
 	// 跨 DEX 的 Class.forName 无法通过本 DEX 的字符串池发现，
@@ -183,6 +199,11 @@ type Renamer struct {
 
 	// keepReasons 记录被保留的类及其原因，用于报告。
 	keepReasons map[string]string
+
+	// byDesc 是「类描述符 -> 类定义」，用于查父类型与成员访问标志。
+	byDesc map[string]*ClassInfo
+	// invisCache 缓存「该类（传递地）是否有本 DEX 之外的父类型」。
+	invisCache map[string]bool
 }
 
 // NewRenamer 构造一个重命名器。
@@ -205,6 +226,11 @@ func NewRenamer(f *File, cfg RenameConfig) (*Renamer, error) {
 		methodRename: map[uint32]string{},
 		fieldRename:  map[uint32]string{},
 		used:         map[string]map[string]bool{"C": {}, "M": {}, "F": {}},
+		byDesc:       make(map[string]*ClassInfo, len(infos)),
+		invisCache:   map[string]bool{},
+	}
+	for i := range r.infos {
+		r.byDesc[r.infos[i].Desc] = &r.infos[i]
 	}
 	for i := uint32(0); i < f.NString; i++ {
 		s, err := f.String(i)
@@ -267,6 +293,27 @@ func (r *Renamer) Plan() (map[string]string, error) {
 		}
 		out[s] = nw
 	}
+	// 跨 DEX 引用：本 DEX 里可能引用「定义在别的 DEX」的类，本 DEX 无法看到
+	// 它们的 class_def。这类引用同样必须跟着改名，否则本 DEX 里仍写着旧名，
+	// 运行时报
+	//   NoClassDefFoundError: Failed resolution of: Lcom/foo/Bar;
+	// 真实案例：Termux（原生 30 个 DEX），另外 RustDesk 能跑通是因为它是单 DEX，
+	// 多份是 B4 在**改名之后**才拆出来的，因此碰不到这个问题。
+	//
+	// 只补「不在本 DEX 定义」的类：本 DEX 定义的类由 classRename 决定（它已经
+	// 尊重了本地的保留决策，例如声明了 native 方法的类绝不能改名）。
+	for old, nw := range r.cfg.ClassMap {
+		if old == nw {
+			continue
+		}
+		if _, definedHere := r.byDesc[old]; definedHere {
+			continue
+		}
+		if _, exists := out[old]; !exists {
+			out[old] = nw
+		}
+	}
+
 	// 数组描述符必须跟着元素类一起改名。
 	//
 	// DEX 里 "[Lfoo;"（foo 的数组）是**独立于 "Lfoo;" 的类型字符串**，
@@ -282,6 +329,24 @@ func (r *Renamer) Plan() (map[string]string, error) {
 		for dim := 1; dim <= 8; dim++ {
 			po := strings.Repeat("[", dim) + old
 			pn := strings.Repeat("[", dim) + nw
+			if _, exists := out[po]; !exists {
+				out[po] = pn
+			}
+		}
+	}
+	// 跨 DEX 的数组类型同理（引用方可能只写了 "[Lcom/foo/Bar;"）。
+	// 先取出类描述符条目再展开，避免边遍历边插入同一个 map。
+	var classEntries [][2]string
+	for old, nw := range out {
+		// 只有类描述符才派生数组形式（L...;）
+		if strings.HasPrefix(old, "L") && strings.HasSuffix(old, ";") {
+			classEntries = append(classEntries, [2]string{old, nw})
+		}
+	}
+	for _, e := range classEntries {
+		for dim := 1; dim <= 8; dim++ {
+			po := strings.Repeat("[", dim) + e[0]
+			pn := strings.Repeat("[", dim) + e[1]
 			if _, exists := out[po]; !exists {
 				out[po] = pn
 			}
@@ -443,10 +508,36 @@ func (r *Renamer) planMethods(kept map[string]string) error {
 		if r.isAlwaysKeepMethodName(name) {
 			continue
 		}
+		// 跨 DEX 的统一决策优先于本地判断：
+		//   MemberKeep —— 一致保留（某个共用它的 DEX 不同意改名）；
+		//   MemberMap  —— 一致改名（新名也由调用方统一指定）。
+		if r.cfg.MemberKeep[name] {
+			continue
+		}
+		if nw, ok := r.cfg.MemberMap[name]; ok {
+			pending[idx] = nw
+			continue
+		}
 		// 引用该名称的类必须全部处于重命名集合中
 		all := true
 		for _, rf := range refs {
 			if _, ok := r.classRename[rf.class]; !ok {
+				all = false
+				break
+			}
+			// 可能覆写「看不见的」父类型方法时也不能改。
+			if r.mayOverrideInvisible(name, rf.class, rf.sig) {
+				all = false
+				break
+			}
+			// 引用若在**可见继承链**里找不到声明，说明它来自本 DEX 之外的父类型
+			// （框架/未打包的库），改名后运行时解析不到：
+			//   NoSuchMethodError: No virtual method aez(Ljava/lang/String;)
+			//   Ljava/lang/Class; in class Lorg/lsposed/hiddenapibypass/nc;
+			// 实测就是这么崩的：nc 的父类是 dalvik.system.PathClassLoader，
+			// loadClass 是**继承来的框架方法**，调用点的静态类型却是应用子类，
+			// 于是被误当成「应用内部方法」改了名。
+			if !r.resolvesVisibly(rf.class, name, rf.sig) {
 				all = false
 				break
 			}
@@ -467,6 +558,76 @@ func (r *Renamer) planMethods(kept map[string]string) error {
 	}
 	r.methodRename = pending
 	return nil
+}
+
+// hasInvisibleSuper 判断类（沿本 DEX 内的继承链传递地）是否继承了本 DEX 之外的
+// 父类或接口。
+//
+// 为什么重要：DEX 里只有应用的类定义，框架与未打包进来的库类不在其中。
+// 若某类的父类型在 DEX 之外，那么它的非私有实例方法可能在**覆写我们看不见的
+// 方法**——接口方法的实现就是最典型的一种（框架回调尤其如此：调用方在系统里，
+// 本 DEX 中根本没有该方法的引用，因此「引用者是否都被改名」这条判据看不见它）。
+// 把这类方法改名，覆写关系就断了，运行时抛
+//
+//	java.lang.AbstractMethodError: abstract method "...View$OnAttachStateChangeListener
+//	.onViewAttachedToWindow(android.view.View)" on receiver ...
+//
+// 实测就是这样崩的（Dhizuku：View.OnAttachStateChangeListener）。
+//
+// 判定是保守的：只要继承链上有一环落在 DEX 之外，就认为该类的方法「可能覆写
+// 不可见方法」。纯应用内部的类（父类、接口都在同一 DEX 里）不受影响，仍然改名。
+func (r *Renamer) hasInvisibleSuper(desc string) bool {
+	if v, ok := r.invisCache[desc]; ok {
+		return v
+	}
+	// 先占位，避免继承链出现环时无限递归。
+	r.invisCache[desc] = false
+	ci := r.byDesc[desc]
+	if ci == nil {
+		return false
+	}
+	supers := make([]string, 0, 1+len(ci.Interfaces))
+	supers = append(supers, ci.Super)
+	supers = append(supers, ci.Interfaces...)
+	res := false
+	for _, s := range supers {
+		if s == "" || s == "Ljava/lang/Object;" {
+			continue
+		}
+		if _, ok := r.byDesc[s]; !ok {
+			// 父类型不在本 DEX 里 → 看不见它的方法表
+			res = true
+			break
+		}
+		if r.hasInvisibleSuper(s) {
+			res = true
+			break
+		}
+	}
+	r.invisCache[desc] = res
+	return res
+}
+
+// mayOverrideInvisible 判断「类 classDesc 上名为 name、签名为 sig 的方法」
+// 是否可能覆写本 DEX 之外的方法（私有/静态方法不参与覆写，不算）。
+func (r *Renamer) mayOverrideInvisible(name, classDesc, sig string) bool {
+	ci := r.byDesc[classDesc]
+	if ci == nil {
+		return false
+	}
+	if !r.hasInvisibleSuper(classDesc) {
+		return false
+	}
+	for _, m := range ci.Methods() {
+		if m.Name != name || m.Proto != sig {
+			continue
+		}
+		if m.Access&accPrivate != 0 || m.Access&accStatic != 0 {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // memberRef 描述一个「名称字符串」被哪个类的哪个成员签名引用。
@@ -554,6 +715,14 @@ func (r *Renamer) planFields(kept map[string]string) error {
 		if skip {
 			continue
 		}
+		// 跨 DEX 的统一决策优先（与 planMethods 一致）
+		if r.cfg.MemberKeep[name] {
+			continue
+		}
+		if nw, ok := r.cfg.MemberMap[name]; ok {
+			pending[idx] = nw
+			continue
+		}
 		all := true
 		for _, rf := range refs {
 			if _, ok := r.classRename[rf.class]; !ok {
@@ -561,6 +730,11 @@ func (r *Renamer) planFields(kept map[string]string) error {
 				break
 			}
 			if r.isKeptMember(rf.class, name) {
+				all = false
+				break
+			}
+			// 同 planMethods：可见链里找不到声明的字段引用同样不能改名
+			if !r.resolvesVisibly(rf.class, name, rf.sig) {
 				all = false
 				break
 			}
@@ -801,6 +975,71 @@ func declaresNative(ci *ClassInfo) bool {
 		if m.Native {
 			return true
 		}
+	}
+	return false
+}
+
+// resolvesVisibly 判断「类 classDesc 上的 (name, proto) 成员」能否在本 DEX 可见的
+// 继承链（自身 + 父类 + 接口，传递地）里找到声明。
+//
+// 找不到就意味着声明在本 DEX 之外（框架或未打包的库）：这种成员名**绝不能改**，
+// 因为调用点用的静态类型可能是应用子类，而实现来自看不见的父类。真实案例：
+// 某库的类继承 dalvik.system.PathClassLoader，它调用 loadClass 时用的是自己的
+// 静态类型，A1 把 loadClass 改了名 → 运行时
+//
+//	NoSuchMethodError: No virtual method aez(Ljava/lang/String;)Ljava/lang/Class;
+//	in class Lorg/lsposed/hiddenapibypass/nc;
+//
+// java/lang/Object 的成员视作已知（所有类的公共祖先，DEX 里不重复声明）。
+func (r *Renamer) resolvesVisibly(classDesc, name, proto string) bool {
+	seen := map[string]bool{}
+	var walk func(d string, depth int) bool
+	walk = func(d string, depth int) bool {
+		if d == "" || seen[d] || depth > 32 {
+			return false
+		}
+		seen[d] = true
+		ci := r.byDesc[d]
+		if ci == nil {
+			return d == "Ljava/lang/Object;" && objectHasMember(name, proto)
+		}
+		for _, m := range ci.Methods() {
+			if m.Name == name && m.Proto == proto {
+				return true
+			}
+		}
+		if walk(ci.Super, depth+1) {
+			return true
+		}
+		for _, i := range ci.Interfaces {
+			if walk(i, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(classDesc, 0)
+}
+
+// objectHasMember 判断名称/签名是否属于 java.lang.Object 的已知成员。
+func objectHasMember(name, proto string) bool {
+	switch name {
+	case "equals":
+		return proto == "(Ljava/lang/Object;)Z"
+	case "hashCode":
+		return proto == "()I"
+	case "toString":
+		return proto == "()Ljava/lang/String;"
+	case "clone":
+		return proto == "()Ljava/lang/Object;"
+	case "finalize", "notify", "notifyAll", "registerNatives":
+		return proto == "()V"
+	case "getClass":
+		return proto == "()Ljava/lang/Class;"
+	case "wait":
+		return proto == "()V" || proto == "(J)V" || proto == "(JI)V"
+	case "<init>":
+		return proto == "()V"
 	}
 	return false
 }

@@ -95,11 +95,44 @@ type runResponse struct {
 	OK       bool              `json:"ok"`
 	Error    string            `json:"error,omitempty"`
 	Out      string            `json:"out,omitempty"`
+	Outs     []string          `json:"outs,omitempty"`
 	Size     int               `json:"size,omitempty"`
 	Ran      []string          `json:"ran,omitempty"`
 	Notes    []string          `json:"notes,omitempty"`
 	Stats    map[string]string `json:"stats,omitempty"`
 	Duration string            `json:"duration,omitempty"`
+}
+
+// resolveOut 返回未显式指定输出路径时的默认值。
+func resolveOut(opts *config.Options) string {
+	if opts.Out != "" {
+		return opts.Out
+	}
+	ext := filepath.Ext(opts.In)
+	return strings.TrimSuffix(opts.In, ext) + "-protected" + ext
+}
+
+// runAndWrite 跑一次完整流水线并把产物写到 out（按需创建目录）。
+func runAndWrite(ctx context.Context, opts *config.Options, out string) (int, *pipeline.Result, error) {
+	res, err := pipeline.New(passes.Registry(), pipeline.DefaultSink{}).Run(ctx, opts)
+	if err != nil {
+		return 0, nil, err
+	}
+	if dir := filepath.Dir(out); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return 0, nil, fmt.Errorf("创建输出目录失败: %w", err)
+		}
+	}
+	if err := os.WriteFile(out, res.APK, 0o644); err != nil {
+		return 0, nil, fmt.Errorf("写出 APK 失败: %w", err)
+	}
+	// v4 的签名文件是独立文件，必须一并落盘（约定 <APK>.idsig）。
+	if len(res.IDSig) > 0 {
+		if err := os.WriteFile(out+".idsig", res.IDSig, 0o644); err != nil {
+			return 0, nil, fmt.Errorf("写出 v4 签名文件失败: %w", err)
+		}
+	}
+	return len(res.APK), res, nil
 }
 
 // handleRun 执行一次加固。
@@ -113,6 +146,15 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, runResponse{Error: "请求体解析失败: " + err.Error()})
 		return
 	}
+	// 与 CLI 的 -keep-rules 保持一致：该字段是**文件路径**，这里读成规则内容。
+	if opts.KeepRules != "" {
+		data, err := os.ReadFile(opts.KeepRules)
+		if err != nil {
+			writeJSON(w, http.StatusOK, runResponse{Error: "读取保留白名单失败: " + err.Error()})
+			return
+		}
+		opts.KeepRules = string(data)
+	}
 	if err := opts.Validate(); err != nil {
 		writeJSON(w, http.StatusOK, runResponse{Error: err.Error()})
 		return
@@ -121,37 +163,61 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
 	defer cancel()
 
-	res, err := pipeline.New(passes.Registry(), pipeline.DefaultSink{}).Run(ctx, &opts)
+	out := resolveOut(&opts)
+
+	// 多渠道：与 CLI 的 runChannels 一致，每个渠道单独跑完整流程。
+	// 不能「签一次再改文件」——v2/v3 签名覆盖整个文件，签完再插入渠道信息会立刻失效。
+	if opts.IsEnabled("E4") && len(opts.Channels) > 0 {
+		ext := filepath.Ext(out)
+		base := strings.TrimSuffix(out, ext)
+		outs := make([]string, 0, len(opts.Channels))
+		var lastRes *pipeline.Result
+		var lastSize int
+		for _, ch := range opts.Channels {
+			child := opts
+			child.Channels = []string{ch}
+			p := base + "-" + sanitizeChannel(ch) + ext
+			size, res, err := runAndWrite(ctx, &child, p)
+			if err != nil {
+				writeJSON(w, http.StatusOK, runResponse{Error: "渠道 " + ch + " 产出失败: " + err.Error()})
+				return
+			}
+			outs = append(outs, p)
+			lastRes, lastSize = res, size
+		}
+		log.Printf("多渠道加固完成: %s -> %d 个包 (%v)", opts.In, len(outs), outs)
+		writeJSON(w, http.StatusOK, buildRunResponse(lastRes, outs, lastSize))
+		return
+	}
+
+	size, res, err := runAndWrite(ctx, &opts, out)
 	if err != nil {
 		writeJSON(w, http.StatusOK, runResponse{Error: err.Error()})
 		return
 	}
+	log.Printf("加固完成: %s -> %s (%d 字节, %d 项)", opts.In, out, size, len(res.Ran))
+	writeJSON(w, http.StatusOK, buildRunResponse(res, []string{out}, size))
+}
 
-	out := opts.Out
-	if out == "" {
-		ext := filepath.Ext(opts.In)
-		out = strings.TrimSuffix(opts.In, ext) + "-protected" + ext
-	}
-	if err := os.WriteFile(out, res.APK, 0o644); err != nil {
-		writeJSON(w, http.StatusOK, runResponse{Error: "写出 APK 失败: " + err.Error()})
-		return
-	}
-
+// buildRunResponse 把一次（或一批同渠道）执行结果整理成返回体。
+func buildRunResponse(res *pipeline.Result, outs []string, size int) runResponse {
 	ran := make([]string, 0, len(res.Ran))
 	for _, id := range res.Ran {
 		ran = append(ran, string(id))
 	}
-	log.Printf("加固完成: %s -> %s (%d 字节, %d 项)", opts.In, out, len(res.APK), len(res.Ran))
-
-	writeJSON(w, http.StatusOK, runResponse{
+	out := runResponse{
 		OK:       true,
-		Out:      out,
-		Size:     len(res.APK),
+		Out:      outs[0],
+		Size:     size,
 		Ran:      ran,
 		Notes:    res.Notes,
 		Stats:    res.Stats,
 		Duration: res.Duration.Round(time.Millisecond).String(),
-	})
+	}
+	if len(outs) > 1 {
+		out.Outs = outs
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

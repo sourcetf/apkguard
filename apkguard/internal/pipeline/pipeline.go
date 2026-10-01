@@ -126,6 +126,10 @@ func (r *Registry) Passes() []Pass { return r.passes }
 type Result struct {
 	// APK 是加固后的 APK 字节流（未签名，若启用了 E1 则已签名）。
 	APK []byte
+	// IDSig 是 v4 签名文件（.idsig）的内容，未启用 v4 时为 nil。
+	// 它是独立于 APK 的第二个文件，调用方应当与 APK 一并落盘
+	// （约定文件名：<APK 路径>.idsig）。
+	IDSig []byte
 	// Notes 是各 Pass 的说明汇总。
 	Notes []string
 	// Stats 是各 Pass 的统计汇总。
@@ -201,6 +205,9 @@ func (p *Pipeline) Run(ctx context.Context, opts *config.Options) (*Result, erro
 	}
 
 	res.APK = out
+	if v, ok := art.Get(sharedKeyIDSig).([]byte); ok {
+		res.IDSig = v
+	}
 	res.Notes = art.Notes
 	res.Stats = art.Stats
 	res.Duration = time.Since(start)

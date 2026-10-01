@@ -33,6 +33,15 @@ type CodeItemFull struct {
 	Insns        []uint16
 	Tries        []TryItem
 	Handlers     []CatchHandler
+	// HandlerOffs 是每个处理器**在原始字节流中**的起始偏移（与 try_item 的
+	// handler_off 同一基准：相对 encoded_catch_handler_list 的 size 字段起）。
+	//
+	// 为什么必须记录下来：读回内存的 handler 里存的是**类型索引**，而重命名会
+	// 改写这些索引；索引跨过 ULEB128 的 1→2 字节边界时任一处长度变化都会让后续
+	// 处理器整体后移。此时若「用内存里的 handler 重新编码一遍」来推算旧偏移，
+	// 得到的并不是文件里的真实偏移，映射查不到就静默沿用旧值，产物直接非法。
+	// 记录解析时的真实偏移后，映射的键始终是文件事实。
+	HandlerOffs []uint16
 }
 
 // ParseCodeItem 完整解析一个 code_item。
@@ -87,12 +96,18 @@ func ParseCodeItemBytes(d []byte) (*CodeItemFull, error) {
 			p += 8
 		}
 		// encoded_catch_handler_list
+		listStart := p
 		handlersSize, np, err := ULEB128(d, p)
 		if err != nil {
 			return nil, err
 		}
 		p = np
 		for i := uint32(0); i < handlersSize; i++ {
+			// 记录该处理器在列表内的真实起始偏移（handler_off 的基准）。
+			if p-listStart > 0xffff {
+				return nil, fmt.Errorf("%w: 处理器列表超过 65535 字节，handler_off 无法表示", ErrBadLayout)
+			}
+			ci.HandlerOffs = append(ci.HandlerOffs, uint16(p-listStart))
 			var size int32
 			size, p, err = SLEB128(d, p)
 			if err != nil {
@@ -167,9 +182,27 @@ func (ci *CodeItemFull) Encode(addrFix func(old uint32) uint32) []byte {
 	// （ClassNotFoundException），而 dex2oat 的 verify 模式并不报错，
 	// 因此本地极难发现。
 	//
-	// 做法：把处理器列表分别按「旧地址」与「新地址」编码两次，
-	// 得到每个处理器在两种编码下的起始偏移，建立映射后再改写 try_item。
-	_, oldOffs := encodeHandlerList(ci.Handlers, func(v uint32) uint32 { return v })
+	// 做法：先确定「旧偏移 -> 新偏移」的映射，再改写 try_item 的 handler_off。
+	//
+	// 旧偏移必须取自**解析时记录的真实值**（ci.HandlerOffs）。早期实现是
+	// 「用内存里的 handler 再编码一遍」来推算旧偏移，这在类型索引因改名而跨过
+	// ULEB128 的 1→2 字节边界时是错的：那时内存里已是新索引，重编码得到的布局
+	// 不是文件里的布局，映射键对不上，代码就静默沿用旧偏移——产物被 ART 判
+	//   "Failure to verify dex file: Bogus handler offset: N"
+	// 并整个 DEX 被丢弃（表现同样是 ClassNotFoundException）。
+	// 索引小的应用（如我们的测试应用）永远碰不到这个边界，所以此前没暴露。
+	var oldOffs []uint16
+	if len(ci.HandlerOffs) == len(ci.Handlers) {
+		oldOffs = ci.HandlerOffs
+	} else {
+		// 自建 code_item（注入类）没有原始字节，此时 handler 索引从未被改写，
+		// 恒等重编码得到的偏移就是真值。
+		_, offs := encodeHandlerList(ci.Handlers, func(v uint32) uint32 { return v })
+		oldOffs = make([]uint16, len(offs))
+		for i, o := range offs {
+			oldOffs[i] = uint16(o)
+		}
+	}
 	newHandlers, newOffs := encodeHandlerList(ci.Handlers, fix)
 	remap := make(map[uint32]uint32, len(oldOffs))
 	for i := range oldOffs {
@@ -185,6 +218,10 @@ func (ci *CodeItemFull) Encode(addrFix func(old uint32) uint32) []byte {
 		ho := uint32(t.HandlerOff)
 		if v, ok := remap[ho]; ok {
 			ho = v
+		} else if len(ci.HandlerOffs) == len(ci.Handlers) {
+			// 记了旧偏移却查不到，说明上游把 handler 结构改坏了——
+			// 绝不能静默沿用旧值，那会产出被 ART 丢弃的非法 DEX。
+			panic(fmt.Sprintf("dex: try_item.handler_off=%d 不在处理器起始偏移中（code_item 结构已损坏）", ho))
 		}
 		var b [8]byte
 		binary.LittleEndian.PutUint32(b[0:], s)

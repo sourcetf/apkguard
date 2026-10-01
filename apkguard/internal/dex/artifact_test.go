@@ -465,6 +465,162 @@ func checkDanglingRefs(t *testing.T, tag string, g *File, known map[string]bool,
 	}
 }
 
+// checkMemberRefs 校验产物里的**成员引用**都能在「本 APK 定义的类」里解析到。
+//
+// 与 checkDanglingRefs（只看类型引用）互补：改名是按名称字符串生效的，若某个
+// 成员引用在可见继承链里根本不存在，运行时会抛 NoSuchMethodError /
+// NoSuchFieldError —— 这类错误 ART 在加载期**不报**，只在执行到那一行时才崩，
+// 静态结构与 dex2oat verify 都看不见。实测就漏过一次（Termux 30 个 DEX 的
+// 跨 DEX 成员改名不一致）。
+//
+// 判定边界（避免误报）：只检查「继承链完全落在本 APK 内」的类。若祖先里有框架
+// 类型，其成员声明我们看不见，无从判定——那类问题需要库方法表，见 README 的
+// 已知局限。
+func checkMemberRefs(t *testing.T, tag string, files []*File) {
+	t.Helper()
+	type key struct{ name, proto string }
+	decl := map[string]map[key]bool{}
+	supers := map[string]string{}
+	ifaces := map[string][]string{}
+	for _, f := range files {
+		infos, err := f.ClassInfos()
+		if err != nil {
+			t.Fatalf("%s：读取类信息失败: %v", tag, err)
+		}
+		for i := range infos {
+			ci := &infos[i]
+			if decl[ci.Desc] == nil {
+				decl[ci.Desc] = map[key]bool{}
+			}
+			for _, m := range ci.Methods() {
+				decl[ci.Desc][key{m.Name, m.Proto}] = true
+			}
+			for _, fl := range ci.Fields() {
+				decl[ci.Desc][key{fl.Name, fl.Type}] = true
+			}
+			supers[ci.Desc] = ci.Super
+			ifaces[ci.Desc] = ci.Interfaces
+		}
+	}
+	// java.lang.Object 的成员不在 DEX 里重复声明，视作已知（否则全是误报）
+	decl["Ljava/lang/Object;"] = map[key]bool{
+		{"equals", "(Ljava/lang/Object;)Z"}: true, {"hashCode", "()I"}: true,
+		{"toString", "()Ljava/lang/String;"}: true, {"clone", "()Ljava/lang/Object;"}: true,
+		{"finalize", "()V"}: true, {"getClass", "()Ljava/lang/Class;"}: true,
+		{"notify", "()V"}: true, {"notifyAll", "()V"}: true, {"wait", "()V"}: true,
+		{"wait", "(J)V"}: true, {"wait", "(JI)V"}: true,
+		{"registerNatives", "()V"}: true, {"<init>", "()V"}: true,
+	}
+	// 继承链是否完全可见
+	invis := map[string]bool{}
+	var tainted func(d string, depth int) bool
+	tainted = func(d string, depth int) bool {
+		if v, ok := invis[d]; ok {
+			return v
+		}
+		invis[d] = false
+		if depth > 32 {
+			return false
+		}
+		res := false
+		for _, anc := range append([]string{supers[d]}, ifaces[d]...) {
+			if anc == "" || anc == "Ljava/lang/Object;" {
+				continue
+			}
+			if _, ok := decl[anc]; !ok {
+				res = true
+				break
+			}
+			if tainted(anc, depth+1) {
+				res = true
+				break
+			}
+		}
+		invis[d] = res
+		return res
+	}
+	resolves := func(cls string, k key) bool {
+		seen := map[string]bool{}
+		var walk func(d string, depth int) bool
+		walk = func(d string, depth int) bool {
+			if d == "" || seen[d] || depth > 32 {
+				return false
+			}
+			seen[d] = true
+			if decl[d][k] {
+				return true
+			}
+			if walk(supers[d], depth+1) {
+				return true
+			}
+			for _, i := range ifaces[d] {
+				if walk(i, depth+1) {
+					return true
+				}
+			}
+			return false
+		}
+		return walk(cls, 0)
+	}
+
+	var bad []string
+	for _, f := range files {
+		for i := uint32(0); i < f.NMethod; i++ {
+			ref, err := f.MethodRefAt(i)
+			if err != nil {
+				continue
+			}
+			cls, err := f.Type(uint32(ref.ClassIdx))
+			if err != nil || decl[cls] == nil || tainted(cls, 0) {
+				continue
+			}
+			n, err1 := f.String(ref.NameIdx)
+			pd, err2 := f.ProtoDesc(uint32(ref.ProtoIdx))
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			if !resolves(cls, key{n, pd}) {
+				bad = append(bad, fmt.Sprintf("方法 %s->%s%s", cls, n, pd))
+			}
+		}
+		for i := uint32(0); i < f.NField; i++ {
+			classIdx, typeIdx, nameIdx, err := f.FieldRefAt(i)
+			if err != nil {
+				continue
+			}
+			cls, err1 := f.Type(uint32(classIdx))
+			ft, err2 := f.Type(uint32(typeIdx))
+			n, err3 := f.String(nameIdx)
+			if err1 != nil || err2 != nil || err3 != nil || decl[cls] == nil || tainted(cls, 0) {
+				continue
+			}
+			if !resolves(cls, key{n, ft}) {
+				bad = append(bad, fmt.Sprintf("字段 %s->%s:%s", cls, n, ft))
+			}
+		}
+	}
+	sort.Strings(bad)
+	if len(bad) > 0 {
+		seen := map[string]bool{}
+		var uniq []string
+		for _, b := range bad {
+			if !seen[b] {
+				seen[b] = true
+				uniq = append(uniq, b)
+			}
+		}
+		t.Fatalf("%s：存在悬空成员引用 %d 处（运行时 NoSuchMethod/NoSuchFieldError）：%v",
+			tag, len(uniq), uniq[:min(len(uniq), 5)])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // TestArtifactS1NoDanglingRefs 检查纯混淆包（无壳）里有没有改名漏改的引用。
 //
 // S1 只开 A1/A2/A3/A4/A14 却闪退，而 S0（什么都不开）正常，
@@ -481,6 +637,7 @@ func TestArtifactS1NoDanglingRefs(t *testing.T) {
 	}
 	t.Logf("S1 定义的类: %v", allClassNames(t, g))
 	checkDanglingRefs(t, "S1-obf", g, known, []string{"Lcom/agtest/"})
+	checkMemberRefs(t, "S1-obf", []*File{g})
 }
 
 // TestArtifactShellOnlyNoDanglingRefs 检查壳包的载荷里有没有悬空引用。
@@ -512,13 +669,17 @@ func TestArtifactShellOnlyNoDanglingRefs(t *testing.T) {
 			known[n] = true
 		}
 	}
+	var payloads []*File
 	for _, p := range env.fs {
 		pg, err := Parse(p)
 		if err != nil {
 			t.Fatalf("解析载荷失败: %v", err)
 		}
+		payloads = append(payloads, pg)
 		checkDanglingRefs(t, "1-shell-only 载荷", pg, known, []string{"Lcom/agtest/"})
 	}
+	// 成员引用要跨全部载荷一起解析（类被拆到不同分片是常态）
+	checkMemberRefs(t, "1-shell-only 载荷", payloads)
 }
 
 // TestArtifactClassFlagsAreLegal 检查所有产物里的类标志是否落在「类能用的位」上。

@@ -39,6 +39,16 @@ APKSIGNER="$(exe "$BT/apksigner")"
 ZIPALIGN="$(exe "$BT/zipalign")"
 mkdir -p "$OUT"
 
+# 选一个**真正可用**的 python：Windows 上 python3 常指向应用商店的空壳
+# （命令存在但执行即失败），因此必须实际跑一次才算数。
+PY_BIN=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then
+    PY_BIN="$c"; break
+  fi
+done
+[ -n "$PY_BIN" ] || { echo "错误：找不到可用的 python（产物断言需要 3.x）" >&2; exit 1; }
+
 echo "############ 1) 构建测试 APK ############"
 bash "$ROOT/scripts/build-testapp.sh"
 IN="$APP/testapp-signed.apk"
@@ -66,10 +76,23 @@ harden 1-shell-only  -enable "A1,A2,A3,A4,B1,B2,B3,B4,A14,E1,E2,E3,E6"
 harden D1-debug-shell -enable "A1,A2,A3,A4,B1,B2,B3,B4,A14,E1,E2,E3,E6" -debug-shell
 harden 2-full-checks -enable "A1,A2,A3,A4,B1,B2,B3,B4,A14,E1,E2,E3,E6,C1,C4,C5,C6,D1,D2,D3,D4"
 harden D2-debug-full -enable "A1,A2,A3,A4,B1,B2,B3,B4,A14,E1,E2,E3,E6,C1,C4,C5,C6,D1,D2,D3,D4" -debug-shell
+# 此前 e2e 完全没有覆盖的混淆项：A5/A8/A9/A10/A11/A12/A13。
+# 它们只被单元测试碰过，而「加固 + 签名 + 对齐之后产物是否仍然合法」没人验过。
+harden 4-obf-full    -enable "A1,A2,A3,A4,A5,A8,A9,A10,A11,A12,A13,A14,E1,E2,E3,E6"
+# A5 单开（A11 同时启用时 A5 会让位，那样 A5 自身的实现就没人跑了）
+harden 5-res-a5-only -enable "A1,A4,A5,A14,E1,E2,E3,E6"
 # D5 设备绑定：绑一个不存在的设备标识，运行时应当被立即拦停（用来验证绑定确实生效）
 "$AG" -in "$IN" -out "$OUT/3-device-bind.apk"       -ks "$KS" -ks-pass 123456       -enable "B1,B2,B3,D5" -bind-device 0000000000000000       >"$OUT/3-device-bind.log" 2>&1 || {
   echo "加固失败："; tail -20 "$OUT/3-device-bind.log"; exit 1; }
 echo "-- 3-device-bind"
+
+# E4 多渠道：每个渠道单独走一遍「写入 → 对齐 → 签名」，产出多个 APK。
+# 不能「签一次再改文件」——v2/v3 覆盖整个文件，签完再改会让签名立刻失效。
+"$AG" -in "$IN" -out "$OUT/6-channels.apk" -ks "$KS" -ks-pass 123456 \
+      -enable "A1,A4,B1,B2,B3,A14,E1,E2,E3,E6,E4" -channels "huawei,xiaomi" \
+      >"$OUT/6-channels.log" 2>&1 || {
+  echo "加固失败："; tail -20 "$OUT/6-channels.log"; exit 1; }
+echo "-- 6-channels（E4：huawei/xiaomi）"
 
 echo
 echo "############ 4) 签名/对齐校验 ############"
@@ -90,7 +113,24 @@ echo "############ 5) 生成签名摘要（C1 载荷测试需要）############"
 echo "  摘要: $(cat "$OUT/signer-sha256.txt")"
 
 echo
-echo "############ 6) 产物级守卫（对刚生成的包做结构自检）############"
+echo "############ 6) 产物断言（启用的功能项必须真的生效）############"
+# 只验「签名有效 + 对齐正确」是不够的：那看不出「启用了 A9/A10/A12，
+# 产物里却什么都没有」这类失败——功能项声明为已实现、exit code 为 0，
+# 实际毫无作用。这里按功能项逐个检查产物特征。
+verify() {
+  local name="$1"; shift
+  local feats="$1"; shift
+  "$PY_BIN" "$ROOT/scripts/verify-products.py" "$OUT/$name" "$feats" "$@"
+}
+verify 4-obf-full.apk    "A4,A5,A8,A9,A10,A11,A12,A13"
+verify 5-res-a5-only.apk "A4,A5"
+verify 1-shell-only.apk  "B1,B2"
+verify 2-full-checks.apk "B1,B2"
+verify 6-channels-huawei.apk "B1,B2,E4" --channel huawei
+verify 6-channels-xiaomi.apk "B1,B2,E4" --channel xiaomi
+
+echo
+echo "############ 7) 产物级守卫（对刚生成的包做结构自检）############"
 # 这些检查都曾在真实缺陷上复现过 ART 的报错，
 # 覆盖：分支目标、异常处理器、shorty、static_values、字段操作码、outs_size、
 #       类标志、悬空引用与数组描述符、DEX 版本、载荷内容一致性。
@@ -98,7 +138,7 @@ echo "############ 6) 产物级守卫（对刚生成的包做结构自检）####
   | grep -E '^(=== RUN|--- (PASS|FAIL|SKIP)|ok|FAIL)|检查|体检|命中|解密落地|载荷类清单'
 
 echo
-echo "############ 7) 全量测试 ############"
+echo "############ 8) 全量测试 ############"
 (cd "$ROOT/apkguard" && go test ./... -count=1)
 
 echo

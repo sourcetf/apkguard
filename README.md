@@ -98,8 +98,40 @@ apkguard                     # 双击或直接运行 = 启动图形界面并自�
 完整排查过程、9 个缺陷的根因与复现方式见
 [`realworld/实测记录-RustDesk.md`](realworld/实测记录-RustDesk.md)。
 
-**受控测试应用**：`testapp/`（一个 Activity + 一个 ContentProvider + 辅助类），
-用于逐功能隔离验证，覆盖全部 31 个已实现项。
+**三个真实应用 × 全选项 × Android 16（API 36）**：Termux（30 DEX / 8576 类）、
+Dhizuku（3292 类）、RustDesk（Flutter / 5449 类）在启用全部 29 个可用功能项
+（D2/D3 因设备是已 root 的模拟器而按设计排除）后**全部正常运行**。
+本轮据此修掉 8 个缺陷（其中 3 个是「一装上就崩」级别），详见
+[`realworld/实测记录-三应用全选项.md`](realworld/实测记录-三应用全选项.md)。
+
+**受控测试应用 × Android 16（API 36）**：`testapp` 的 11 个产物在 x86_64 模拟器上
+逐个装机实测，**11/11 通过**（安装成功、运行正常或被按设计拦停、运行时零结构性错误）。
+覆盖了此前从未进入端到端链路的 A5/A8/A9/A10/A11/A12/A13 与 E4 多渠道，
+并因此查出一个「启用 A5/A11 的包在 Android 11+ 上装不上」的真缺陷（已修）。
+
+**受控测试应用**：`testapp/`（一个 Activity + 一个 ContentProvider + 辅助类 + 一个
+代表性业务类 `Features`），用于逐功能隔离验证。
+
+测试固件放在 [`testdata/`](testdata/README.md)（由 `testapp` 构建产物导出，共约 16 KB，
+**必须入库**）：此前 `dex`/`axml`/`passes`/`pipeline` 等包的样本加载器只认工作区里的
+临时路径，而那些路径都不在仓库里，于是干净检出下 **94 条测试被静默跳过**，
+`go test ./...` 却仍然显示 ok——README 里主打的「产物级守卫」在 CI 上一条都没跑。
+固件入库后这些测试在干净检出下也会真正执行。
+
+### 端到端矩阵
+
+`scripts/e2e.sh` 用 **9 组功能集**覆盖全部 31 个已实现项（早先只覆盖 22 项，
+A5/A8/A9/A10/A11/A12/A13/E4 从未进过端到端链路），并对产物做两类校验：
+
+1. **签名/对齐**：apksigner 校验 + `zipalign -c -p 4`；
+2. **产物断言**（`scripts/verify-products.py`）：逐功能项检查产物特征。
+   只验签名和对齐看不出「启用了 A9/A10/A12，产物里却什么都没有」这类失败——
+   功能项声明为已实现、退出码为 0，实际毫无作用。
+
+装机实测用 [`scripts/device-test.sh`](scripts/device-test.sh)：把产物逐个装到设备上
+并检查运行时行为（进程是否存活、有无 `VerifyError`/`ClassNotFoundException`/
+`UnsatisfiedLinkError`、壳日志是否出现）。「被检测拦停」与「结构损坏崩溃」在脚本里
+是两种不同的判定。
 
 ### 自动化守卫
 
@@ -114,10 +146,14 @@ apkguard                     # 双击或直接运行 = 启动图形界面并自�
 | 字段操作码 | 操作码宽度与字段类型匹配（`sput-object` vs `sput-wide` 等） | 全量 |
 | outs_size | ≥ 方法内任何 invoke 的参数字数 | 866 个方法体 |
 | 类标志 | 不出现 `ACC_STATIC` 等成员标志（真实工具链产出中为 0） | 全量 |
-| 悬空引用 | 改名后引用与数组描述符均能解析 | 全量 |
+| 悬空引用 | 改名后类型引用与数组描述符均能解析 | 全量 |
+| **悬空成员引用** | 方法与字段引用都能在可见继承链里解析（跨 DEX 一致） | 全量 |
+| 描述符合法性 | 类型表里不出现 `auo;`、`[[auo;` 这类非法描述符 | 全量 |
 | DEX 版本 | 新建用 037，重建时归一化到 ≥037 | 全量 |
 
-`go test ./...` 全绿。
+`go test ./...` 全绿（含签名、resources.arsc、批量处理等包的单测）。
+A5/A11 的**决定性判据**（资源 ID 逐条不变）用 Android 官方 `aapt2` 复核，
+只要 `ANDROID_HOME` 可用就会真正执行——此前它因为只认 Windows 路径而一直静默跳过。
 
 > ⚠️ `dex2oat --compiler-filter=verify` **不能**替代上述检查：它对
 > `handler_off`、`static_values` 这类结构错误返回 rc=0（漏报）。
@@ -125,7 +161,37 @@ apkguard                     # 双击或直接运行 = 启动图形界面并自�
 
 ### 已知局限
 
-- **安卓 16 未实测**：RustDesk 的验证是在安卓 11 上做的；安卓 16 模拟器（纯软件模拟）启动过慢，尚未跑通回归。
+- **A4 不裁剪字符串池**：A4 会清空 `class_def` 的 `source_file_idx` 与 code_item 的
+  `debug_info_off`（所以反编译视图里不再有 `MainActivity.java`、行号与局部变量名），
+  但**不会**把因此失去引用的字符串从池里删掉，`strings` 仍可能捞到 `*.java` 字面量。
+  安全地裁剪需要对全部引用做完整扫描，风险大于收益。
+  同理，`SourceDebugExtension`（以注解形式存在）目前也未清除。
+- **D4 覆盖范围**：实现是周期性地重复 C4/C5/C6 三项检查（调试器/注入/.so 改写），
+  默认 3 秒一轮、命中即 `_exit(1)`；**不包含**「单个方法的字节码被改写」。
+  原设计见 `剩余功能落地设计.md`，做成它需要先有 B5 的函数抽取基建。
+- **原生库为 16 KB 页对齐**（`p_align=0x4000`，Android 15+ 的要求，Google Play 自
+  2025-11 起对 targetSdk 35 的提交强制检查）；CI 与 `build_native.py --check`
+  都会断言这一点。若自行改了 C 代码，记得用 NDK r26+ 重新构建（脚本已带上
+  `-Wl,-z,max-page-size=16384`）。
+- **A1 的成员改名偏保守**：真实混淆器（R8/ProGuard）靠**库方法表**判断某个方法是否
+  覆写/继承自框架方法，本工具没有这份信息，只能用保守判据替代：① 继承链含框架
+  类型的类，其非私有实例方法不改名（可能是框架回调）；② 引用若在可见继承链里
+  找不到声明，说明声明来自看不见的父类型，名称保留；③ 多 DEX 应用里跨 DEX 共用的
+  成员名一致保留。**类改名不受影响**，但方法/字段改名比例下降（RustDesk 全开时
+  仅 15 个方法）。取舍理由见 `realworld/实测记录-三应用全选项.md`。
+- **D5 的设备标识必须由应用自报**：Android 8+ 的 `ANDROID_ID` 按应用签名作用域化，
+  `adb shell settings get secure android_id` 取到的是**原始值**，与应用内读到的不同
+  （实测同一台模拟器：`2ad89c08d44767b6` vs `32a023838d4d9174`）。正确做法是
+  `-debug-shell` 出排障版 → 在目标设备跑一次 → `adb logcat -s APKGUARD-D5` 读出
+  本机标识 → 作为 `-bind-device` 的值。
+- **`android:appComponentFactory` 会被指向框架默认实现**：该系统在壳接管
+  ClassLoader **之前**就要实例化它，而原工厂类（通常是
+  `androidx.core.app.CoreComponentFactory`）在加密载荷里——不改会让应用启动即
+  `ClassNotFoundException`（三个真实应用都声明了它）。改动保留标准组件实例化语义，
+  丢失的只有 androidx 的 `CompatWrapped` 包装特性。
+- **Android 16 的回归范围**：Android 16（API 36）x86_64 模拟器上，`testapp` 的 11 个
+  产物与上述三个真实应用都跑通了；但**没有覆盖更多机型/系统版本矩阵**，
+  上生产前仍建议在目标机型上跑完整回归。
 - 未实现的 7 项功能（A6/A7/B5/B6/B7/C2/C3）为**最高强度档**，启用会被 `-enable` 拒绝而不是静默跳过。
 - 加固会改变代码布局，**与依赖反射/签名的第三方框架可能存在兼容问题**；
   上生产前建议在目标机型上跑一遍完整回归。
@@ -139,9 +205,9 @@ apkguard                     # 双击或直接运行 = 启动图形界面并自�
 
 | 作业 | 内容 | 触发 |
 |---|---|---|
-| **构建与测试** | gofmt、go vet、内嵌原生库检查、六平台交叉编译（linux/darwin/windows × amd64/arm64）、单元测试、CLI 冒烟测试 | 每次推送 / PR |
-| **端到端** | 装 Android SDK 构建工具 → 从源码构建测试 APK → 用 6 组功能集加固 → apksigner/zipalign 校验 → 生成签名摘要 → 跑产物级守卫 → 全量测试 | 每次推送 / PR |
-| **原生库重建** | 用 NDK 重新编译 3 个 ABI，校验 `.agexpect` 段，并对比仓库中的预编译库以检出「改了 C 代码却没更新 .so」 | 手动触发，或提交信息含 `[native]` |
+| **构建与测试** | gofmt、go vet、内嵌原生库检查 + 摘要与 **16 KB 页对齐**校验、六平台交叉编译（linux/darwin/windows × amd64/arm64）、单元测试、CLI 冒烟测试 | 每次推送 / PR |
+| **端到端** | 装 Android SDK 构建工具 → 从源码构建测试 APK → 用 **9 组功能集**加固 → apksigner/zipalign 校验 → **产物断言** → 生成签名摘要 → 跑产物级守卫 → 全量测试 | 每次推送 / PR |
+| **原生库重建** | 用 NDK 重新编译 3 个 ABI，校验 `.agexpect` 段与 **16 KB 页对齐**，并对比仓库中的预编译库以检出「改了 C 代码却没更新 .so」 | 手动触发，或提交信息含 `[native]` |
 
 CLI 冒烟测试里有两条**行为断言**，而不只是「能跑起来」：
 
@@ -149,6 +215,10 @@ CLI 冒烟测试里有两条**行为断言**，而不只是「能跑起来」：
 - 启用签名（E1）却不给密钥库时必须报错。
 
 产物：六平台二进制、加固后的 APK、3 个 ABI 的原生库（保留 14 天）。
+
+> CI 不跑装机实测（没有设备）。有设备时用
+> `bash scripts/device-test.sh`（可加 `ROOTED_DEVICE=1` 表示设备已 root/是模拟器，
+> 此时带 D2/D3 的包被拦停属预期）。
 
 ### 本地跑同一套检查
 
@@ -159,9 +229,11 @@ GitHub Actions 可能因账号计费无法启动作业（注解会写
 ```bash
 export ANDROID_HOME=/path/to/android-sdk     # 跑端到端需要，否则跳过该段
 bash scripts/ci-local.sh
+
+bash scripts/device-test.sh                  # 有设备/模拟器时做装机实测
 ```
 
-### 两个踩过的 CI 坑（供参考）
+### 几个踩过的 CI 坑（供参考）
 
 1. **`.c` 文件不能放在 Go 包目录里**。Go 会把包目录下的 `.c` 当成 cgo 源文件，
    包内没有 `import "C"` 时直接报
@@ -172,6 +244,11 @@ bash scripts/ci-local.sh
    bash 把行尾回车符当成选项的一部分，CI 报
    `set: pipefail: invalid option name`。仓库已加 `.gitattributes` 强制 `eol=lf`；
    同步脚本也从 git 对象库读取内容，避免把工作区的 CRLF 带进仓库。
+3. **`build_native.py` 要能同时适配 Windows 与 Linux**：NDK 在 Windows 上提供
+   `<target>.cmd` 批处理包装、在 Linux/macOS 上提供同名 shell 脚本；NDK 位置也要
+   同时认 `ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT`（CI 的 `setup-ndk` 就是设这两个）
+   与 `$ANDROID_HOME/ndk/<版本>`。历史上该脚本只认 Windows 的硬编码路径，
+   于是 CI 的「原生库重建」作业从找到的 NDK 里一个 ABI 都编不出来。
 
 ---
 

@@ -17,6 +17,11 @@ import (
 // 顺序不可颠倒：v2+ 签名覆盖整个文件，签名后再做任何字节修改都会使签名失效。
 type DefaultSink struct{}
 
+// sharedKeyIDSig 是 v4 签名文件（.idsig）在 Artifact.Shared 中的键。
+// Sink 的返回值只有 APK 字节流，而 .idsig 是必须单独落盘的第二个文件，
+// 因此通过 Shared 交给调用方。
+const sharedKeyIDSig = "sign.idsig"
+
 // Finish 实现 Sink 接口。
 func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Options) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
@@ -31,6 +36,17 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 			return nil, fmt.Errorf(
 				"已禁用 v1 签名（-no-v1），但 AndroidManifest.xml 声明的 minSdkVersion=%d：Android 7.0 以下的系统只认 v1 签名，产物在这些设备上无法安装；请去掉 -no-v1，或确认不再支持 API 24 以下", m)
 		}
+	}
+
+	// ---- resources.arsc 必须以未压缩方式存放 ----
+	//
+	// 这是 Android 11+（targetSdk ≥ 30）的安装硬要求，违反时报
+	//   Failure [-124] ... requires the resources.arsc of installed APKs
+	//   to be stored uncompressed and aligned on a 4-byte boundary
+	// 注意 zipalign -c 查不出这个问题（它只检查未压缩条目的对齐），
+	// 所以必须在收尾处统一兜底，而不是指望各功能项自觉。
+	if err := storeResourceTable(art); err != nil {
+		return nil, err
 	}
 
 	// ---- E2: zipalign ----
@@ -59,18 +75,49 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 		return nil, fmt.Errorf("剥离旧签名块失败: %w", err)
 	}
 
+	// v3 签名块里的 SDK 区间必须覆盖真实设备，否则平台会跳过该 signer；
+	// apksig/AOSP 对「区间不含当前 SDK」的处理是抛 NoSupportedSignatures，
+	// 而不是悄悄回退到 v2——实测区间为 [0,0] 的包在 API 24 与 API 28 上
+	// 都是 `DOES NOT VERIFY`，也就是**根本装不上**。
+	//
+	// MinSDK/MaxSDK 为 0 表示「调用方没指定」（CLI 的 flag 有默认值，但
+	// Web UI 与任何库调用都只给零值）。这里按 apksig 的语义补齐：
+	// 下界取 Manifest 声明的 minSdkVersion（读不到则退到 24），上界取 INT_MAX。
+	def := sign.DefaultOptions()
+	minSDK := uint32(opts.MinSDK)
+	if minSDK == 0 {
+		if m := manifestMinSDK(art); m > 0 {
+			minSDK = uint32(m)
+		} else {
+			minSDK = def.MinSDK
+		}
+	}
+	maxSDK := uint32(opts.MaxSDK)
+	if maxSDK == 0 {
+		maxSDK = def.MaxSDK
+	}
+	if minSDK > maxSDK {
+		return nil, fmt.Errorf("v3 签名区间非法：minSdk=%d 大于 maxSdk=%d", minSDK, maxSDK)
+	}
+
 	sr, err := sign.Sign(clean, ks, sign.Options{
 		V1:     !opts.NoV1,
 		V2:     !opts.NoV2,
 		V3:     !opts.NoV3,
 		V4:     opts.V4,
-		MinSDK: uint32(opts.MinSDK),
-		MaxSDK: uint32(opts.MaxSDK),
+		MinSDK: minSDK,
+		MaxSDK: maxSDK,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("签名失败: %w", err)
 	}
 	signed := sr.APK
+	// v4 的签名文件（.idsig）是独立于 APK 的一个文件，必须交给调用方落盘——
+	// 否则 `-v4` 只是「算了一遍但没交给任何人」，CLI 的帮助文本却写着会生成它。
+	// 这里借 Shared 传给 pipeline.Result（Sink 的返回值只有 APK 字节流）。
+	if len(sr.IDSig) > 0 {
+		art.Put(sharedKeyIDSig, sr.IDSig)
+	}
 
 	var schemes []string
 	if !opts.NoV1 {
@@ -104,6 +151,27 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 	return signed, nil
 }
 
+// storeResourceTable 确保 resources.arsc 以未压缩方式存放。
+//
+// 任何改写资源表的功能项（A5/A11 会重写字符串池）都可能把它变成 DEFLATE，
+// 而 Android 11+ 的安装期校验明确要求它未压缩——不满足时安装会被直接拒绝，
+// 且现象是「装不上」而不是「跑起来崩」，很容易被误判成签名问题。
+func storeResourceTable(art *Artifact) error {
+	e := Find(art, "resources.arsc")
+	if e == nil || e.IsStored() {
+		return nil
+	}
+	data, err := e.Data()
+	if err != nil {
+		return fmt.Errorf("读取 resources.arsc 失败: %w", err)
+	}
+	if err := e.SetData(data, false); err != nil {
+		return fmt.Errorf("把 resources.arsc 改为未压缩存放失败: %w", err)
+	}
+	art.Note("resources.arsc 已改为未压缩存放（Android 11+ 的安装要求）")
+	return nil
+}
+
 // selfCheck 校验最终 APK 的结构完整性。
 func selfCheck(data []byte, art *Artifact) error {
 	a, err := zipx.Read(data)
@@ -119,6 +187,11 @@ func selfCheck(data []byte, art *Artifact) error {
 		if a.Find(want) == nil {
 			return fmt.Errorf("缺少必需条目 %s", want)
 		}
+	}
+
+	// resources.arsc 必须未压缩（Android 11+ 的安装要求）
+	if e := a.Find("resources.arsc"); e != nil && !e.IsStored() {
+		return fmt.Errorf("resources.arsc 必须未压缩存放，否则 Android 11+ 会拒绝安装")
 	}
 
 	// 每个 .dex 条目的头部与校验和
@@ -167,6 +240,11 @@ func checkDexEntry(e *zipx.Entry) error {
 		return fmt.Errorf("magic 非法")
 	}
 	if err := dex.Verify(data); err != nil {
+		return err
+	}
+	// 类型描述符必须合法：改名/注入类都会生成新描述符，出错时 ART 会丢弃
+	// 整个 DEX（表现为 ClassNotFoundException），而校验和是自洽的。
+	if err := dex.ValidateDescriptors(data); err != nil {
 		return err
 	}
 	return nil

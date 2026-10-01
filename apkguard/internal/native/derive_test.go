@@ -20,26 +20,39 @@ var tccCandidates = []string{
 	"tcc",
 }
 
-// findTCC 返回可用的宿主编译器路径；找不到时返回空串。
+// hostCC 描述一个可用于对拍的宿主编译器。
+type hostCC struct {
+	path string
+	// tiny 表示是 TinyCC：它支持 `-run` 直接编译并执行，无需落盘中间产物。
+	tiny bool
+}
+
+// findHostCC 返回可用的宿主编译器；找不到时返回零值。
 //
-// 返回的必须是绝对路径：Windows 的 CreateProcess 不会替调用方解析
-// 带 ".." 的相对路径，直接传相对路径会得到「找不到指定的路径」。
-func findTCC() string {
+// TinyCC 优先；没有时退回 cc/gcc/clang（CI 的 ubuntu runner 自带 gcc）。
+// 这条对拍是本包最重要的测试——Go 侧加密、C 侧解密，差 1 bit 就会让所有
+// 产物在真机上解不开自己的载荷，所以在任何有 C 编译器的环境都不该跳过。
+func findHostCC() hostCC {
 	for _, p := range tccCandidates {
 		st, err := os.Stat(p)
 		if err != nil || st.IsDir() {
 			continue
 		}
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			continue
+		// 必须是绝对路径：Windows 的 CreateProcess 不会替调用方解析
+		// 带 ".." 的相对路径，直接传相对路径会得到「找不到指定的路径」。
+		if abs, err := filepath.Abs(p); err == nil {
+			return hostCC{path: abs, tiny: true}
 		}
-		return abs
 	}
 	if p, err := exec.LookPath("tcc"); err == nil {
-		return p
+		return hostCC{path: p, tiny: true}
 	}
-	return ""
+	for _, name := range []string{"cc", "gcc", "clang"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return hostCC{path: p}
+		}
+	}
+	return hostCC{}
 }
 
 // TestDeriveMatchesNativeC 用 C 实现自测的输出对拍 Go 实现。
@@ -51,16 +64,30 @@ func findTCC() string {
 // C 代码同时会用 NIST 测试向量自检 SHA-256（见 apkguard.c 的 AG_HOST_TEST
 // 分支），因此这条对拍是建立在「C 的 SHA-256 本身已被验证」之上的。
 func TestDeriveMatchesNativeC(t *testing.T) {
-	tcc := findTCC()
-	if tcc == "" {
-		t.Skip("未找到 TCC，跳过 C/Go 派生一致性对拍（安装方式见 native/README.md）")
+	cc := findHostCC()
+	if cc.path == "" {
+		t.Skip("未找到宿主编译器（tcc/cc/gcc/clang），跳过 C/Go 派生一致性对拍")
 	}
-	src := "apkguard.c" // 与 derive.go 同目录
+	// C 源码在 csrc/ 子目录：放在包根目录会被 Go 当作 cgo 源文件而报错
+	// （见 build_native.py 顶部注释）。这里必须跟着走，否则本测试等于没跑。
+	src := filepath.Join("csrc", "apkguard.c")
 	if _, err := os.Stat(src); err != nil {
 		t.Skipf("找不到 C 源码 %s: %v", src, err)
 	}
 
-	cmd := exec.Command(tcc, "-DAG_HOST_TEST", "-run", "apkguard.c")
+	var cmd *exec.Cmd
+	if cc.tiny {
+		cmd = exec.Command(cc.path, "-DAG_HOST_TEST", "-run", src)
+	} else {
+		// cc/gcc/clang 不支持 -run：先编译出临时可执行文件再运行。
+		bin := filepath.Join(t.TempDir(), "apkguard-hosttest")
+		build := exec.Command(cc.path, "-DAG_HOST_TEST", "-O1", "-o", bin, src)
+		build.Dir = "."
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("编译 C 自测失败（%s）: %v\n%s", cc.path, err, out)
+		}
+		cmd = exec.Command(bin)
+	}
 	cmd.Dir = "."
 	out, err := cmd.CombinedOutput()
 	if err != nil {

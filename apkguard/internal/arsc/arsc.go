@@ -185,14 +185,22 @@ func (t *Table) Encode() ([]byte, error) {
 func (t *Table) decode(p int) (string, error) {
 	d := t.data
 	if t.utf8 {
-		// UTF-8 形式：u8len(varint) u16len(varint) bytes NUL
+		// UTF-8 形式：u16len(varint) u8len(varint) bytes NUL
+		//
+		// 顺序不能搞反：**先**是 UTF-16 码元数，**后**才是 UTF-8 字节数
+		// （AOSP ResStringPool::string8At 就是 decodeLength 两次）。
+		// 早期实现把第一个前缀当字节数用，于是任何非 ASCII 字符串都被截断
+		// （中文 1 个码元 = 3 字节），而 Encode() 会把截断后的值整池写回——
+		// 中文资源会被静默损坏。ASCII 串两者相等，因此本地测试与
+		// 「只比资源 ID」的用例都发现不了。
+		if _, n := uvarint(d, p); n <= 0 {
+			return "", fmt.Errorf("UTF-16 长度前缀非法")
+		} else {
+			p += n
+		}
 		u8len, n := uvarint(d, p)
 		if n <= 0 {
 			return "", fmt.Errorf("UTF-8 长度前缀非法")
-		}
-		p += n
-		if _, n = uvarint(d, p); n <= 0 {
-			return "", fmt.Errorf("UTF-16 长度前缀非法")
 		}
 		p += n
 		if p+int(u8len) > len(d) {
@@ -202,9 +210,11 @@ func (t *Table) decode(p int) (string, error) {
 		// 直接用标准解码在 BMP 以外会失败，因此逐段容错解码。
 		return decodeCESU8(d[p : p+int(u8len)]), nil
 	}
-	// UTF-16 形式：u16len(varint) units NUL
-	u16len, n := uvarint(d, p)
-	if n <= 0 {
+	// UTF-16 形式：长度是**小端 uint16**（超长时首字置 0x8000 标志、次字为低 16 位），
+	// 不是变长整数。用 uvarint 读会少读 1 字节，整个池解码成乱码
+	// （实测："res/layout/main.xml" 会变成 "爀攀猀⼀..."，即按字节错位）。
+	u16len, n := utf16PoolLen(d, p)
+	if n == 0 {
 		return "", fmt.Errorf("长度前缀非法")
 	}
 	p += n
@@ -212,6 +222,25 @@ func (t *Table) decode(p int) (string, error) {
 		return "", fmt.Errorf("字符串数据越界")
 	}
 	return decodeUTF16(d[p : p+int(u16len)*2]), nil
+}
+
+// utf16PoolLen 读取 UTF-16 池字符串的长度前缀。
+//
+// 约定与 internal/axml 的 utf16Len 一致：小端 uint16；若首字的最高位为 1，
+// 则它是长字符串标志，真实长度 = (首字 & 0x7fff) << 16 | 次字。
+func utf16PoolLen(d []byte, p int) (uint32, int) {
+	if p+2 > len(d) {
+		return 0, 0
+	}
+	v := binary.LittleEndian.Uint16(d[p:])
+	if v&0x8000 == 0 {
+		return uint32(v), 2
+	}
+	if p+4 > len(d) {
+		return 0, 0
+	}
+	lo := binary.LittleEndian.Uint16(d[p+2:])
+	return uint32(v&0x7fff)<<16 | uint32(lo), 4
 }
 
 // uvarint 读取 1~2 字节的无符号变长整数（池字符串的长度前缀格式）。

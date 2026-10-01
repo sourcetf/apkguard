@@ -10,6 +10,10 @@
 !/.github/
 
 # 说明文档与设计文档
+#
+# .gitattributes 必须入库：它强制 eol=lf，是 CI 的 shell 脚本与 gofmt 的前提。
+# 只放行 .gitignore 而漏掉它会让它永远进不了仓库（根规则 /* 会挡住）。
+!/.gitattributes
 !/.gitignore
 !/README.md
 !/*.md
@@ -81,3 +85,19 @@ tmp/
 # 它们是我们自己的构建产物（3 个 ABI 合计 48 KB），属于构建输入，
 # 与「不提交二进制产物」的一般原则不冲突。
 !/apkguard/internal/native/prebuilt/*/libapkguard.so
+
+# ---- 例外：测试固件必须入库 ----
+#
+# testdata/ 里是 testapp 构建产物（APK 12 KB、DEX 6 KB、二进制 Manifest 2 KB），
+# 供 dex/axml/passes/pipeline/cmd 等包的测试当样本用。
+#
+# 为什么必须入库：这几个包的样本加载器此前只认工作区里的临时路径
+# （iterator.apk.apk / dex_tmp/classes2.dex 等，都不在仓库里），
+# 于是干净检出（含 CI）下 94 条测试被静默跳过——go test 依然显示 ok，
+# 安全网等于不存在。固件入库后这些测试才真正运行。
+# 重新生成方式见 testdata/README.md。
+!/testdata/
+!/testdata/*.apk
+!/testdata/*.dex
+!/testdata/*.xml
+!/testdata/*.md

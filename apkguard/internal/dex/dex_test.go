@@ -12,11 +12,17 @@ import (
 
 // sampleDex 返回一个用于测试的真实 DEX 文件路径。
 //
-// 优先使用样本 APK 解出的 classes2.dex（classes.dex 是样本用于伪装的畸形文件）；
-// 不存在时跳过测试。
+// 查找顺序有讲究：
+//  1. 刚构建的 testapp DEX —— e2e/本地构建会生成，用的就是最终要装机的产物，
+//     因此不会与固件版本脱节；
+//  2. 仓库内的 testdata/sample.dex —— 保证**干净检出**（CI 的 build-test 作业）
+//     下测试真的有样本可用。没有它时本包近一半测试会被静默跳过，
+//     而 go test 依然显示 ok，安全网形同虚设。
 func sampleDex(t *testing.T) []byte {
 	t.Helper()
 	candidates := []string{
+		filepath.Join("..", "..", "..", "testapp", "build", "dex", "classes.dex"),
+		filepath.Join("..", "..", "..", "testdata", "sample.dex"),
 		filepath.Join("..", "..", "..", "dex_tmp", "classes2.dex"),
 		filepath.Join("..", "..", "..", "dex_tmp", "classes3.dex"),
 	}
@@ -138,7 +144,14 @@ func TestRebuildIdentity(t *testing.T) {
 		g.NString, g.NType, g.NMethod, g.NClass, len(out))
 }
 
-// TestRebuildDropDebugInfo 验证移除调试信息后仍可正常解析。
+// TestRebuildDropDebugInfo 验证 A4 真的清除了调试信息。
+//
+// 断言必须落到两个独立位置，它们是两件事：
+//  1. class_def 的 source_file_idx —— jadx/JEB 显示「Foo.java」的来源；
+//  2. code_item 的 debug_info_off —— 行号表与局部变量表。
+//
+// 只查「重建后还能解析」是不够的：那样即使实现整个失效也照样通过
+// （这条路以前就走通过——source_file_idx 一直没被清，测试全绿）。
 func TestRebuildDropDebugInfo(t *testing.T) {
 	data := sampleDex(t)
 	f, err := Parse(data)
@@ -158,7 +171,6 @@ func TestRebuildDropDebugInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("重建结果无法解析: %v", err)
 	}
-	// 移除调试信息后体积应减小或持平
 	t.Logf("原 %d 字节 -> 去调试信息后 %d 字节", len(data), len(out))
 	if len(out) > len(data) {
 		t.Errorf("移除调试信息后体积反而增大: %d -> %d", len(data), len(out))
@@ -166,6 +178,83 @@ func TestRebuildDropDebugInfo(t *testing.T) {
 	if g.NClass != f.NClass || g.NMethod != f.NMethod {
 		t.Error("移除调试信息不应改变类与方法数量")
 	}
+	// 样本必须真的带源文件名，否则下面的断言无从谈起。
+	if src := countSourceFiles(t, f); src == 0 {
+		t.Fatal("样本没有任何 class_def 带 source_file_idx，测试失去意义")
+	}
+
+	// 判据 1：源文件名必须全部消失。
+	if got := countSourceFiles(t, g); got != 0 {
+		t.Errorf("清除后仍有 %d 个类带源文件名（如 %s）", got, firstSourceFile(t, g))
+	}
+
+	// 判据 2：debug_info_off 必须全部归零。样本必须原本带调试信息。
+	before, err := countDebugInfo(t, f)
+	if err != nil {
+		t.Fatalf("统计样本调试信息失败: %v", err)
+	}
+	if before == 0 {
+		t.Fatal("样本没有任何 debug_info，测试失去意义")
+	}
+	after, err := countDebugInfo(t, g)
+	if err != nil {
+		t.Fatalf("统计产物调试信息失败: %v", err)
+	}
+	if after != 0 {
+		t.Errorf("清除后仍有 %d 个方法带 debug_info（原 %d 个）", after, before)
+	}
+	t.Logf("清除前 %d 个类带源文件名、%d 个方法带调试信息；清除后均为 0", countSourceFiles(t, f), before)
+}
+
+// countSourceFiles 统计带 source_file_idx 的类数量。
+func countSourceFiles(t *testing.T, f *File) int {
+	t.Helper()
+	infos, err := f.ClassInfos()
+	if err != nil {
+		t.Fatalf("读取类信息失败: %v", err)
+	}
+	n := 0
+	for _, ci := range infos {
+		if ci.SourceFile != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// firstSourceFile 返回第一个仍带源文件名的类（用于报错信息）。
+func firstSourceFile(t *testing.T, f *File) string {
+	t.Helper()
+	infos, err := f.ClassInfos()
+	if err != nil {
+		return "?"
+	}
+	for _, ci := range infos {
+		if ci.SourceFile != "" {
+			return ci.Desc + " -> " + ci.SourceFile
+		}
+	}
+	return ""
+}
+
+// countDebugInfo 统计带 debug_info 的方法体数量。
+func countDebugInfo(t *testing.T, f *File) (int, error) {
+	t.Helper()
+	n := 0
+	err := f.AllMethods(func(_, _ string, m EncodedMethod) error {
+		if m.CodeOff == 0 {
+			return nil
+		}
+		ci, err := f.ParseCodeItem(m.CodeOff)
+		if err != nil {
+			return err
+		}
+		if ci.DebugInfoOff != 0 {
+			n++
+		}
+		return nil
+	})
+	return n, err
 }
 
 // TestEncodeDecodeMUTF8 验证 MUTF-8 编解码往返。

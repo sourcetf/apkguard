@@ -5,18 +5,25 @@ import "fmt"
 // DevSpec 描述 D5（设备绑定）要注入的校验类。
 //
 // 绑定对象是 ANDROID_ID：它在「同一设备 + 同一签名证书 + 同一用户」下稳定，
-// 且重装换签名后会变化——正好符合设备绑定的语义。相比拿 Build.MODEL 之类
-// 拼一串指纹，单取 ANDROID_ID 的好处是使用方能一条命令取到它：
+// 且重装换签名后会变化——正好符合设备绑定的语义。
 //
-//	adb shell settings get secure android_id
+// **采集方式（重要）**：Android 8.0 起 ANDROID_ID 按「应用签名 + 用户 + 设备」
+// 作用域化，`adb shell settings get secure android_id` 取到的是**原始值**，
+// 与应用内 `Settings.Secure.getString(cr, "android_id")` 读到的并不是同一个串
+// （后者由系统按签名/包名再派生一次）。因此绑定值必须**由应用自己报出来**：
+// 用 `-debug-shell` 出一个排障版，在目标设备上跑一次，logcat 里会打印
 //
-// 这一点很重要：绑定信息必须由使用方在**目标设备**上采集，工具本身
-// 无法凭空得知。取值流程越简单，越不容易出错。
+//	I APKGUARD: AG-D5 本机标识=<值>
+//
+// 把这个值传给 `-bind-device` 即可。（排障版会暴露壳的存在与设备标识，
+// 只应出现在采集阶段，不要用于正式发布。）
 type DevSpec struct {
 	// Class 是校验类的描述符。
 	Class string
 	// Digest 是绑定目标的 SHA-256（32 字节）。
 	Digest [32]byte
+	// Debug 为 true 时，读取到的设备标识会打进 logcat（采集用）。
+	Debug bool
 }
 
 // DevEntry 是设备校验的入口方法名。
@@ -26,8 +33,12 @@ const DevEntry = "a"
 const (
 	descContentResolver = "Landroid/content/ContentResolver;"
 	descSettingsSecure  = "Landroid/provider/Settings$Secure;"
+	descLog             = "Landroid/util/Log;"
 	// androidIDKey 是 Settings.Secure 中设备标识的键名。
 	androidIDKey = "android_id"
+	// debugTag 是排障版打印设备标识用的 logcat 标签。
+	// 用独立标签是为了「一条 logcat -s APKGUARD-D5 就能拿到要绑定的值」。
+	debugTag = "APKGUARD-D5"
 )
 
 // DevAddition 构造设备绑定校验类。
@@ -166,6 +177,16 @@ func devCheckCode(sp *DevSpec) (*CodeBlob, error) {
 	}
 	a.MoveResultObject(rID)
 	a.IfEqz(rID, "done")
+	// 排障版把读到的标识打出来：Android 8+ 的 ANDROID_ID 是作用域化之后的
+	// 值，`settings get secure android_id` 取不到它，只能由应用自报。
+	if sp.Debug {
+		logI := MethodSpec{Class: descLog, Name: "i",
+			Proto: ProtoSpec{Ret: "I", Params: []string{descStringType, descStringType}}}
+		a.ConstString(rT0, debugTag)
+		if err := a.InvokeStatic([]int{rT0, rID}, logI); err != nil {
+			return nil, err
+		}
+	}
 	// got = MessageDigest.getInstance("SHA-256").digest(id.getBytes())
 	if err := a.InvokeVirtual([]int{rID}, getBytes); err != nil {
 		return nil, err

@@ -76,27 +76,44 @@ WORK="$APP/build"
 rm -rf "$WORK"
 mkdir -p "$WORK/classes" "$WORK/dex"
 
-echo "== 1/6 编译 Java 源码 =="
-# 找出全部源文件
-mapfile -t SRCS < <(find "$APP/src" -name '*.java')
-echo "   源文件 ${#SRCS[@]} 个"
-javac -nowarn -source 8 -target 8 \
-  -bootclasspath "$PLATFORM" -classpath "$PLATFORM" \
-  -d "$WORK/classes" "${SRCS[@]}"
+echo "== 1/7 编译资源 =="
+# res/ 存在时先编译成 .flat，交给 aapt2 link 打包进 resources.arsc。
+# 没有资源时 arsc 是空表，A5/A11（资源混淆）在端到端链路里就无从验证。
+RES_ARGS=()
+if [ -d "$APP/res" ]; then
+  "$AAPT2" compile --dir "$APP/res" -o "$WORK/res.zip"
+  RES_ARGS=("$WORK/res.zip")
+  echo "   已编译 $APP/res -> $WORK/res.zip"
+else
+  echo "   没有 res/ 目录，跳过"
+fi
 
-echo "== 2/6 生成 DEX =="
-mapfile -t CLASSES < <(find "$WORK/classes" -name '*.class')
-"$D8" --min-api 24 --output "$WORK/dex" "${CLASSES[@]}"
-ls -la "$WORK/dex/classes.dex"
-
-echo "== 3/6 链接资源与 Manifest =="
+echo "== 2/7 链接资源与 Manifest（并生成 R.java）=="
+mkdir -p "$WORK/gen"
 "$AAPT2" link \
   -o "$WORK/unsigned-base.apk" \
   --manifest "$APP/AndroidManifest.xml" \
   -I "$PLATFORM" \
-  --min-sdk-version 24 --target-sdk-version 34
+  --java "$WORK/gen" \
+  --min-sdk-version 24 --target-sdk-version 34 \
+  ${RES_ARGS[@]+"${RES_ARGS[@]}"}
 
-echo "== 4/6 放入 classes.dex =="
+echo "== 3/7 编译 Java 源码（src + 生成的 R.java）=="
+# 找出全部源文件（含 aapt2 生成的 R.java）
+mapfile -t SRCS < <(find "$APP/src" "$WORK/gen" -name '*.java')
+echo "   源文件 ${#SRCS[@]} 个"
+# -g 必须保留调试信息：A4（清除调试信息）与 StringUsage 的调试信息统计
+# 都以「样本里真的有调试信息」为前提，缺了它们相关测试只能跳过。
+javac -nowarn -g -source 8 -target 8 \
+  -bootclasspath "$PLATFORM" -classpath "$PLATFORM" \
+  -d "$WORK/classes" "${SRCS[@]}"
+
+echo "== 4/7 生成 DEX =="
+mapfile -t CLASSES < <(find "$WORK/classes" -name '*.class')
+"$D8" --min-api 24 --output "$WORK/dex" "${CLASSES[@]}"
+ls -la "$WORK/dex/classes.dex"
+
+echo "== 5/7 放入 classes.dex =="
 rm -f "$APP/testapp-unsigned.apk"
 "$PY_BIN" - "$WORK/unsigned-base.apk" "$WORK/dex/classes.dex" "$APP/testapp-unsigned.apk" <<'PY'
 import shutil, sys, zipfile
@@ -109,11 +126,11 @@ with zipfile.ZipFile(dst, "a", zipfile.ZIP_DEFLATED) as z:
 print("   已写入 classes.dex")
 PY
 
-echo "== 5/6 对齐 =="
+echo "== 6/7 对齐 =="
 rm -f "$APP/testapp-aligned.apk"
 "$ZIPALIGN" -f -p 4 "$APP/testapp-unsigned.apk" "$APP/testapp-aligned.apk"
 
-echo "== 6/6 签名 =="
+echo "== 7/7 签名 =="
 KS="$WORK/test.jks"
 keytool -genkeypair -keystore "$KS" -alias test -keyalg RSA -keysize 2048 \
   -validity 3650 -storepass 123456 -keypass 123456 \

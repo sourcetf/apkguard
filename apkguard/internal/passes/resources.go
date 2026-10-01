@@ -115,7 +115,13 @@ func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool,
 	if err != nil {
 		return fmt.Errorf("重写 %s 失败: %w", arscName, err)
 	}
-	if err := entry.SetData(out, true); err != nil {
+	// 压缩方式必须保持原样，**不能**强制压缩：
+	// Android 11+（targetSdk ≥ 30）要求 resources.arsc 以未压缩方式存放，
+	// 否则安装时直接失败——
+	//   Failure [-124] ... requires the resources.arsc of installed APKs
+	//   to be stored uncompressed and aligned on a 4-byte boundary
+	// 而 zipalign -c -p 4 查不出来（它只看未压缩条目的对齐）。
+	if err := entry.SetData(out, !entry.IsStored()); err != nil {
 		return fmt.Errorf("写回 %s 失败: %w", arscName, err)
 	}
 

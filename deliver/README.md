@@ -31,6 +31,43 @@
 
 > 手机上导入 `2-full-checks.apk` 应当**正常运行**：D2/D3 只在已 Root 或模拟器环境命中。
 
+## 装机实测结果（Android 16 / API 36 / x86_64 模拟器，已 Root）
+
+用 `scripts/device-test.sh` 逐个安装运行（`ROOTED_DEVICE=1`，该环境已 Root）：
+
+| 包 | 结果 |
+|---|---|
+| S0-plain / S1-obf / 1-shell-only / D1-debug-shell | **正常运行** |
+| **4-obf-full**（A5/A8/A9/A10/A11/A12/A13 一起开） | **正常运行** |
+| **5-res-a5-only**（A5 单开） | **正常运行** |
+| **6-channels-huawei / 6-channels-xiaomi**（E4 多渠道） | **正常运行** |
+| 2-full-checks / D2-debug-full | 被检测拦停 —— 模拟器 + Root 环境下属设计行为 |
+| 3-device-bind | 被拦停 —— 设计行为（设备指纹不符） |
+| **全部 11 个包** | 安装成功；**VerifyError / ClassNotFoundException / UnsatisfiedLinkError / FATAL EXCEPTION 均为 0** |
+
+排障版在 Android 16 上的完整壳链路日志：
+
+```
+I APKGUARD: AG1 壳已启动
+I APKGUARD: AG-L1 载荷已解密并落地
+I APKGUARD: AG-L2 DexClassLoader 就绪
+I APKGUARD: AG-L3 接管成功
+I APKGUARD: AG3 载荷解密并接管返回
+I APKGUARD: AG4 已委托原 Application
+I AGTEST  : HealthProvider.onCreate OK（ClassLoader 接管生效）
+I AGTEST  : MyApp.onCreate OK
+I AGTEST  : MainActivity.onCreate OK-跨分片
+I AGTEST  : Features.classify=-31 parse=42   ← 分支/switch/异常表在真机上跑通
+```
+
+> **这轮装机实测查出并修掉的一个真缺陷**：启用 A5/A11 的产物此前**根本装不上**
+> （`Failure [-124] ... requires the resources.arsc ... to be stored uncompressed`）——
+> 资源 pass 回写 `resources.arsc` 时把它压成了 DEFLATE，而 Android 11+ 要求它未压缩。
+> 签名校验与 `zipalign -c` **都发现不了**（zipalign 只检查未压缩条目的对齐），
+> 只有装机才会暴露；而此前的交付验证里恰好没有包含 A5/A11 的包。
+> 现在收尾阶段会统一把 `resources.arsc` 改为未压缩存放，并在 E3 自检与
+> `scripts/verify-products.py` 里各加了一条断言。
+
 ## 已实现的功能（31/38）
 
 - **混淆**：A1 改名、A2 字符串加密、A3 常量数组化、A4 去调试信息、A5 资源混淆、A8 诱饵类、A9 伪 DEX、A10 垃圾条目、A11 资源扁平化、A12 ZIP 路径攻击、A13 类膨胀、A14 时间戳统一

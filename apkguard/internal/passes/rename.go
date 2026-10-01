@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"apkguard/internal/arsc"
 	"apkguard/internal/axml"
 	"apkguard/internal/config"
 	"apkguard/internal/dex"
@@ -28,6 +29,28 @@ type renameClass struct{}
 func (renameClass) ID() config.FeatureID { return "A1" }
 func (renameClass) In() pipeline.Level   { return pipeline.LevelZip }
 func (renameClass) Out() pipeline.Level  { return pipeline.LevelZip }
+
+// classPkgOf 返回类描述符所属的「包前缀」，用于给新类名分配前缀。
+//
+// 返回值一定包含开头的 'L' 与结尾的 '/'（默认包只有 'L'）：
+//
+//	Lcom/a/B;  ->  Lcom/a/
+//	Lkf;       ->  L        ← 默认包
+//
+// 默认包这一支曾经返回空串，于是生成的新描述符是 "auo;" 这样
+// **缺 L** 的非法类型名，数组形式更会变成 "[[auo;"。ART 校验时报
+//
+//	Invalid type descriptor: '[[auo;'
+//
+// 并丢弃整个 DEX（表现同样是 ClassNotFoundException）。
+// 混淆过的应用（类名常被压成默认包里的 Lkf; 之类）必然踩到，而类都在包内的
+// 应用（如 RustDesk）则完全不会——所以这个缺陷藏得很深。
+func classPkgOf(desc string) string {
+	if i := strings.LastIndex(desc, "/"); i > 0 {
+		return desc[:i+1]
+	}
+	return "L"
+}
 
 func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *config.Options) error {
 	entries := pipeline.FindAll(art, isDexEntry)
@@ -59,6 +82,13 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 
 	keep := splitKeepRules(opts.KeepRules)
 	keepClasses := manifestComponents(art)
+	// 非 DEX 内容里按名字引用的类（布局中的自定义 View、资源字符串、assets 里的
+	// 类名等）也必须保留：这些引用是字符串，改类名不会同步改到它们。
+	dexFiles := make([]*dex.File, 0, len(units))
+	for _, u := range units {
+		dexFiles = append(dexFiles, u.file)
+	}
+	keepClasses = append(keepClasses, passiveClassRefs(art, dexFiles)...)
 
 	// ---- 第一轮：全局决策 ----
 	classMap := map[string]string{}
@@ -114,11 +144,7 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 				continue
 			}
 			seen[old] = true
-			pkg := ""
-			if i := strings.LastIndex(old, "/"); i > 0 {
-				pkg = old[:i+1]
-			}
-			cands = append(cands, cand{desc: old, pkg: pkg})
+			cands = append(cands, cand{desc: old, pkg: classPkgOf(old)})
 		}
 	}
 	sort.Slice(cands, func(a, b int) bool { return cands[a].desc < cands[b].desc })
@@ -137,6 +163,95 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		}
 	}
 
+	// ---- 第二轮前的全局成员名决策 ----
+	//
+	// 成员改名是按「名称字符串」生效的：同一个名字可能被多个 DEX 交叉引用
+	// （Termux 有 30 个 DEX，静态常量 TERMUX_HOME_DIR 正是如此）。若各 DEX
+	// 各自决策、各自生成新名，就会出现「定义方改了名、引用方仍是旧名」：
+	//   NoSuchFieldError: No field TERMUX_HOME_DIR of type ... in class ...
+	// 因此：① 先问每个 DEX 自己愿意改哪些成员名；② 只保留「所有用到它的 DEX
+	// 都愿意改」的名称；③ 由一份全局生成器统一命名，保证各 DEX 拿到同一个新名。
+	usedNames := map[string]bool{}
+	for _, u := range units {
+		for i := uint32(0); i < u.file.NType; i++ {
+			if t, err := u.file.Type(i); err == nil {
+				usedNames[t] = true
+			}
+		}
+	}
+	uses := make([]map[string]bool, len(units))
+	accept := make([]map[string]bool, len(units))
+	for i, u := range units {
+		uses[i] = u.file.MemberNameStrings()
+		for n := range uses[i] {
+			usedNames[n] = true
+		}
+		rn, err := dex.NewRenamer(u.file, dex.RenameConfig{
+			Keep:             keep,
+			ExtraKeepClasses: keepClasses,
+			ReflectedNames:   reflected,
+			ObfuscateFields:  true,
+			ClassMap:         classMap,
+		})
+		if err != nil {
+			return fmt.Errorf("%s 构造重命名器失败: %w", u.entry.NameString(), err)
+		}
+		plan, err := rn.Plan()
+		if err != nil {
+			return fmt.Errorf("%s 生成重命名计划失败: %w", u.entry.NameString(), err)
+		}
+		acc := map[string]bool{}
+		for old := range plan {
+			// 只取成员名；类描述符与数组描述符交给 ClassMap
+			if uses[i][old] && !isClassDesc(old) && !strings.HasPrefix(old, "[") {
+				acc[old] = true
+			}
+		}
+		accept[i] = acc
+	}
+
+	memberMap := map[string]string{}
+	memberKeep := map[string]bool{}
+	mseq := 0
+	allAccepted := map[string]bool{}
+	for _, acc := range accept {
+		for n := range acc {
+			allAccepted[n] = true
+		}
+	}
+	for name := range allAccepted {
+		globally := true
+		declined := false
+		for i := range units {
+			if !uses[i][name] {
+				continue
+			}
+			if !accept[i][name] {
+				globally = false
+				declined = true
+			}
+		}
+		if !globally {
+			// 有 DEX 不同意改名：必须**一致地保留**这个名称。
+			// 只把它排除在 MemberMap 之外是不够的——那样同意改名的 DEX 仍会
+			// 自行改名，制造出「定义方改了、引用方没改」的不一致。
+			if declined {
+				memberKeep[name] = true
+			}
+			continue
+		}
+		for {
+			mseq++
+			nw := encodeShortName(mseq)
+			if usedNames[nw] {
+				continue
+			}
+			usedNames[nw] = true
+			memberMap[name] = nw
+			break
+		}
+	}
+
 	// ---- 第二轮：各 DEX 应用重命名 ----
 	totalCls, totalM, totalF := 0, 0, 0
 	ok := 0
@@ -148,6 +263,8 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			ReflectedNames:   reflected,
 			ObfuscateFields:  true,
 			ClassMap:         classMap,
+			MemberMap:        memberMap,
+			MemberKeep:       memberKeep,
 		})
 		if err != nil {
 			return fmt.Errorf("%s 构造重命名器失败: %w", u.entry.NameString(), err)
@@ -166,6 +283,11 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		}
 		if err := dex.Verify(out); err != nil {
 			return fmt.Errorf("%s 重建后校验失败: %w", u.entry.NameString(), err)
+		}
+		// 生成新类名是本功能的核心动作，必须立刻确认产物里的类型描述符合法：
+		// 默认包类被算错前缀时会产生 "auo;" 这类非法名字，ART 会丢弃整个 DEX。
+		if err := dex.ValidateDescriptors(out); err != nil {
+			return fmt.Errorf("%s 重命名后描述符非法: %w", u.entry.NameString(), err)
 		}
 		if err := u.entry.SetData(out, true); err != nil {
 			return fmt.Errorf("写回 %s 失败: %w", u.entry.NameString(), err)
@@ -292,4 +414,106 @@ func manifestComponents(art *pipeline.Artifact) []string {
 		return nil
 	}
 	return f.ComponentClasses()
+}
+
+// passiveClassRefs 返回「被非 DEX 内容按名字引用」的类（Java 点分名）。
+//
+// 这些引用是**字符串**，与 DEX 里的类型引用无关，改类名不会同步改到它们：
+//
+//   - 布局中的自定义 View：`<com.foo.MyView .../>`。改名后布局解析直接失败
+//     InflateException: Error inflating class com.foo.MyView
+//     （实测 Termux：com.termux.app.terminal.TermuxActivityRootView）
+//   - resources.arsc 的字符串、assets 里的配置/清单里的类名同理
+//
+// 只保留「确实存在对应类」的名字，避免把普通字符串误当成类名而白白削弱混淆。
+func passiveClassRefs(art *pipeline.Artifact, files []*dex.File) []string {
+	types := map[string]bool{}
+	for _, f := range files {
+		for i := uint32(0); i < f.NType; i++ {
+			if t, err := f.Type(i); err == nil {
+				types[t] = true
+			}
+		}
+	}
+	found := map[string]bool{}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || found[s] || !looksLikeJavaClass(s) {
+			return
+		}
+		if types["L"+strings.ReplaceAll(s, ".", "/")+";"] {
+			found[s] = true
+		}
+	}
+	for _, e := range art.Entries() {
+		if isDexEntry(e) {
+			continue
+		}
+		name := e.NameString()
+		data, err := e.Data()
+		if err != nil {
+			continue
+		}
+		switch {
+		case name == "AndroidManifest.xml":
+			if f, err := axml.Parse(data); err == nil {
+				for _, s := range f.Strings() {
+					add(s)
+				}
+			}
+		case name == "resources.arsc":
+			if t, err := arsc.Parse(data); err == nil {
+				for _, s := range t.Strings() {
+					add(s)
+				}
+			}
+		case strings.HasPrefix(name, "res/") && strings.HasSuffix(strings.ToLower(name), ".xml"):
+			if f, err := axml.Parse(data); err == nil {
+				for _, s := range f.Strings() {
+					add(s)
+				}
+			}
+		case strings.HasPrefix(name, "assets/"):
+			for _, tok := range classLikeTokens(data) {
+				add(tok)
+			}
+		}
+	}
+	out := make([]string, 0, len(found))
+	for s := range found {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// classLikeTokens 从任意字节流中抽出「像类名」的 token（用于 assets 等文本内容）。
+func classLikeTokens(data []byte) []string {
+	const maxLen = 300
+	var out []string
+	start := -1
+	for i := 0; i <= len(data); i++ {
+		var c byte
+		if i < len(data) {
+			c = data[i]
+		}
+		isName := c == '_' || c == '$' || c == '.' ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if isName {
+			if start < 0 {
+				start = i
+			}
+			if i-start > maxLen {
+				start = -1
+			}
+			continue
+		}
+		if start >= 0 {
+			if s := string(data[start:i]); looksLikeJavaClass(s) {
+				out = append(out, s)
+			}
+			start = -1
+		}
+	}
+	return out
 }

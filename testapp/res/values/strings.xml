@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  字符串资源：让 testapp 产出的 resources.arsc 有真实内容。
+
+  在此之前 testapp 没有任何资源，arsc 是空的，于是 A5（资源混淆）/A11（资源
+  路径扁平化）在端到端链路里**无从验证**——测试会因「样本没有 ARSC 引用的
+  res/ 路径」而跳过。
+-->
+<resources>
+    <string name="app_name">agtest</string>
+    <string name="hello">AGTEST hello</string>
+</resources>

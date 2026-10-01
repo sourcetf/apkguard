@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  布局资源：提供**文件型**资源，使 resources.arsc 里出现 res/layout/main.xml
+  这样的路径条目。A5/A11 的判据（ResPaths 非空、被引用的路径必须被改名）
+  依赖的正是这类路径。
+-->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/main_text"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content" />

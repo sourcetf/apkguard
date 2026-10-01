@@ -544,6 +544,34 @@ func Finalize(data []byte) []byte {
 	return out
 }
 
+// MemberNameStrings 返回本 DEX 的 method_ids / field_ids 引用到的全部名称字符串。
+//
+// 多 DEX 场景要靠它判断「某个成员名是否被多个 DEX 共用」：共用的名称必须在全局
+// 统一决策与命名，否则会出现「一个 DEX 改了名、另一个仍引用旧名」，
+// 运行时报 NoSuchFieldError / NoSuchMethodError。
+func (f *File) MemberNameStrings() map[string]bool {
+	out := make(map[string]bool, f.NMethod+f.NField)
+	for i := uint32(0); i < f.NMethod; i++ {
+		ref, err := f.MethodRefAt(i)
+		if err != nil {
+			continue
+		}
+		if s, err := f.String(ref.NameIdx); err == nil {
+			out[s] = true
+		}
+	}
+	for i := uint32(0); i < f.NField; i++ {
+		_, _, nameIdx, err := f.FieldRefAt(i)
+		if err != nil {
+			continue
+		}
+		if s, err := f.String(nameIdx); err == nil {
+			out[s] = true
+		}
+	}
+	return out
+}
+
 // Verify 校验 DEX 的校验和与签名是否自洽。
 func Verify(data []byte) error {
 	if len(data) < 32 {

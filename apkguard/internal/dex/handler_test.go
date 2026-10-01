@@ -30,11 +30,22 @@ func checkTryHandlers(t *testing.T, tag string, f *File) int {
 		if len(ci.Tries) == 0 {
 			return nil
 		}
-		// 按当前字段重新编码处理器列表，得到合法起点集合。
-		_, offs := encodeHandlerList(ci.Handlers, func(v uint32) uint32 { return v })
+		// 合法起点必须取自**解析出的字节事实**（ci.HandlerOffs）。
+		//
+		// 早期实现是「用 encodeHandlerList 重算一遍」，也就是拿同一个编码器
+		// 校验自己：编码器若在「类型索引跨 ULEB128 边界」时算错偏移，重算出的
+		// 「合法集合」会跟着一起错，守卫恒为真——这个真缺陷正是这样躲过了整套
+		// 守卫（只有 Dhizuku 这种类型索引 >127 的大应用才会触发）。
 		valid := map[uint32]bool{}
-		for _, o := range offs {
-			valid[uint32(o)] = true
+		if len(ci.HandlerOffs) == len(ci.Handlers) {
+			for _, o := range ci.HandlerOffs {
+				valid[uint32(o)] = true
+			}
+		} else {
+			_, offs := encodeHandlerList(ci.Handlers, func(v uint32) uint32 { return v })
+			for _, o := range offs {
+				valid[uint32(o)] = true
+			}
 		}
 		// 指令边界集合（含 payload 起始）。
 		l, err := ParseInsns(ci.Insns)
@@ -73,6 +84,61 @@ func checkTryHandlers(t *testing.T, tag string, f *File) int {
 		t.Fatalf("%s 遍历失败: %v", tag, err)
 	}
 	return checked
+}
+
+// TestEncodeHandlerOffAfterTypeIndexGrowth 复现并钉住一个真实缺陷。
+//
+// 场景：重命名会把捕获类型的索引推大，一旦跨过 ULEB128 的 127→128 边界，
+// 该处理器在列表里就多占 1 字节，**后续处理器整体后移**。此时 try_item 的
+// handler_off 必须跟着改。
+//
+// 早期实现用「把内存里的 handler 重新编码一遍」推算旧偏移，而那时索引已经被
+// 改名改写过了，算出的「旧偏移」不是文件里的真值 → 映射键对不上 → 代码静默
+// 沿用旧偏移，产物被 ART 判 "Bogus handler offset" 并丢弃整个 DEX。
+// 索引小的应用碰不到这个边界，因此这个缺陷只在大应用上出现（实测 Dhizuku）。
+func TestEncodeHandlerOffAfterTypeIndexGrowth(t *testing.T) {
+	// 原始布局（HandlerOffs 记录的是解析时的字节事实）：
+	//   size(1) | handler0: size(1) type(1) addr(1) | handler1: size(-1) type(1) addr(1) all(1)
+	//   → handler0 在偏移 1，handler1 在偏移 4
+	ci := &CodeItemFull{
+		Registers: 2, Ins: 1, Outs: 1,
+		Insns: []uint16{0x000e, 0x0000, 0x000e, 0x0000},
+		// try 指向 handler1（会移动的那个）
+		Tries: []TryItem{{StartAddr: 0, InsnCount: 2, HandlerOff: 4}},
+		Handlers: []CatchHandler{
+			{Types: []uint32{1}, Addrs: []uint32{0}},
+			{Types: []uint32{2}, Addrs: []uint32{0}, CatchAll: true, AllAddr: 0},
+		},
+		HandlerOffs: []uint16{1, 4},
+	}
+	// 模拟重命名：把 handler0 的类型索引推到需要 2 字节 ULEB 的值
+	ci.Handlers[0].Types[0] = 300
+
+	out := ci.Encode(nil)
+	got, err := ParseCodeItemBytes(out)
+	if err != nil {
+		t.Fatalf("重新解析产物失败: %v", err)
+	}
+	if len(got.HandlerOffs) != 2 {
+		t.Fatalf("处理器数量应仍为 2，实际 %d", len(got.HandlerOffs))
+	}
+	// handler0 未动（偏移 1），handler1 因前面变长而移到 5
+	if got.HandlerOffs[0] != 1 || got.HandlerOffs[1] != 5 {
+		t.Fatalf("处理器新偏移应为 [1 5]，实际 %v", got.HandlerOffs)
+	}
+	valid := map[uint16]bool{}
+	for _, o := range got.HandlerOffs {
+		valid[o] = true
+	}
+	for _, tr := range got.Tries {
+		if !valid[tr.HandlerOff] {
+			t.Fatalf("try_item.handler_off=%d 未指向处理器起点 %v"+
+				"（ART 会判 Bogus handler offset 并拒绝整个 DEX）", tr.HandlerOff, got.HandlerOffs)
+		}
+	}
+	if tr := got.Tries[0].HandlerOff; tr != 5 {
+		t.Fatalf("指向 handler1 的 try_item.handler_off 应随之后移到 5，实际 %d", tr)
+	}
 }
 
 // TestArtifactTryHandlers 对全部交付包（含解密后的载荷）检查 try/handler 结构。

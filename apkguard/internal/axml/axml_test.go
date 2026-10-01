@@ -8,9 +8,13 @@ import (
 )
 
 // sampleManifest 返回样本 AndroidManifest.xml 的路径；不存在时跳过。
+//
+// testdata/AndroidManifest.xml 是仓库内固件（由 testapp 构建产物导出），
+// 它让本包测试在干净检出下也能真正运行——否则 11 条测试会全部静默跳过。
 func sampleManifest(t *testing.T) []byte {
 	t.Helper()
 	candidates := []string{
+		filepath.Join("..", "..", "..", "testdata", "AndroidManifest.xml"),
 		filepath.Join("..", "..", "..", "apk_extracted", "AndroidManifest.xml"),
 		filepath.Join("..", "..", "..", "payload_extracted", "AndroidManifest.xml"),
 	}

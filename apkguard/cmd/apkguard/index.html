@@ -90,7 +90,7 @@
         <label class="row"><span>设备绑定</span><input type="text" id="bind_device" placeholder="android_id（D5）"></label>
         <label class="row"><span>签名指纹</span><input type="text" id="sig_hash" placeholder="SHA-256 十六进制（D1）"></label>
         <label class="row"><span>名称前缀</span><input type="text" id="name_prefix" placeholder="A1 混淆类名前缀"></label>
-        <label class="row"><span>保留白名单</span><input type="text" id="keep_rules" placeholder="A1 规则文件路径"></label>
+        <label class="row"><span>保留白名单</span><input type="text" id="keep_rules" placeholder="A1 规则文件路径（每行一条）"></label>
         <label class="row"><span>最短加密</span><input type="number" id="obf_string_min" placeholder="0 = 全部（A2）"></label>
         <label class="row"><span>拆分份数</span><input type="number" id="split_count" placeholder="0 = 不拆（B4）"></label>
         <label class="row"><span>类膨胀数</span><input type="number" id="class_pad_count" placeholder="100（A13）"></label>
@@ -151,12 +151,21 @@ const PRESETS = {
 };
 function val(id) { return (document.getElementById(id).value || '').trim(); }
 function num(id) { const v = val(id); return v === '' ? undefined : Number(v); }
+// channels 必须按逗号切成数组：后端的 Options.Channels 是 []string，
+// 直接发字符串会让 json.Decode 报 "cannot unmarshal string into ... []string"，
+// 导致界面上任何一次「开始加固」都失败。
+function channels() {
+  const v = val('channels');
+  if (!v) return undefined;
+  const out = v.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+  return out.length ? out : undefined;
+}
 function collect() {
   const enabled = {};
   for (const f of state.features) enabled[f.id] = !!state.enabled[f.id];
   return {enabled: enabled, in: val('in'), out: val('out'), ks: val('ks'),
     ks_pass: val('ks_pass'), key_pass: val('key_pass'), ks_type: val('ks_type'),
-    alias: val('alias'), seed: val('seed'), channels: val('channels'),
+    alias: val('alias'), seed: val('seed'), channels: channels(),
     bind_device: val('bind_device'),
     sig_hashes: val('sig_hash') ? [val('sig_hash')] : undefined,
     name_prefix: val('name_prefix'), keep_rules: val('keep_rules'),
@@ -181,7 +190,13 @@ async function run() {
       return;
     }
     status('<span class="ok">加固完成（' + (d.duration || secs + 's') + '）</span>');
-    let html = '<div class="out">输出：' + d.out + '（' + (d.size / 1024).toFixed(1) + ' KB）</div>';
+    let html = '';
+    // 多渠道时后端逐个产出、返回多个路径；单渠道/单包时只有一个。
+    const outs = (d.outs && d.outs.length) ? d.outs : [d.out];
+    for (const o of outs) {
+      const kb = (o === d.out && d.size) ? '（' + (d.size / 1024).toFixed(1) + ' KB）' : '';
+      html += '<div class="out">输出：' + o + kb + '</div>';
+    }
     if (d.ran && d.ran.length) {
       html += '<p class="dim">执行了 ' + d.ran.length + ' 项：' + d.ran.join(', ') + '</p>';
     }

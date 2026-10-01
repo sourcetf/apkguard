@@ -19,9 +19,14 @@ import (
 // ---- 测试辅助 ----
 
 // sampleAPK 返回样本 APK 路径；不存在时跳过。
+//
+// 顺序：刚构建的 testapp（e2e 会生成，与装机产物一致）→ 仓库内固件
+// testdata/sample.apk（保证干净检出下不跳过）→ 开发机上的历史样本。
 func sampleAPK(t *testing.T) string {
 	t.Helper()
 	candidates := []string{
+		filepath.Join("..", "..", "..", "testapp", "testapp-signed.apk"),
+		filepath.Join("..", "..", "..", "testdata", "sample.apk"),
 		filepath.Join("..", "..", "..", "payload_apk", "payload.apk"),
 		filepath.Join("..", "..", "..", "iterator.apk.apk"),
 		filepath.Join("..", "..", "..", "iterator.apk"),
@@ -358,6 +363,19 @@ func TestDropDebugInfoE2E(t *testing.T) {
 		})
 		if bad > 0 {
 			t.Fatalf("%s 仍有 %d 个方法带调试信息", e.NameString(), bad)
+		}
+		// class_def 的 source_file_idx 也必须清空。
+		//
+		// 它与 code_item 的 debug_info_off 是两处独立数据：只清后者时，
+		// 反编译器仍会显示 "MainActivity.java"，A4 的目标就没达成。
+		infos, err := f.ClassInfos()
+		if err != nil {
+			t.Fatalf("读取类信息失败: %v", err)
+		}
+		for _, ci := range infos {
+			if ci.SourceFile != "" {
+				t.Fatalf("%s 的类 %s 仍带源文件名 %q", e.NameString(), ci.Desc, ci.SourceFile)
+			}
 		}
 		after += len(d)
 	}

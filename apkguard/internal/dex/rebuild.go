@@ -678,7 +678,13 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		} else {
 			cp.superIdx = pl.typeIdx[values[typeNameIdx(f, cd.SuperIdx)]]
 		}
-		if cd.SourceFileIdx == noIndex {
+		// A4（DropDebugInfo）要求连类级的源文件名一起清掉。
+		//
+		// 只丢 debug_info 是不够的：source_file_idx 才是 jadx/JEB 显示
+		// 「MainActivity.java」的入口，它在 class_def 里独立存在，
+		// 与 code_item 的 debug_info 无关。此前这里漏了这个分支，
+		// 结果 A4 清掉了行号表却把类名对应的源文件名留了下来。
+		if cd.SourceFileIdx == noIndex || opts.DropDebugInfo {
 			cp.sourceIdx = noIndex
 		} else {
 			cp.sourceIdx = pl.stringIdx[values[cd.SourceFileIdx]]
