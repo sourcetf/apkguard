@@ -58,7 +58,7 @@ case "$(uname -s)" in
 esac
 if "$LOCAL_BIN" -list >/dev/null 2>&1; then ok "-list 可执行"; else bad "-list 失败"; fi
 n="$("$LOCAL_BIN" -list | python3 "$ROOT/scripts/count-features.py")"
-[ "$n" -eq 40 ] && ok "功能项 40 个" || bad "功能项数量为 $n（应为 40）"
+[ "$n" -eq 46 ] && ok "功能项 46 个" || bad "功能项数量为 $n（应为 46）"
 
 printf 'x' > /tmp/ag-fake.apk
 # 注意：本脚本开了 pipefail，而这两条命令**预期会非零退出**（报错即成功）。

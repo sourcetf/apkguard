@@ -1073,7 +1073,23 @@ func loaderWriteCode(markReadOnly bool) (*CodeBlob, error) {
 	closeM := MethodSpec{Class: descFileOut, Name: "close", Proto: ProtoSpec{Ret: "V"}}
 	setRO := MethodSpec{Class: descFile, Name: "setReadOnly", Proto: ProtoSpec{Ret: "Z"}}
 
+	delM := MethodSpec{Class: descFile, Name: "delete", Proto: ProtoSpec{Ret: "Z"}}
+
 	a := NewAsm()
+	// f.delete()：先删掉可能存在的旧文件，再写。
+	//
+	// 必须删，不能直接覆盖：MarkReadOnly 打开时上一次启动已把 d0.dex 标记为
+	// 只读（0444），而 FileOutputStream 对已存在的只读文件**没有写权限**，
+	// 于是这次启动抛
+	//   java.lang.RuntimeException: Unable to instantiate application
+	//     java.io.FileNotFoundException: .../app_ag/d0.dex: open failed:
+	//     EACCES (Permission denied)
+	// 实测于 RustDesk（targetSdk ≥ 34 会打开 MarkReadOnly）：表现为
+	// 「装上第一次能开、第二次就崩」。删除只读文件在应用自己的目录里是允许的
+	// （目录可写即可），因此这是正确且最小的修法。
+	if err := a.InvokeVirtual([]int{rF}, delM); err != nil {
+		return nil, err
+	}
 	a.NewInstance(rOs, descFileOut)
 	if err := a.InvokeDirect([]int{rOs, rF}, osInit); err != nil {
 		return nil, err

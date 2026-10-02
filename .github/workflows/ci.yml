@@ -112,11 +112,11 @@ jobs:
           # 用 scripts/count-features.py 解析而不是内联 grep：
           # 默认启用标记是 U+221A（UTF-8 三字节），grep 的 . 是否按字符匹配依赖
           # locale；且 -list 每个功能项占两行、描述里也会出现 ID，直接数行会错。
-          echo "-- 功能项数量应为 40"
+          echo "-- 功能项数量应为 46"
           # 注意：本步骤的 working-directory 是 apkguard/，脚本在仓库根的 scripts/
           n="$("$BIN" -list | python3 ../scripts/count-features.py)"
           echo "   解析到 $n 项"
-          [ "$n" -eq 40 ] || { echo "::error::功能项数量不是 40（实际 $n）"; exit 1; }
+          [ "$n" -eq 46 ] || { echo "::error::功能项数量不是 46（实际 $n）"; exit 1; }
 
           # 未实现的功能项必须是显式错误，而不是静默跳过——
           # 否则使用者会以为自己拿到了 VMP/控制流混淆等防护，实际完全没有。

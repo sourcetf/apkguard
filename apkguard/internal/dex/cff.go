@@ -29,6 +29,22 @@ type ControlFlow struct {
 	Substitute bool
 	// MaxItems 是参与改写的方法的最大指令项数；0 表示取默认值 200。
 	MaxItems int
+	// JunkFill 为 true 时向方法体插入**无害花指令**：nop 填充 + 不可达前向跳转。
+	//
+	// 与不透明谓词的区别是它**不写任何寄存器**，因此不存在「写坏活跃寄存器」
+	// 的类型冲突风险（那正是 A6 早期形态在真实应用上崩掉的原因）。
+	// 代价是它只增加反编译噪音、不改变控制流图，属低强度手法，但覆盖面可以很大。
+	//
+	// JunkFill 是**独占模式**：开启后只做花指令填充，不注入不透明谓词、也不做
+	// 等价指令替换。这样 A20（花指令）与 A6（控制流混淆）在语义上彼此独立——
+	// A20 的产物里绝不会悄悄出现写寄存器的谓词（那是「偷偷开 A6」）。
+	JunkFill bool
+	// JunkNops 是 JunkFill 模式下每个方法插入的 nop 数量；0 表示默认 4。
+	//
+	// 硬上限 cffMaxJunkNops（8）：花指令的覆盖面靠「每个方法都插」，而不是
+	// 「每个方法插很多」。设上限可避免小方法被撑大数倍、增加 dex2oat 与运行时
+	// 校验负担，也避免入口附近的短距 goto 被迫加宽、进而扰动更多指令布局。
+	JunkNops int
 }
 
 // ControlFlowStats 汇总一次 A6 改写的量化结果与跳过原因分布。
@@ -47,6 +63,8 @@ type ControlFlowStats struct {
 	SkippedRegisters int
 	// FakeJumps 是插入「不可达跳转块」的方法数（无空闲寄存器时的兜底形态）。
 	FakeJumps int
+	// Nops 是 JunkFill 模式下插入的 nop 指令总数（A20）。
+	Nops int
 	// SkippedInit 是因是 <init>/<clinit> 而跳过的方法数。
 	SkippedInit int
 	// SkippedShape 是因方法体过小/过大、结尾非终结指令或含
@@ -363,6 +381,23 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 		return nil, nil, false, nil
 	}
 
+	// ---- A20：无害花指令填充（JunkFill，独占模式） ----
+	//
+	// 放在「形状/终结指令」判定之后、**寄存器扫描之前**：花指令不读写任何寄存器，
+	// 不需要（也不应依赖）寄存器使用信息，因此即便某方法含未覆盖的操作码，只要它
+	// 不含 try/payload、方法体规模合适，就仍然可以安全地填充，覆盖面由此最大化。
+	//
+	// 安全论证：本分支插入的指令只有 nop（0x00，无副作用）与 goto/16（0x29，只改
+	// pc），两者都**不产生任何寄存器定义或使用**。ART 校验器在真实入口处合并到的
+	// 类型状态与改写前逐位相同，因此不可能出现 A6 早期形态那种
+	//   VerifyError: Verifier rejected class pan.bbu: [0x6D] wide register v7
+	//   has type Low-half Constant/Conflict
+	// （RustDesk/Dhizuku 开启「会在入口写寄存器」的 A6 即崩、关掉即正常。）
+	// 这是 A20 能覆盖到极大方法集合却几乎没有真机回归风险的根因。
+	if cf.JunkFill {
+		return b.junkFillCodeItem(pl, ci, l)
+	}
+
 	// 扫描活跃寄存器：任何未覆盖的操作码都导致整个方法跳过。
 	used := map[int]bool{}
 	for i := 0; i < l.ItemCount(); i++ {
@@ -380,6 +415,17 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 		}
 		for _, r := range rs {
 			used[r] = true
+			// **必须把相邻寄存器也算占用**：DEX 里 long/double 占**两个**寄存器
+			// （低半 r、高半 r+1），而 cffRegs 只报告指令显式写出的那一个。
+			// 若只按 rs 判"空闲"，我们会挑中某个宽值的高半，往里写一个 int 常量，
+			// 校验器随即报
+			//   VerifyError: ... wide register v4 has type Long (Low Half)/Integer
+			// （实测 Dhizuku 的 dqg.equals/hashCode 与 RustDesk 的 pan.bbu.c，
+			// 都是 A6 一开就崩、关掉即正常。）
+			// 多算一格只会让我们更保守（少挑几个寄存器），不会写坏任何值。
+			if r+1 <= 15 {
+				used[r+1] = true
+			}
 		}
 	}
 
@@ -412,7 +458,6 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 	// 代价是优化过的 DEX 里这种寄存器很少，于是谓词往往插不进去。
 	// 为此下面提供了**不写任何寄存器**的兜底形态（不可达跳转块），
 	// 保证 A6 在真实产物上始终有效，而不是静默地什么都不做。
-	entryOnly := false
 	var vP, vT int
 	havePredicate := false
 	if len(free) >= 2 {
@@ -445,13 +490,8 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 	}
 
 	// ---- 不透明谓词注入 ----
-	maxPred := cf.MaxPredicates
-	if entryOnly {
-		// 复用可能活跃的寄存器只在入口安全，因此不允许其它锚点。
-		maxPred = 1
-	}
 	anchors := []int{0}
-	if maxPred > 1 {
+	if cf.MaxPredicates > 1 {
 		tset := map[int]bool{}
 		for _, br := range l.branches {
 			tset[br.target] = true
@@ -504,7 +544,7 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 		}
 		seen[a] = true
 		picked = append(picked, a)
-		if len(picked) >= maxPred {
+		if len(picked) >= cf.MaxPredicates {
 			break
 		}
 	}
@@ -567,6 +607,70 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 	st.MethodsRewritten++
 	// try/handler 偏移统一交给 Encode 重算（本切片不处理含 try 的方法，
 	// 但仍走同一条修正路径，保证行为与 A2/A3 一致）。
+	return ci.Encode(func(old uint32) uint32 { return FixAddr(m, old) }), fresh, true, nil
+}
+
+// cffMaxJunkNops 是 JunkFill 模式下每个方法插入 nop 的硬上限。
+//
+// 理由：花指令的价值来自「每个方法都插一点」带来的全局噪音，而不是单个方法里
+// 堆很多。上限 8 使单方法最多膨胀 8 个字（nop）+ 4 个字（两条 goto/16），
+// 相对常见方法体（几十到几百字）占比很小；无上限则小方法可能被撑大数倍，
+// 既拖慢 dex2oat/校验，又可能把入口附近的短距 goto 逼出 8 位范围而被迫加宽。
+const cffMaxJunkNops = 8
+
+// junkFillCodeItem 对单个 code_item 实施 A20 无害花指令填充。
+//
+// 插入形态（以入口为锚点）：
+//
+//	nop × N ; goto/16 :real ; goto/16 :real ; :real <原第一条指令>
+//
+// 第一条 goto 无条件跳过第二条，两条都**前向**汇聚到真实入口，第二条永远不可达。
+// 执行时前 N 个 nop 无副作用地落入第一条 goto，随即跳到真实入口，因此改写前后
+// 逐位语义相同。刻意不追加「尾部死代码块 + 跳回入口」，因为跳回入口会形成回边，
+// 校验器须在入口处合并入口态与末尾态，宽值寄存器可能冲突（A6 早期形态的真机崩溃）。
+//
+// 插入项与入口锚点共享旧偏移，Encode 的 old2new 以最后出现的项为准，因此
+// 旧偏移 0 映射到**锚点**的新位置：两条 goto 以及任何原有「跳回入口」的分支都会
+// 落到真实入口，而不是落进花指令块。
+func (b *builder) junkFillCodeItem(pl *plan, ci *CodeItemFull, l *InsnList) ([]byte, map[int]bool, bool, error) {
+	st := &pl.controlFlow.stats
+	cf := pl.controlFlow.spec
+
+	// 入口若恰好是 move-result*/move-exception（正常编译产物不会出现），
+	// 不能在其前插入——ART 要求 move-result 紧跟 invoke。
+	if !cffInsertable(l, 0) {
+		st.SkippedShape++
+		return nil, nil, false, nil
+	}
+
+	nops := cf.JunkNops
+	if nops <= 0 {
+		nops = 4
+	}
+	if nops > cffMaxJunkNops {
+		nops = cffMaxJunkNops
+	}
+
+	realOld := l.ItemOldOffset(0)
+
+	insns := make([][]uint16, 0, nops+2)
+	for i := 0; i < nops; i++ {
+		insns = append(insns, []uint16{0x0000}) // nop
+	}
+	// 两条 goto/16 的偏移字段由 Encode 依据 target 回填。
+	insns = append(insns, []uint16{0x0029, 0}, []uint16{0x0029, 0})
+	l.InsertBefore(0, insns...)
+
+	// 插入后两条 goto 的项下标：nops 个 nop 之后依次是 0x29、0x29。
+	l.AddBranch(nops, 1, 0, realOld, form20t)
+	l.AddBranch(nops+1, 1, 0, realOld, form20t)
+
+	st.Nops += nops
+	st.FakeJumps++
+	st.MethodsRewritten++
+
+	out, m, fresh := l.Encode()
+	ci.Insns = out
 	return ci.Encode(func(old uint32) uint32 { return FixAddr(m, old) }), fresh, true, nil
 }
 

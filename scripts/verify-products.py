@@ -12,6 +12,7 @@
 退出码：0 = 全部通过；1 = 有断言失败（会逐条打印原因）。
 """
 
+import io
 import re
 import sys
 import unicodedata
@@ -323,6 +324,78 @@ class Checker:
             if in_manifest:
                 self.check(not _decoy_is_provider(self.manifest),
                            "A8", "诱饵被声明成了 <provider>（会在启动时被实例化）")
+
+        # ---- A16 诱饵核心文件：大小写/同形变体，且绝不撞真名 ----
+        if self.want("A16"):
+            variants = [n for n in self.names if "/" not in n
+                        and n.lower() in ("androidmanifest.xml", "resources.arsc", "classes.dex")
+                        and n != n.lower() and n.lower() in ("androidmanifest.xml", "resources.arsc", "classes.dex")]
+            # 上面的写法会漏掉「同形但大小写混合」的形态，直接用精确名排除更稳：
+            variants = [n for n in self.names if "/" not in n
+                        and n.lower() in ("androidmanifest.xml", "resources.arsc", "classes.dex")
+                        and n not in ("AndroidManifest.xml", "resources.arsc", "classes.dex")]
+            self.check(bool(variants), "A16",
+                       "找不到大小写/同形变体的假核心文件（如 ANDROIDMANIFEST.XML）")
+            # 真核心文件必须恰好各一条，否则系统会读到假的、应用直接死。
+            for real in ("AndroidManifest.xml", "resources.arsc", "classes.dex"):
+                self.check(self.names.count(real) == 1, "A16",
+                           "真核心文件 %s 的条目数不是 1（系统可能读到假的那份）" % real)
+
+        # ---- A17 假内层 APK：assets 下存在一个能被打开的完整 APK ----
+        if self.want("A17"):
+            nested = []
+            # 重新打开归档读取条目内容：Checker 在 __init__ 的 with 块里只留了
+            # 条目名与 Manifest，闭包外再拿 ZipFile 会报「已关闭」。
+            with zipfile.ZipFile(self.apk) as zf:
+                blobs = {n: read_bytes(zf, n) for n in self.names if n.startswith("assets/")}
+            for n, blob in blobs.items():
+                if not blob.startswith(b"PK"):
+                    continue
+                try:
+                    iz = zipfile.ZipFile(io.BytesIO(blob))
+                except Exception:
+                    continue
+                inner = iz.namelist()
+                if ("AndroidManifest.xml" in inner and "resources.arsc" in inner
+                        and any(x.startswith("classes") and x.endswith(".dex") for x in inner)):
+                    nested.append(n)
+            self.check(bool(nested), "A17",
+                       "assets 下找不到「自带 Manifest/arsc/dex 的完整假 APK」")
+
+        # ---- A18 Manifest 诱饵元数据：自定义权限 + required=false 特性 ----
+        #
+        # 必须用 manifest_contains（UTF-8 与 UTF-16LE 都试）：二进制 AXML 的字符串
+        # 池通常是 UTF-16，裸字节搜 ASCII 一定搜不到（这一点踩过一次）。
+        if self.want("A18"):
+            self.check(manifest_contains(self.manifest, ".permission."), "A18",
+                       "Manifest 里找不到自定义权限声明（诱饵权限没生效）")
+            self.check(not manifest_contains(self.manifest, "android.permission."), "A18",
+                       "Manifest 里出现了系统权限名（应只用系统未定义的自定义权限，避免影响安装与授权）")
+            self.check(manifest_contains(self.manifest, "uses-feature"), "A18",
+                       "Manifest 里找不到 uses-feature（诱饵特性没生效）")
+            self.check(manifest_contains(self.manifest, "queries"), "A18",
+                       "Manifest 里找不到 queries 包可见性声明（诱饵没生效）")
+
+        # ---- C7 原生库伪装：lib/ 下不再有 libapkguard.so，而是假名 ----
+        if self.want("C7"):
+            libs = [n for n in self.names if n.startswith("lib/") and n.endswith(".so")]
+            guard = [n for n in libs if "apkguard" in n.lower()]
+            self.check(not guard, "C7",
+                       "lib/ 下仍存在暴露身份的守卫库名：%s" % guard)
+            self.check(bool(libs), "C7",
+                       "lib/ 下没有任何 .so（守卫库被搬走了？C7 应与 C2 协调）")
+
+        # ---- A19 字符串池垃圾：DEX 里出现形似业务常量的注入串 ----
+        if self.want("A19"):
+            marks = [s for s in self.dex_strs
+                     if "_api_key" in s or "api.internal." in s or "X-" in s and "Token" in s]
+            self.check(bool(marks), "A19",
+                       "classes.dex 的字符串池里找不到注入的垃圾串特征")
+
+        # ---- A20 花指令：连续 nop（编译产物里不会连续出现）----
+        if self.want("A20"):
+            self.check(bytes([0, 0, 0, 0, 0, 0]) in self.shell_dex, "A20",
+                       "classes.dex 里找不到连续 nop 填充（A20 未生效）")
 
         # ---- A9 伪 DEX 块 ----
         if self.want("A9"):

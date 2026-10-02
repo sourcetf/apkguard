@@ -244,11 +244,16 @@ func TestCffSemanticEquivalence(t *testing.T) {
 		t.Fatalf("应至少改写 add/loop/mix/bits 四个方法，实际 %d（谓词 %d、替换 %d）",
 			st.ControlFlow.MethodsRewritten, st.ControlFlow.Predicates, st.ControlFlow.Substitutions)
 	}
-	if st.ControlFlow.Predicates < 4 {
-		t.Fatalf("应至少注入 4 组谓词，实际 %d", st.ControlFlow.Predicates)
+	// 两类插入任一发生即可：谓词/替换都需要「全方法未引用、且相邻格也未引用」的
+	// 寄存器（DEX 的 long/double 占两格，只按显式寄存器判空闲会写坏宽值的高半，
+	// 实测 Dhizuku/RustDesk 因此 VerifyError）。优化过的 DEX 里这种寄存器很少，
+	// 于是多数方法回退到**不需要寄存器**的不可达跳转块。断言的是"确实改写了"，
+	// 而不是"必须用某一种技术"—— 后者会让测试随寄存器分布变化而假失败。
+	if st.ControlFlow.MethodsRewritten < 4 {
+		t.Fatalf("应至少改写 4 个方法，实际 %d", st.ControlFlow.MethodsRewritten)
 	}
-	if st.ControlFlow.Substitutions == 0 {
-		t.Fatalf("应至少发生一次等价指令替换，实际 0")
+	if st.ControlFlow.Predicates+st.ControlFlow.FakeJumps == 0 {
+		t.Fatalf("既没有谓词也没有不可达跳转块：A6 静默失效")
 	}
 
 	f1, err := Parse(out)
@@ -326,8 +331,11 @@ func TestCffMultiPredicateSemantics(t *testing.T) {
 	if err := ValidateDescriptors(out); err != nil {
 		t.Fatal(err)
 	}
-	if st.ControlFlow.Predicates < 4 {
-		t.Fatalf("每方法最多 2 组谓词时总计应 >=4 组，实际 %d", st.ControlFlow.Predicates)
+	if st.ControlFlow.MethodsRewritten == 0 {
+		t.Fatalf("没有改写任何方法：A6 静默失效")
+	}
+	if st.ControlFlow.Predicates+st.ControlFlow.FakeJumps == 0 {
+		t.Fatalf("既没有谓词也没有不可达跳转块：A6 静默失效")
 	}
 	f1, err := Parse(out)
 	if err != nil {
@@ -382,6 +390,8 @@ func TestCffOpaquePredicateShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []byte{0x13, 0x13, 0x92, 0x91, 0x13, 0x95, 0x38}
+	// 无寄存器形态：两条连续的无条件 goto/16（第一条跳过第二条，两条都前向汇聚）。
+	fakeJump := []byte{0x29, 0x29}
 	got := make([]byte, 0, 32)
 	for i := 0; i < l.ItemCount(); i++ {
 		if !l.ItemIsInsn(i) {
@@ -389,8 +399,8 @@ func TestCffOpaquePredicateShape(t *testing.T) {
 		}
 		got = append(got, byte(l.ItemWords(i)[0]&0xff))
 	}
-	if !bytes.Contains(got, want) {
-		t.Fatalf("未在 add 方法中找到不透明谓词特征序列 % x（A6 可能静默失效）\n实际操作码: % x", want, got)
+	if !bytes.Contains(got, want) && !bytes.Contains(got, fakeJump) {
+		t.Fatalf("add 方法里既无谓词特征序列 % x、也无不可达跳转块 % x（A6 静默失效）\n实际操作码: % x", want, fakeJump, got)
 	}
 }
 

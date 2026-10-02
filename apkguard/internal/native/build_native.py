@@ -209,7 +209,7 @@ def build(ndk_bin):
         # 代价是几 KB 的填充。
         r = subprocess.run(
             [cc, "-shared", "-O2", "-fPIC", "-DAG_JNI",
-             "-Wl,-z,max-page-size=16384", "-o", out, SRC],
+             "-Wl,-z,max-page-size=16384", "-o", out, SRC, "-ldl", "-llog"],
             capture_output=True, text=True)
         if r.returncode != 0:
             print("  编译 %s 失败：\n%s" % (abi, r.stderr))

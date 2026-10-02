@@ -59,7 +59,9 @@ type loaderEnv struct {
 	// readOnly 记录被标记只读的文件路径（Android 14+ 要求动态加载的
 	// DEX 必须先 setReadOnly，否则系统拒绝加载）。
 	readOnly []string
-	assets   map[string][]byte
+	// deleted 记录被 File.delete() 删除的路径（用于断言「先删后写」）。
+	deleted []string
+	assets  map[string][]byte
 	// fs 是模拟文件系统：绝对路径 -> 文件内容。
 	fs map[string][]byte
 	// dexPath 是 DexClassLoader 构造时收到的 dexPath。
@@ -479,6 +481,23 @@ func installLoaderMocks(env *loaderEnv) func() {
 			env.readOnly = append(env.readOnly, p)
 			return 1, nil, nil
 		}
+	// 落盘前必须先删旧文件：MarkReadOnly 打开时上次启动留下的 d0.dex 是只读的，
+	// FileOutputStream 覆盖它没有写权限，真机会抛
+	//   FileNotFoundException: .../app_ag/d0.dex: open failed: EACCES
+	// （实测 RustDesk：第一次能开、第二次就崩）。这里把「删了哪些路径」记下来，
+	// 供测试断言「写之前确实先删」。
+	h["Ljava/io/File;->delete()Z"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			o, ok := in.objs[regs[0]].(*fakeObj)
+			if !ok {
+				return 0, nil, errf("delete 的接收者不是 File")
+			}
+			p, _ := o.aux.(string)
+			env.deleted = append(env.deleted, p)
+			// 删掉之后模拟文件系统里确实没有了，便于断言「先删后写」的顺序。
+			delete(env.fs, p)
+			return 1, nil, nil
+		}
 	h["Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V"] =
 		func(in *interp, regs []int) (int32, any, error) {
 			o, ok := in.objs[regs[0]].(*fakeObj)
@@ -747,6 +766,80 @@ func TestLoaderMarksDexReadOnly(t *testing.T) {
 		t.Fatalf("只读标记落在了错误的文件上: %v", env.readOnly)
 	}
 	t.Logf("已标记只读: %v", env.readOnly)
+}
+
+// TestLoaderDeletesStaleDexBeforeWrite 钉住「落盘前先删旧文件」。
+//
+// 真实缺陷（实测 RustDesk）：MarkReadOnly 打开时（targetSdk ≥ 34），上一次启动
+// 已把 d0.dex 标记为只读；第二次启动再写同一个路径时，FileOutputStream 对只读
+// 文件没有写权限，抛
+//
+//	java.lang.RuntimeException: Unable to instantiate application
+//	  java.io.FileNotFoundException: .../app_ag/d0.dex: open failed:
+//	  EACCES (Permission denied)
+//
+// 表现为「装上第一次能开、第二次就崩」——只有反复启动才会暴露。
+// 修法是写之前先 File.delete()：删只读文件在应用自己的目录里是允许的
+// （目录可写即可）。
+func TestLoaderDeletesStaleDexBeforeWrite(t *testing.T) {
+	key, iv := testPackKey, testPackIV
+	blob := mustEncrypt(t, Empty(), key, iv)
+
+	ls := &LoaderSpec{
+		Class:   "Lcom/apkguard/shell/Loader;",
+		Key:     key,
+		TempDir: "ag",
+		Items:   []LoaderItem{{Asset: "assets/pay_ab12.bin", DexName: "d0.dex", Size: len(blob)}},
+	}
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造 Loader 失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	const stale = "/data/user/0/app/ag/d0.dex"
+	env := &loaderEnv{
+		assets: map[string][]byte{"pay_ab12.bin": blob},
+		// 模拟上一次启动留下的文件（内容无关紧要，关键是它「已存在」）。
+		fs: map[string][]byte{stale: []byte("stale")},
+	}
+	restore := installLoaderMocks(env)
+	defer restore()
+
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, ls.Class)
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+
+	idx, off := findMethod(t, g, ls.Class, "->"+LoaderEntry+"(")
+	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("Loader.a 执行失败: %v", err)
+	}
+	deleted := false
+	for _, p := range env.deleted {
+		if p == stale {
+			deleted = true
+		}
+	}
+	if !deleted {
+		t.Fatalf("落盘前没有删除已存在的旧文件 %s，真机上会因只读而 EACCES", stale)
+	}
+	got, ok := env.fs[stale]
+	if !ok {
+		t.Fatal("删除旧文件后没有重新写入")
+	}
+	if string(got) == "stale" {
+		t.Fatal("写回的仍是旧内容：说明没有真正重写")
+	}
+	t.Logf("先删后写已生效：deleted=%v，重写后 %d 字节", env.deleted, len(got))
 }
 
 // TestLoaderInstallsClassLoader 验证接管链路确实把新 ClassLoader 写进了

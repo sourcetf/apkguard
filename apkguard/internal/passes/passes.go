@@ -32,6 +32,16 @@ func Registry() *pipeline.Registry {
 	r.Register(&constantArray{})
 	r.Register(&classPad{})
 	r.Register(&dropDebugInfo{})
+	// A6 控制流混淆。当前只启用**可证明安全**的两类插入：不透明谓词（仅用
+	// 「全方法未被任何指令引用」的寄存器）与不可达前向跳转。早期版本曾复用
+	// 任意局部寄存器，在 RustDesk/Dhizuku 上触发 ART 的宽值类型冲突
+	// （VerifyError: wide register ... Low-half Constant/Conflict），已移除那条路径。
+	r.Register(&controlFlow{})
+	// A20 花指令填充与 A6 同族（都改写方法体），紧跟其后。它只插入 nop 与
+	// 不可达前向跳转、不写任何寄存器，因此不存在 A6 那种宽值类型冲突。
+	r.Register(&nopFill{})
+	// A19 只往字符串池追加垃圾串、不触碰指令流，放在混淆段末尾即可。
+	r.Register(&strJunk{})
 	// A6（控制流混淆）**不注册**：实现与单元测试已就位（internal/dex/cff.go），
 	// 但在三个真实应用上实测会破坏产物（ART 报
 	//   VerifyError: ... wide register v7 has type Low-half Constant/Conflict），
@@ -43,6 +53,11 @@ func Registry() *pipeline.Registry {
 	r.Register(&resourceObf{})
 	r.Register(&resourceFlatten{})
 	r.Register(&decoyClass{})
+	// A18 与 A8 同构（都是往 Manifest 追加元素），放一起。
+	r.Register(&decoyMeta{})
+	// A16 假核心文件：纯 ZIP 层注入，位置不敏感，但必须在 A14 之前
+	// （A14 要统一所有新增条目的时间戳）。
+	r.Register(&decoyCore{})
 
 	// ---- 阶段3：L2 一代壳 ----
 	//
@@ -61,6 +76,9 @@ func Registry() *pipeline.Registry {
 	// B8 必须排在 B1 之后（要读加密载荷清单）、B3 之前（要改载荷条目名，
 	// 而 B3 生成 Loader 时会把这些名字内联进字节码）。
 	r.Register(&payloadContainer{})
+	// A17 假内层 APK：排在 B8 之后（B8 已建好同构的容器目录树，A17 往里放
+	// 一个「能被 apktool/jadx 打开的完整假 APK」，与真载荷同构）。
+	r.Register(&nestedDecoyAPK{})
 	r.Register(&appReplace{})
 	r.Register(&classLoader{})
 
@@ -72,6 +90,10 @@ func Registry() *pipeline.Registry {
 	// 同时它决定的密钥被 B1 使用——但 B1 是自行复算同一纯函数，
 	// 不依赖执行顺序。
 	r.Register(&nativeKeyDerive{})
+	// C7 必须排在 C2 与 C1 之后：C2 靠原始文件名识别并跳过守卫库（先改名会让它
+	// 把守卫库当业务库加密搬走），C1 才是注入守卫库与桥接类的那个 Pass，
+	// 而 C7 要改写 C1 写进壳 DEX 的库名。
+	r.Register(&libDisguise{})
 	r.Register(&antiDebug{})
 	r.Register(&antiHook{})
 	r.Register(&selfIntegrity{})

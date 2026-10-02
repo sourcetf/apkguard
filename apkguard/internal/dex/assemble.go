@@ -531,6 +531,8 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 	if pl.constArr != nil {
 		pl.constArr.count = 0
 	}
+	// 加宽统计每轮清零，理由同 A3/A6（assemble 会多次 generate）。
+	pl.widen = WidenStats{}
 	codeMap := map[uint32]uint32{}
 	for _, co := range codeOffs {
 		var blob []byte
@@ -599,6 +601,26 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 				if changed {
 					blob = nb
 					mergeSkip(sk)
+				}
+			}
+			// 字符串索引越界自动加宽：把新下标 >65535 的 const-string
+			// 换成 const-string/jumbo。
+			//
+			// 必须排在 A2/A3 **之后**：只有这两步改完之后，剩下的 0x1a 才是
+			// 真正需要加宽的对象（A2 会把部分 0x1a 直接换成 jumbo，A3 会换成
+			// 数组构造序列）；也必须排在 remapCode **之前**，因为 remapCode 按
+			// 固定宽度线性遍历，加宽改变了字位置，在其后做会让后续字全部错位。
+			//
+			// 本步会返回平移后的 skip：skip 是绝对字位置，插入一个字后其后
+			// 位置全部后移，平移错了 remapCode 会漏跳/错跳，静默损坏产物。
+			{
+				nb, nsk, changed, err := b.widenConstStrings(pl, blob, skip)
+				if err != nil {
+					return nil, err
+				}
+				if changed {
+					blob = nb
+					skip = nsk
 				}
 			}
 			// 修正 debug_info_off

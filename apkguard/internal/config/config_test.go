@@ -9,11 +9,11 @@ import (
 // TestAllFeaturesUnique 验证功能项 ID 唯一且数量符合设计文档。
 //
 // 设计文档列了 38 项，另有 2 项按参考样本的手法补充实现（A15 巨型 Manifest
-// 填充、B8 载荷容器化），因此总数为 40。
+// 填充、B8 载荷容器化、A16~A20 欺骗类、C2 SO 加壳、C7 原生库伪装），因此总数为 46。
 func TestAllFeaturesUnique(t *testing.T) {
 	fs := All()
-	if len(fs) != 40 {
-		t.Errorf("功能项数量应为 40，实际 %d", len(fs))
+	if len(fs) != 46 {
+		t.Errorf("功能项数量应为 46，实际 %d", len(fs))
 	}
 	seen := map[FeatureID]bool{}
 	for _, f := range fs {
@@ -33,7 +33,7 @@ func TestAllFeaturesUnique(t *testing.T) {
 	for _, f := range fs {
 		counts[f.ID[0]]++
 	}
-	want := map[byte]int{'A': 15, 'B': 8, 'C': 6, 'D': 5, 'E': 6}
+	want := map[byte]int{'A': 20, 'B': 8, 'C': 7, 'D': 5, 'E': 6}
 	for k, v := range want {
 		if counts[k] != v {
 			t.Errorf("%c 类功能项应为 %d 个，实际 %d", k, v, counts[k])

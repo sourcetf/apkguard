@@ -332,51 +332,22 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	// 若被改名会直接崩，必须按名字保留。
 	passiveMethods := passiveMethodRefs(art)
 
-	// ---- 16 位字符串索引的余量检查 ----
+	// 成员覆盖改名的规划。
 	//
-	// 「按条目覆盖」的成员改名要为每个新名字**追加字符串**，而重建后的池是按
-	// UTF-16 序排序的（DEX 要求 string_ids 有序，ART 会校验：
-	// 「Out-of-order string_ids」）。池一旦超过 65535，排序位移就可能让某个
-	// 原本合法的 const-string（16 位索引）落到 65536 以上，重建直接失败：
-	//
-	//	dex: 指令 0x1a @word 23 引用索引 65592 超出 16 位，需要指令加宽
-	//
-	// （实测：Termux 的 classes.dex 有 65866 个字符串，本身就超过 16 位，
-	// 原 DEX 用 jumbo 表达高位串；我们一追加字符串就可能越界。）
-	//
-	// 正确处理是「把越界的 const-string 加宽成 const-string/jumbo」，那需要
-	// 在指令流里做长度变化并重算偏移，属后续工作。在那之前这里**保守降级**：
-	// 只要有一个 DEX 的池已接近上限，就整体放弃追加字符串的改名通道
-	// （值键通道不新增字符串，保持与原行为一致）。做了多少、少了多少都会
-	// 写进 Note，绝不静默。
-	poolHeadroom := 0
-	for _, f := range dexFiles {
-		if int(f.NString) > poolHeadroom {
-			poolHeadroom = int(f.NString)
-		}
-	}
-	byIDDisabled := false
-	if poolHeadroom > 0xFFFF-1024 {
-		byIDDisabled = true
-	}
-
-	var memberRes *dex.MemberRenameResult
-	var err error
-	if byIDDisabled {
-		art.Note("A1：有 DEX 的字符串池已达 %d 个（16 位索引上限 65535），"+
-			"跳过「按条目覆盖」的成员改名通道——它需要追加字符串，会把池推过上限，"+
-			"导致 const-string 索引越界。正确修法是把越界的 const-string 加宽为 jumbo", poolHeadroom)
-	} else {
-		memberRes, err = dex.PlanMemberRenames(dexFiles, dex.MemberRenameConfig{
-			ClassMap:     classMap,
-			NameKeep:     passiveMethods,
-			Keep:         keep,
-			ExcludeNames: excludeNames,
-			Reserved:     reservedNames,
-		})
-		if err != nil {
-			return fmt.Errorf("成员覆盖改名规划失败: %w", err)
-		}
+	// 这里曾经有一条「池已达 16 位上限就整体跳过」的降级分支：追加字符串会把
+	// 字符串池推过 65535，而 const-string 的索引只有 16 位，越界时重建直接失败
+	// （实测 Termux 的 classes.dex 有 65866 个字符串）。**该降级已移除**——
+	// dex 层现在会把越界的 const-string 自动加宽成 const-string/jumbo
+	// （见 internal/dex/widen.go），于是追加字符串不再有 16 位越界风险。
+	memberRes, err := dex.PlanMemberRenames(dexFiles, dex.MemberRenameConfig{
+		ClassMap:     classMap,
+		NameKeep:     passiveMethods,
+		Keep:         keep,
+		ExcludeNames: excludeNames,
+		Reserved:     reservedNames,
+	})
+	if err != nil {
+		return fmt.Errorf("成员覆盖改名规划失败: %w", err)
 	}
 
 	// ---- 第二轮：各 DEX 应用重命名 ----

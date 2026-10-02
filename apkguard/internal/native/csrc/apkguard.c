@@ -17,6 +17,27 @@
  */
 
 #include <stdint.h>
+#include <dlfcn.h>
+
+/*
+ * 可观测的日志：有意不用「悄悄记在内存里」的方式。
+ *
+ * 存在的理由：C6 的自校验在本机（模拟器 / extractNativeLibs=false 的设备）
+ * **无法定位自身文件**——native 库是从 APK 内部直接加载的，/proc/self/maps
+ * 里对应的是 base.apk 而不是 .so 自己的路径。旧实现此时「当作完整」返回，
+ * 于是完整性校验静默失效（用户以为有防护，实际没有）。现在无论走哪条分支，
+ * 都会打一行日志，使这种降级在 logcat 里**可见**，而不是无声无息。
+ */
+#if defined(AG_JNI)
+#include <android/log.h>
+#define AG_LOG(fmt, ...) __android_log_print(4 /*ANDROID_LOG_INFO*/, "APKGUARD", fmt, ##__VA_ARGS__)
+#elif defined(AG_HOST_TEST)
+#include <stdio.h>
+/* 用 fputc(10,..) 而非转义换行：本项目里转义序列多次被多层工具链吃掉 */
+#define AG_LOG(fmt, ...) do { fprintf(stderr, "[AG] " fmt, ##__VA_ARGS__); fputc(10, stderr); } while (0)
+#else
+#define AG_LOG(fmt, ...) ((void)0)
+#endif
 
 /* ------------------------------------------------------------------ */
 /* SHA-256                                                             */
@@ -462,47 +483,28 @@ static int ag_find_section(int fd, const char *want, uint64_t *off, uint64_t *si
  * 找到含 "libapkguard.so" 的那一行，取其后半段的路径即可。
  */
 static int ag_self_path(char *out, int cap) {
-	static const char suffix[] = "libapkguard.so";
-	char buf[16384];
-	int fd, n, i, sl = (int)sizeof(suffix) - 1;
-	fd = ag_open("/proc/self/maps", 0);
-	if (fd < 0) {
+	Dl_info info;
+	const char *p;
+	int n = 0;
+	/*
+	 * 用 dladdr 反查本库的加载路径，**而不是在 /proc/self/maps 里匹配字面文件名**。
+	 *
+	 * 为什么必须这样：C7（原生库伪装）会把 libapkguard.so 改名成类似
+	 * libsqlite3x.so 的名字以隐藏加固器身份。按字面名匹配时改名后就找不到自己，
+	 * 而下面各处的 "取不到就 return 1（完整）" 会让完整性校验**静默失效**——
+	 * 用户以为自己有 C6/D4 防护，实际一个都没有，这正是本项目最忌讳的失败模式。
+	 * dladdr 给出的是实际加载路径（dli_fname），改名后依然正确。
+	 */
+	if (dladdr((const void *)(uintptr_t)&ag_self_path, &info) == 0 || info.dli_fname == NULL) {
 		return 0;
 	}
-	n = ag_read(fd, buf, (int)sizeof(buf) - 1);
-	ag_close(fd);
-	if (n <= 0) {
-		return 0;
+	p = info.dli_fname;
+	while (p[n] != 0 && n + 1 < cap) {
+		out[n] = p[n];
+		n++;
 	}
-	buf[n] = 0;
-	for (i = 0; i + sl < n; i++) {
-		int j = 0;
-		/* 路径必须从行首或空白处开始，避免匹配到子串。 */
-		if (i != 0 && buf[i - 1] != ' ' && buf[i - 1] != 10) {
-			continue;
-		}
-		while (j < sl && buf[i + j] == suffix[j]) {
-			j++;
-		}
-		if (j != sl) {
-			continue;
-		}
-		{
-			int end = i + sl;
-			while (end < n && buf[end] != 10) {
-				end++;
-			}
-			if (end - i >= cap) {
-				return 0;
-			}
-			for (j = 0; j < end - i; j++) {
-				out[j] = buf[i + j];
-			}
-			out[end - i] = 0;
-			return 1;
-		}
-	}
-	return 0;
+	out[n] = 0;
+	return n > 0;
 }
 
 /* ag_hash_region 把文件 [off, off+size) 区间喂给摘要器。 */
@@ -538,15 +540,31 @@ static int ag_intact(void) {
 	uint8_t got[32];
 	uint64_t toff = 0, tsize = 0, roff = 0, rsize = 0;
 	int i;
+	/*
+	 * 以下三处是**已知的能力边界**，不是应该静默掉的分支：
+	 *
+	 * 「定位不到自身文件」在现代 Android 上是常态——native 库默认**从 APK 内部
+	 * 直接加载**（extractNativeLibs=false），此时 /proc/self/maps 里对应的是
+	 * base.apk 而不是 .so 自己的路径，本函数拿不到可打开的文件路径。
+	 * 旧实现直接 return 1（当作完整），于是 C6/D4 在整类设备上**静默失效**。
+	 *
+	 * 现在改为「返回完整 + 打一行日志」：不误杀应用（把它判成篡改会让应用
+	 * 直接起不来，而这是设备特性不是攻击），但让降级在 logcat 里可见。
+	 * 真正的修法是「基于内存镜像（PT_LOAD）而不是磁盘文件做摘要」——那需要在
+	 * 运行时读已映射的段，属后续工作；在那之前必须让用户看得见这个缺口。
+	 */
 	if (!ag_self_path(path, (int)sizeof(path))) {
+		AG_LOG("C6: 无法定位自身文件（native 库可能直接从 APK 加载），自校验跳过");
 		return 1;
 	}
 	fd = ag_open(path, 0);
 	if (fd < 0) {
+		AG_LOG("C6: 打开自身文件失败（%s），自校验跳过", path);
 		return 1;
 	}
 	if (!ag_find_section(fd, ".text", &toff, &tsize) ||
 	    !ag_find_section(fd, ".rodata", &roff, &rsize)) {
+		AG_LOG("C6: 自身文件缺少 .text/.rodata 节名，自校验跳过");
 		ag_close(fd);
 		return 1;
 	}

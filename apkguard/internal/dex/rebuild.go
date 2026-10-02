@@ -144,6 +144,12 @@ type RebuildOptions struct {
 	DropDebugInfo bool
 	// CodeReplacements 以旧 code_item 偏移为键替换方法体。
 	CodeReplacements map[uint32][]byte
+	// ExtraStrings 是额外注入字符串池的字符串（A19 字符串池垃圾）。
+	//
+	// 与 Addition 里的字符串不同：这些字符串**不被任何指令引用**，纯粹是
+	// 给 strings/grep 制造噪音。因此它们只会出现在池里，不影响任何索引。
+	ExtraStrings []string
+
 	// StringEncrypt 非 nil 时启用 A2 字符串加密。
 	StringEncrypt *StringEncrypt
 	// ConstantArray 非 nil 时启用 A3 常量数组化。
@@ -199,6 +205,12 @@ type plan struct {
 
 	// controlFlow 非 nil 时启用控制流混淆（A6）。
 	controlFlow *controlFlowPlan
+
+	// widen 记录「const-string 自动加宽」的统计。
+	//
+	// 加宽发生在每个 code_item 上、且 assemble 会迭代多次 generate 以收敛
+	// 数据区布局，因此在 generate 开头清零，避免统计翻倍（与 A3/A6 同理）。
+	widen WidenStats
 }
 
 // classPadPlan 记录 A13 的生成统计。
@@ -263,6 +275,16 @@ type RebuildStats struct {
 	ClassPad ClassPadStats
 	// ControlFlow 是 A6 控制流混淆的明细统计。
 	ControlFlow ControlFlowStats
+	// WidenedStrings 是被自动加宽为 const-string/jumbo 的指令数。
+	//
+	// 字符串池超过 65535 时，原本 16 位的 const-string 可能被重排到
+	// >65535 的新下标；这些指令会被自动加宽，使重建不再失败。
+	WidenedStrings int
+	// WidenSkipped 是因无法加宽而保持原样的指令数。
+	//
+	// 这类指令随后仍会让 remapCode 报「超出 16 位」，属于保守失败
+	// （宁可失败也不产出坏 DEX）。正常样本中应为 0。
+	WidenSkipped int
 }
 
 // RebuildWithStats 与 Rebuild 相同，但额外返回量化统计。
@@ -291,6 +313,8 @@ func RebuildWithStats(f *File, opts RebuildOptions) ([]byte, RebuildStats, error
 	if pl.controlFlow != nil {
 		st.ControlFlow = pl.controlFlow.stats
 	}
+	st.WidenedStrings = pl.widen.Widened
+	st.WidenSkipped = pl.widen.Skipped
 	return out, st, nil
 }
 
@@ -385,6 +409,12 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		// 而未替换的（如同时被类型表引用）仍需把密文额外加入。
 		for _, ct := range pl.strEnc.cipher {
 			extra[ct] = true
+		}
+	}
+	// A19：注入的垃圾字符串只需进池，不需要任何引用。
+	for _, s := range opts.ExtraStrings {
+		if s != "" {
+			extra[s] = true
 		}
 	}
 	// A3：常量数组化。

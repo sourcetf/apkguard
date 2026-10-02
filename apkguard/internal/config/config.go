@@ -94,7 +94,8 @@ type Feature struct {
 var implementedIDs = map[FeatureID]bool{
 	// 阶段2 L1 混淆
 	"A1": true, "A2": true, "A3": true, "A4": true, "A5": true, "A8": true, "A11": true,
-	"A9": true, "A10": true, "A12": true, "A13": true, "A15": true,
+	"A9": true, "A10": true, "A12": true, "A13": true, "A15": true, "A6": true,
+	"A16": true, "A17": true, "A18": true, "A19": true, "A20": true,
 	// 阶段1 签名 / 对齐 / 元数据
 	"A14": true, "E1": true, "E2": true, "E3": true, "E4": true, "E5": true, "E6": true,
 	// 阶段3 L2 一代壳
@@ -102,7 +103,7 @@ var implementedIDs = map[FeatureID]bool{
 	// 阶段2/3 运行时防护
 	"D1": true, "D2": true, "D3": true,
 	// 阶段4 L3 native 防护（已落地的部分）
-	"C1": true, "C2": true, "C4": true, "C5": true, "C6": true,
+	"C1": true, "C2": true, "C4": true, "C5": true, "C6": true, "C7": true,
 	"D4": true, "D5": true,
 }
 
@@ -180,6 +181,21 @@ func All() []Feature {
 			Note: "解压/解析成本剧增；可能被应用商店或加固检测按体积拒绝，默认关闭"},
 
 		// ---- 加壳类 ----
+		{ID: "A16", Name: "诱饵核心文件", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
+			Desc: "注入大小写/同形变体的假 AndroidManifest.xml、假 resources.arsc、假 classes.dex，内容都是可解析的合法结构",
+			Note: "参考样本的 ANDROIDMANIFEST.XML 手法；自动化工具会抓到假核心文件"},
+		{ID: "A17", Name: "嵌套 APK 诱饵", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
+			Desc: "在 assets 下放一个结构完整、可被 apktool/jadx 打开的假 APK（自带假 Manifest/arsc/dex），与真载荷同构",
+			Note: "对样本「内层真 APK」的反向利用：自动化脱壳脚本会满载而归地拿到假应用"},
+		{ID: "A18", Name: "Manifest 诱饵元数据", Group: GroupObf, Stage: StageL1, Risk: RiskSafe, Default: false,
+			Desc: "向 Manifest 注入假 uses-permission / meta-data / uses-feature（只用系统未定义的自定义权限名，零运行影响）",
+			Note: "与 A8 的假组件互补：让权限视图与组件表都充满噪音"},
+		{ID: "A19", Name: "字符串池垃圾注入", Group: GroupObf, Stage: StageL2, Risk: RiskSafe, Default: false,
+			Desc: "往每个 DEX 的字符串池注入大量未被引用的字符串（形似业务常量/URL/密钥片段），推高 strings 输出噪音",
+			Note: "会增大 DEX 体积；池接近 16 位上限的 DEX 会自动跳过"},
+		{ID: "A20", Name: "无害花指令填充", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
+			Desc: "向方法体插入 nop 填充与不可达前向跳转——不写任何寄存器，因此无类型冲突风险",
+			Note: "只增加反编译噪音、不改变控制流图，属低强度手法但覆盖面大"},
 		{ID: "B1", Name: "DEX 整体加密", Group: GroupPack, Stage: StageL2, Risk: RiskSafe, Default: false,
 			Desc: "将原始 DEX 加密后存入 assets/，壳 DEX 运行时解密并加载",
 			Note: "所有加固的第一道防线；必须与 B2/B3 同时启用"},
@@ -227,6 +243,9 @@ func All() []Feature {
 			Note: "篡改 SO 或重打包后无法运行"},
 
 		// ---- 运行时防护类 ----
+		{ID: "C7", Name: "原生库伪装", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
+			Desc: "把守卫库改名为常见库名（如 libsqlite3x.so），并同步改写壳侧的 loadLibrary 参数",
+			Note: "库名不再暴露加固器身份；不支持清除 ELF 节头——实测 Android 链接器会校验节头表，改动会导致 dlopen 失败"},
 		{ID: "D1", Name: "签名校验", Group: GroupRuntime, Stage: StageL2, Risk: RiskSafe, Default: false,
 			Desc: "运行时读取 PackageInfo.signatures 与内置签名指纹（SHA-256）比对",
 			Note: "实现成本极低，防二次打包基础防护"},
@@ -339,6 +358,26 @@ type Options struct {
 	StampTime     string `json:"stamp_time"`      // A14 统一时间戳（RFC3339，留空用固定值）
 	ManifestPadMB int    `json:"manifest_pad_mb"` // A15 巨型 Manifest 填充量（MB，0=默认 100）
 
+	// ---- 欺骗类手法（A16~A20 / C7）的参数 ----
+
+	// DecoyCoreCount 是 A16 注入的「假核心文件」组数（每组含假 Manifest/arsc/dex）。
+	DecoyCoreCount int `json:"decoy_core_count"`
+	// DecoyAPKMB 是 A17 假内层 APK 的目标体积（MB）。0 表示用默认值。
+	DecoyAPKMB int `json:"decoy_apk_mb"`
+	// DecoyMetaCount 是 A18 注入的假 uses-permission / meta-data / uses-feature 条数。
+	DecoyMetaCount int `json:"decoy_meta_count"`
+	// StrJunkCount 是 A19 往每个 DEX 字符串池注入的垃圾字符串条数。
+	StrJunkCount int `json:"str_junk_count"`
+	// JunkInsnCount 是 A20 每个方法插入的花指令组数。
+	JunkInsnCount int `json:"junk_insn_count"`
+	// LibFakeName 是 C7 把守卫库改成的新名字（形如 "libsqlite3x.so"；留空用默认）。
+	LibFakeName string `json:"lib_fake_name"`
+	// LibStripSections 是**已废弃**的选项：曾用于清除 ELF 节头，但实测证明
+	// Android 的动态链接器会校验节头表（清零 e_shentsize/e_shstrndx 会让 dlopen
+	// 直接失败），且 C6 的完整性校验依赖节名定位 .text/.rodata。
+	// 保留字段只为让显式请求能被**拒绝并给出原因**，而不是静默忽略。
+	LibStripSections bool `json:"lib_strip_sections"`
+
 	// 加壳参数
 	DexKey   string `json:"dex_key"`   // B1 加密密钥（留空自动生成）
 	DecoyPkg string `json:"decoy_pkg"` // B8 诱饵配置里的假包名（留空用默认）
@@ -446,6 +485,7 @@ func (o *Options) Validate() error {
 		// C1 要往壳 DEX 注入 native 桥接类；密钥派生依赖签名证书，
 		// 因此还必须有签名（否则运行时算不出与加密一致的密钥）。
 		"C1": {{"B2", "密钥 native 派生需要壳 Application 挂载桥接类"}, {"E1", "派生输入包含签名证书摘要，需要启用签名"}},
+		"C7": {{"C1", "原生库伪装作用于 C1/C4/C5/C6 注入的那一份守卫库"}},
 		"C4": {{"B2", "反调试需要壳 Application 提供启动时机"}, {"C1", "反调试与密钥派生共用同一份原生库与桥接类"}},
 		"C5": {{"B2", "反注入需要壳 Application 提供启动时机"}, {"C1", "反注入与密钥派生共用同一份原生库与桥接类"}},
 		"C6": {{"B2", "完整性自校验需要壳 Application 提供启动时机"}, {"C1", "完整性自校验与密钥派生共用同一份原生库与桥接类"}},

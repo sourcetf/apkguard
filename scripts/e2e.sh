@@ -82,6 +82,9 @@ harden 4-obf-full    -enable "A1,A2,A3,A4,A5,A8,A9,A10,A11,A12,A13,A14,E1,E2,E3,
 # A15 巨型 Manifest 填充 + B8 载荷容器化（两项都需单独验证：
 # A15 改 Manifest 字节、B8 改载荷条目名，出问题都是「装不上/起不来」级别）
 harden 7-packed -enable "A1,A2,A4,B1,B2,B3,B8,A15,E1,E2,E3,E6" -manifest-pad-mb 16
+# 欺骗类手法单列一组：A16 假核心文件 / A17 假内层 APK / A18 假权限元数据 /
+# A19 字符串池垃圾 / A20 花指令。它们都不依赖加壳，单独成组便于把产物断言钉死。
+harden 8-deception -enable "A1,A4,A16,A17,A18,A19,A20,E1,E2,E3,E6"
 # A5 单开（A11 同时启用时 A5 会让位，那样 A5 自身的实现就没人跑了）
 harden 5-res-a5-only -enable "A1,A4,A5,A14,E1,E2,E3,E6"
 # D5 设备绑定：绑一个不存在的设备标识，运行时应当被立即拦停（用来验证绑定确实生效）
@@ -132,6 +135,7 @@ verify 2-full-checks.apk "B1,B2"
 verify 6-channels-huawei.apk "B1,B2,E4" --channel huawei
 verify 6-channels-xiaomi.apk "B1,B2,E4" --channel xiaomi
 verify 7-packed.apk      "B1,B2,B8,A15"
+verify 8-deception.apk   "A16,A17,A18,A19,A20"
 
 echo
 echo "############ 7) 产物级守卫（对刚生成的包做结构自检）############"

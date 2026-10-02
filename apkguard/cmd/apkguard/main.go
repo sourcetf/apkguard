@@ -70,14 +70,21 @@ type cliConfig struct {
 	stampTime     string
 	manifestPadMB int
 
-	dexKey       string
-	decoyPkg     string
-	payloadMAC   bool
-	soEncrypt    bool
-	shellPkg     string
-	splitCount   int
-	extractRatio int
-	debugShell   bool
+	dexKey           string
+	decoyPkg         string
+	decoyCoreCount   int
+	decoyAPKMB       int
+	decoyMetaCount   int
+	strJunkCount     int
+	junkInsnCount    int
+	libFakeName      string
+	libStripSections bool
+	payloadMAC       bool
+	soEncrypt        bool
+	shellPkg         string
+	splitCount       int
+	extractRatio     int
+	debugShell       bool
 
 	channels string
 	jobs     int
@@ -124,6 +131,13 @@ func run() error {
 	flag.IntVar(&c.classPadCount, "class-pad-count", 100, "A13 膨胀类数量")
 	flag.StringVar(&c.stampTime, "stamp-time", "", "A14 统一时间戳（RFC3339，留空用固定值）")
 	flag.IntVar(&c.manifestPadMB, "manifest-pad-mb", 0, "A15 巨型 Manifest 填充量（MB，0=用默认 100）")
+	flag.IntVar(&c.decoyCoreCount, "decoy-core-count", 0, "A16 假核心文件组数（0=用默认）")
+	flag.IntVar(&c.decoyAPKMB, "decoy-apk-mb", 0, "A17 假内层 APK 体积（MB，0=用默认）")
+	flag.IntVar(&c.decoyMetaCount, "decoy-meta-count", 0, "A18 假权限/元数据条数（0=用默认）")
+	flag.IntVar(&c.strJunkCount, "str-junk-count", 0, "A19 每个 DEX 注入的垃圾字符串条数（0=用默认）")
+	flag.IntVar(&c.junkInsnCount, "junk-insn-count", 0, "A20 每个方法插入的花指令组数（0=用默认）")
+	flag.StringVar(&c.libFakeName, "lib-name", "", "C7 把守卫库改成的新名字（如 libsqlite3x.so）")
+	flag.BoolVar(&c.libStripSections, "lib-strip-sections", false, "C7 清除守卫库的 ELF 节头（readelf -S 会失败，不影响加载）")
 
 	flag.StringVar(&c.dexKey, "dex-key", "", "B1 加密密钥（留空自动生成）")
 	flag.StringVar(&c.decoyPkg, "decoy-pkg", "", "B8 诱饵配置里的假包名（留空用默认 dummy.installed.check）")
@@ -370,14 +384,21 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		StampTime:     c.stampTime,
 		ManifestPadMB: c.manifestPadMB,
 
-		DexKey:       c.dexKey,
-		DecoyPkg:     c.decoyPkg,
-		PayloadMAC:   c.payloadMAC,
-		SOEncrypt:    c.soEncrypt,
-		ShellPkg:     c.shellPkg,
-		SplitCount:   c.splitCount,
-		ExtractRatio: c.extractRatio,
-		DebugShell:   c.debugShell,
+		DexKey:           c.dexKey,
+		DecoyPkg:         c.decoyPkg,
+		DecoyCoreCount:   c.decoyCoreCount,
+		DecoyAPKMB:       c.decoyAPKMB,
+		DecoyMetaCount:   c.decoyMetaCount,
+		StrJunkCount:     c.strJunkCount,
+		JunkInsnCount:    c.junkInsnCount,
+		LibFakeName:      c.libFakeName,
+		LibStripSections: c.libStripSections,
+		PayloadMAC:       c.payloadMAC,
+		SOEncrypt:        c.soEncrypt,
+		ShellPkg:         c.shellPkg,
+		SplitCount:       c.splitCount,
+		ExtractRatio:     c.extractRatio,
+		DebugShell:       c.debugShell,
 
 		Jobs: c.jobs,
 	}
