@@ -21,10 +21,14 @@ import zipfile
 CHANNEL_ASSET = "assets/apkguard_channel.txt"
 
 # 与 internal/dex/decoy.go 的 DecoyClassNames 保持一致（取前若干个即可判定）。
+# 与 internal/dex/decoy.go 的 DecoyClassNames 保持一致（漏项会让断言形同虚设）。
 DECOY_NAMES = [
-    "SecurityMonitor", "IntegrityChecker", "ThreatDetector", "RootGuard",
-    "EnvironmentProbe", "LicenseValidator", "NativeBridge", "CryptoProvider",
-    "SignatureVerifier", "DebugWatcher",
+    "SecurityMonitor", "IntegrityChecker", "ThreatDetector",
+    "RootGuard", "EnvironmentProbe", "LicenseValidator",
+    "NativeBridge", "CryptoProvider", "SignatureVerifier",
+    "DebugWatcher", "MemoryShield", "ProcessInspector",
+    "AntiTamper", "PolicyEngine", "AuditTrail",
+    "TrustAnchor", "KeyCustodian", "SealVerifier",
 ]
 
 # 与 internal/dex/shell.go 的壳类名保持一致。
@@ -97,12 +101,110 @@ def source_file_indexes(data):
     return out
 
 
-def manifest_contains(zf, needle):
-    """在 AndroidManifest.xml 的字符串池里找 needle（UTF-8 或 UTF-16LE 都试）。"""
-    raw = read_bytes(zf, "AndroidManifest.xml")
+def manifest_contains(raw, needle):
+    """在 AndroidManifest.xml 的原始字节里找 needle（UTF-8 或 UTF-16LE 都试）。
+
+    参数是 **Manifest 的原始字节**而不是 ZipFile：调用方在 with 块里一次性读出，
+    之后再拿 ZipFile 去 open 会因为归档已关闭而报错。
+    """
     if needle.encode("utf-8") in raw:
         return True
     return needle.encode("utf-16-le") in raw
+
+
+def manifest_component_of(raw, needle):
+    """返回「引用 needle 的那个元素的元素名」（如 receiver/service/provider）。
+
+    AXML 的块列表是线性的，没有父子指针。这里顺序遍历全部块，记录最近一个
+    start element 的元素名与它携带的属性字符串；当某个属性字符串等于 needle 时，
+    当前元素名就是答案。
+
+    只解到「元素名 + 属性原始文本」这一层，不解析 Res_value 的数值语义——
+    对「这个名字被声明成哪种组件」的判定已经足够。
+    """
+
+    def pool_strings():
+        """读字符串池，返回 [文本]（按池索引）。"""
+        if len(raw) < 12:
+            return []
+        off = 8  # 跳过根块头
+        while off + 8 <= len(raw):
+            typ = int.from_bytes(raw[off:off + 2], "little")
+            size = int.from_bytes(raw[off + 4:off + 8], "little")
+            if size < 8 or off + size > len(raw):
+                return []
+            if typ == 0x0001:  # RES_STRING_POOL_TYPE
+                count = int.from_bytes(raw[off + 8:off + 12], "little")
+                flags = int.from_bytes(raw[off + 16:off + 20], "little")
+                sstart = int.from_bytes(raw[off + 20:off + 24], "little")
+                utf8 = bool(flags & 0x100)
+                base = off + sstart
+                out, p = [], base
+                for _ in range(count):
+                    if utf8:
+                        # UTF-8 池：字符数（变长） + 字节数（变长） + 数据 + NUL
+                        def _u8len(q):
+                            b = raw[q]
+                            if b & 0x80:
+                                return ((b & 0x7F) << 8) | raw[q + 1], q + 2
+                            return b, q + 1
+                        _, p2 = _u8len(p)
+                        blen, p3 = _u8len(p2)
+                        out.append(raw[p3:p3 + blen].decode("utf-8", "replace"))
+                        p = p3 + blen + 1
+                    else:
+                        # UTF-16 池：码元数（变长） + 数据 + NUL
+                        n = int.from_bytes(raw[p:p + 2], "little")
+                        if n & 0x8000:
+                            n = int.from_bytes(raw[p + 2:p + 4], "little")
+                            p += 4
+                        else:
+                            p += 2
+                        out.append(raw[p:p + n * 2].decode("utf-16-le", "replace"))
+                        p += n * 2 + 2
+                return out
+            off += size
+        return []
+
+    pool = pool_strings()
+    if not pool:
+        return None
+    off = 8
+    current = None
+    while off + 8 <= len(raw):
+        typ = int.from_bytes(raw[off:off + 2], "little")
+        size = int.from_bytes(raw[off + 4:off + 8], "little")
+        if size < 8 or off + size > len(raw):
+            break
+        if typ == 0x0102 and off + 36 <= len(raw):  # RES_XML_START_ELEMENT_TYPE
+            name_idx = int.from_bytes(raw[off + 20:off + 24], "little")
+            attr_start = int.from_bytes(raw[off + 24:off + 26], "little")
+            attr_size = int.from_bytes(raw[off + 26:off + 28], "little")
+            attr_count = int.from_bytes(raw[off + 28:off + 30], "little")
+            current = pool[name_idx] if name_idx < len(pool) else None
+            p = off + 16 + attr_start
+            for _ in range(attr_count):
+                if p + attr_size > off + size:
+                    break
+                raw_idx = int.from_bytes(raw[p + 8:p + 12], "little")
+                data_idx = int.from_bytes(raw[p + 16:p + 20], "little")
+                dtype = raw[p + 15]
+                for idx in (raw_idx, data_idx):
+                    if idx == NO_INDEX or idx >= len(pool):
+                        continue
+                    if dtype == 0x03 and pool[idx] == needle:
+                        return current
+                p += attr_size
+        off += size
+    return None
+
+
+def _decoy_is_provider(raw):
+    """是否有诱饵类被声明成 <provider>（会在应用启动时被实例化）。"""
+    for n in DECOY_NAMES:
+        if manifest_component_of(raw, "com.apkguard.shell." + n) == "provider":
+            return True
+    return False
 
 
 class Checker:
@@ -114,7 +216,6 @@ class Checker:
         self.notes = []
         with zipfile.ZipFile(apk) as zf:
             self.names = zf.namelist()
-            self.zw = zf
             self.manifest = read_bytes(zf, "AndroidManifest.xml") if "AndroidManifest.xml" in self.names else b""
             dex = [n for n in self.names if n == "classes.dex"]
             self.shell_dex = read_bytes(zf, "classes.dex") if dex else b""
@@ -168,7 +269,7 @@ class Checker:
 
         # ---- B2 Application 替换：Manifest 指向壳类 ----
         if self.want("B2"):
-            self.check(manifest_contains(zf, SHELL_CLASS), "B2",
+            self.check(manifest_contains(self.manifest, SHELL_CLASS), "B2",
                        "Manifest 里找不到壳类 %s（android:name 未被改写）" % SHELL_CLASS)
 
         # ---- A4 调试信息清除 ----
@@ -207,8 +308,21 @@ class Checker:
 
         # ---- A8 诱饵类注入 ----
         if self.want("A8"):
-            hit = [n for n in DECOY_NAMES if any(n in s for s in self.dex_strs)]
-            self.check(bool(hit), "A8", "DEX 里找不到任何诱饵类名（如 SecurityMonitor）")
+            # 诱饵类名必须真的声明成 Manifest 组件：否则静态分析者扫一遍组件表
+            # 就能看出「没有任何安全相关组件」，立刻判定这些类是填充物。
+            #
+            # 判据用 Manifest 而不是 DEX：启用 B1 时业务 DEX 已被加密成载荷，
+            # 诱饵类名不会出现在任何明文 DEX 里，靠 DEX 字符串判断会误报失败。
+            in_manifest = [n for n in DECOY_NAMES if manifest_contains(self.manifest, n)]
+            self.check(bool(in_manifest), "A8",
+                       "Manifest 里没有任何诱饵组件声明（只注入类是不够的）")
+            if not self.want("B1"):
+                hit = [n for n in DECOY_NAMES if any(n in s for s in self.dex_strs)]
+                self.check(bool(hit), "A8", "DEX 里找不到任何诱饵类名（如 SecurityMonitor）")
+            # ContentProvider 会在应用启动时被主动实例化，诱饵绝不能声明成 provider。
+            if in_manifest:
+                self.check(not _decoy_is_provider(self.manifest),
+                           "A8", "诱饵被声明成了 <provider>（会在启动时被实例化）")
 
         # ---- A9 伪 DEX 块 ----
         if self.want("A9"):

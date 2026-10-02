@@ -452,10 +452,29 @@ Laabab/b/c/y/i/c/e/i/g/k/l/m/n/o/p/q/aa/bbff/ssss/dd/ff/aa/abbaaaa/fb/c/tt/ii/aa
 
 | 维度 | 内容 |
 |---|---|
-| **功能项** | 注入若干空实现类，命名具有误导性（如 `SecurityMonitor`、`IntegrityChecker`） |
-| **预期效果** | 增加人工分析时间，消耗分析者注意力 |
+| **功能项** | 注入若干具误导性命名的类（如 `SecurityMonitor`、`IntegrityChecker`），并把其中一部分**真的声明成 Manifest 组件** |
+| **预期效果** | 增加人工分析时间，消耗分析者注意力；组件表里能看到「安全相关组件」，与真实应用形态一致 |
 | **解决的问题 / 场景** | 对抗专业逆向团队的人工分析；**注意**：会增加体积，且可能被识别为"刻意混淆" |
 | **做法来源** | `[样本]` 样本注入 17 个 `Lvault/monitor/*` 类（`CoreAtlas`/`QuietAnnex`/`SignalBeacon` 等），`onReceive` 实际只有 `return-void` |
+
+> **为什么必须声明进 Manifest**：只注入类是不够的——分析者扫一遍组件表发现
+> 「没有任何安全相关组件」，立刻就能判定 `SecurityMonitor` 之类是填充物。
+> 声明之后，这些名字会出现在组件表、权限视图与导出组件清单里。
+>
+> 两条不可妥协的约束：
+>
+> 1. **只声明 `<receiver>` / `<service>`，绝不声明 `<provider>`**。
+>    `ContentProvider` 会在应用启动时被 `ActivityThread.installContentProviders`
+>    主动实例化，而诱饵是空实现，被拉起就可能影响启动；`receiver`/`service`
+>    在**没有 intent-filter** 时系统永远不会实例化，声明只对静态分析可见。
+> 2. **类必须继承正确的框架基类并实现其抽象方法**（`BroadcastReceiver.onReceive`、
+>    `Service.onBind`）。只继承 `Object` 就声明成组件，不只是形态可疑，
+>    一旦被实例化还会直接抛异常；继承对了，最坏情况下也只是「什么都不做」。
+>
+> 实现上为此给 `axml` 增加了**元素插入**能力（在原 `Rewrite` 的属性改写之外），
+> 在 `<application>` 的结束块之前插入新的 start/end element 块对。
+> 这比"给已有元素补属性"难一档：块列表是线性的、没有父子指针，
+> 必须靠 start/end 块的出现顺序做深度匹配才能找到父元素的配对结束块。
 
 ### A9. 伪 DEX magic 填充块（★ 本次新发现）
 
@@ -552,10 +571,38 @@ Laabab/b/c/y/i/c/e/i/g/k/l/m/n/o/p/q/aa/bbff/ssss/dd/ff/aa/abbaaaa/fb/c/tt/ii/aa
 
 | 维度 | 内容 |
 |---|---|
-| **功能项** | 用 `InMemoryDexClassLoader`（API 26+）或 `DexClassLoader` 加载解密后的 DEX；反射替换 `ActivityThread.mBoundApplication.info.mClassLoader` 及 `LoadedApk.mClassLoader` |
+| **功能项** | 用 `DexClassLoader` 加载解密后的 DEX；反射替换 `ActivityThread.mBoundApplication.info.mClassLoader` 及 `LoadedApk.mClassLoader` |
 | **预期效果** | 业务代码正常运行，系统认为加载的是原始 APK 的类 |
 | **解决的问题 / 场景** | 加壳方案能否**正常运行**的关键；需适配 Android 5~15 各版本 ART 差异；**技术难点最高** |
 | **做法来源** | `[通用]` 所有壳的通用机制；`[样本]` 样本虽无 native 壳，但通过 PackageInstaller 安装内层 APK 达到类似"二次加载"效果 |
+
+> **为什么最终用的是落盘的 `DexClassLoader`，而不是 `InMemoryDexClassLoader`**
+>
+> 设计文档原始设想是「内存加载」，但实测证明在**公开 API** 范围内做不到，且障碍是
+> 三重叠加的（都在 Android 16 / API 36 上复现过）：
+>
+> 1. **能设置库搜索路径的构造器是 private**。`InMemoryDexClassLoader` 的公开构造器
+>    只有 `(ByteBuffer, ClassLoader)` 与 `(ByteBuffer[], ClassLoader)`；AOSP 里带
+>    `librarySearchPath` 的版本是 `private`，直接调用得到
+>    `NoSuchMethodError: <init>([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;Ljava/lang/String;)V`。
+> 2. **缺库搜索路径会直接毁掉带原生库的应用**。没有 `librarySearchPath` 时
+>    `DexPathList.nativeLibraryDirectories` 只剩系统目录，应用自己的
+>    `System.loadLibrary`（经 `ClassLoader.findLibrary` 解析）报
+>    `UnsatisfiedLinkError: ... couldn't find "librustdesk.so"`。
+> 3. **无法用子类绕开**：`InMemoryDexClassLoader` 被声明为 `final`，
+>    覆写 `findLibrary` 的路子走不通，`VerifyError: Superclass ... is declared final`。
+>    （`DexClassLoader` 反而**不是** final，且它的三参数构造器就是公开的——
+>    这正是它能成为落盘方案的原因。）
+>
+> 剩下的只能是反射改写 `DexPathList` 的内部字段，而那些字段名在 API 29~36 之间
+> 变过、且属非 SDK 接口，会被隐藏 API 限制拦下——可靠性无法保证，失败代价是
+> 应用加载自己的 `.so` 时崩溃。
+>
+> **结论**：B3 采用落盘的 `DexClassLoader`（第三个参数传 `nativeLibraryDir`）。
+> 明文 DEX 落在应用私有目录（`<dataDir>/app_ag/`），只有应用自己（与 root）可读；
+> 这也正是主流加固方案的通行做法。副产品是一条**回归保护**：测试里
+> `DexClassLoader` 的模拟会校验 `librarySearchPath` 非空——此前它只校验 `dexPath`，
+> 于是「库搜索路径悄悄变成 null」这类缺陷在测试里完全看不见。
 
 ### B4. 多 DEX 拆分
 

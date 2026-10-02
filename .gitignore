@@ -107,3 +107,4 @@ tmp/
 !/testdata/*.dex
 !/testdata/*.xml
 !/testdata/*.md
+__pycache__

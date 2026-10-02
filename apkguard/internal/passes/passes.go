@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"apkguard/internal/axml"
 	"apkguard/internal/config"
 	"apkguard/internal/dex"
 	"apkguard/internal/pipeline"
@@ -607,7 +608,24 @@ func (d *decoyClass) Run(_ context.Context, art *pipeline.Artifact, opts *config
 		return fmt.Errorf("诱饵类名与现有类全部冲突，无可注入")
 	}
 
-	add, err := dex.DecoyAddition(&dex.DecoySpec{Prefix: prefix, Names: names, Seed: opts.Seed})
+	// 挑出「实际被注入」的诱饵组件（名字可能与现有类冲突而被剔除）。
+	injected := map[string]bool{}
+	for _, n := range names {
+		injected[n] = true
+	}
+	var comps []dex.DecoyComponent
+	for _, c := range dex.DecoyManifestComponents {
+		if injected[c.Name] {
+			comps = append(comps, c)
+		}
+	}
+
+	add, err := dex.DecoyAddition(&dex.DecoySpec{
+		Prefix:     prefix,
+		Names:      names,
+		Seed:       opts.Seed,
+		Components: comps,
+	})
 	if err != nil {
 		return err
 	}
@@ -622,9 +640,88 @@ func (d *decoyClass) Run(_ context.Context, art *pipeline.Artifact, opts *config
 		return fmt.Errorf("写回 %s 失败: %w", host.NameString(), err)
 	}
 
-	art.Note("A8 诱饵类注入：向 %s 注入 %d 个具误导性命名的类（如 %s.%s），方法体带真实位运算",
-		host.NameString(), len(names), prefix, names[0])
+	declared, err := declareDecoyComponents(art, prefix, comps)
+	if err != nil {
+		return err
+	}
+
+	art.Note("A8 诱饵类注入：向 %s 注入 %d 个具误导性命名的类（如 %s.%s），方法体带真实位运算；"+
+		"其中 %d 个（%s）已作为 <receiver>/<service> 声明进 Manifest",
+		host.NameString(), len(names), prefix, names[0], declared, strings.Join(compNames(comps), "、"))
 	art.Stat("A8.classes", fmt.Sprint(len(names)))
 	art.Stat("A8.dex", host.NameString())
+	art.Stat("A8.components", fmt.Sprint(declared))
 	return nil
+}
+
+// compNames 返回组件名列表（用于日志）。
+func compNames(cs []dex.DecoyComponent) []string {
+	out := make([]string, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, c.Name)
+	}
+	return out
+}
+
+// declareDecoyComponents 把诱饵类声明成 Manifest 里的 <receiver>/<service>。
+//
+// 为什么值得做：只注入类时，静态分析者扫一遍 Manifest 就能看到「组件表里没有
+// 任何安全相关的类」，于是立刻知道 SecurityMonitor 之类的类是填充物；
+// 把它们**真的声明成组件**，这些名字才会出现在组件表、权限视图、导出组件清单里，
+// 与真实应用的形态一致。
+//
+// 两条安全约束（都不是可选项）：
+//   - 只声明 receiver / service，**不声明 provider**：ContentProvider 会在应用启动时
+//     被 ActivityThread 主动实例化，而诱饵是空实现，被拉起就可能干扰启动。
+//   - 不加 intent-filter：没有过滤器时系统永远不会实例化它们，声明只对静态分析可见。
+//
+// 返回实际写入的组件数。
+func declareDecoyComponents(art *pipeline.Artifact, prefix string, comps []dex.DecoyComponent) (int, error) {
+	if len(comps) == 0 {
+		return 0, nil
+	}
+	entry := pipeline.Find(art, "AndroidManifest.xml")
+	if entry == nil {
+		return 0, nil // 没有 Manifest 就无从声明，交由 E3 自检去报错
+	}
+	data, err := entry.Data()
+	if err != nil {
+		return 0, fmt.Errorf("读取 Manifest 失败: %w", err)
+	}
+	mf, err := axml.Parse(data)
+	if err != nil {
+		return 0, fmt.Errorf("解析 Manifest 失败: %w", err)
+	}
+	if mf.FindElement("application") == nil {
+		return 0, nil
+	}
+
+	javaPkg := strings.ReplaceAll(prefix, "/", ".")
+	edit := axml.Edit{}
+	for _, c := range comps {
+		edit.AddElements = append(edit.AddElements, axml.NewElement{
+			Parent:      "application",
+			ParentIndex: 0,
+			Name:        string(c.Kind),
+			Attrs: []axml.NewAttr{
+				// 用全限定名而不是 ".SecurityMonitor"：诱饵类实际落在壳包下，
+				// 写成相对名会指向应用自身包，声明与实际类对不上。
+				axml.StringAttr(axml.AndroidNS, "name", javaPkg+"."+c.Name),
+				axml.BoolAttr(axml.AndroidNS, "exported", false),
+				axml.BoolAttr(axml.AndroidNS, "enabled", true),
+			},
+		})
+	}
+	out, err := mf.Rewrite(edit)
+	if err != nil {
+		return 0, fmt.Errorf("写入诱饵组件失败: %w", err)
+	}
+	// 写回后必须能重新解析：组件声明一旦写坏，应用会启动即死。
+	if _, err := axml.Parse(out); err != nil {
+		return 0, fmt.Errorf("诱饵组件写入后 Manifest 无法解析: %w", err)
+	}
+	if err := entry.SetData(out, true); err != nil {
+		return 0, fmt.Errorf("写回 Manifest 失败: %w", err)
+	}
+	return len(comps), nil
 }

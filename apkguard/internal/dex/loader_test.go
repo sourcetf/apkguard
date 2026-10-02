@@ -40,6 +40,9 @@ type fakeCipher struct {
 	iv  []byte
 }
 
+// testNativeLibDir 是测试里模拟的应用原生库目录。
+const testNativeLibDir = "/data/app/lib/x86_64"
+
 // loaderEnv 汇总模拟运行期间共享的状态。
 type loaderEnv struct {
 	// readOnly 记录被标记只读的文件路径（Android 14+ 要求动态加载的
@@ -52,6 +55,8 @@ type loaderEnv struct {
 	dexPath string
 	// clObj 是 Shell 构造出的 DexClassLoader 实例。
 	clObj any
+	// libPath 记录 DexClassLoader 收到的 librarySearchPath。
+	libPath string
 }
 
 // loaderFields 是各模拟类的字段表：Java 类名 -> 字段。
@@ -321,7 +326,20 @@ func installLoaderMocks(env *loaderEnv) func() {
 		}
 	h["Landroid/content/Context;->getApplicationInfo()Landroid/content/pm/ApplicationInfo;"] =
 		func(in *interp, regs []int) (int32, any, error) {
-			return 0, &fakeObj{desc: "Landroid/content/pm/ApplicationInfo;"}, nil
+			// nativeLibraryDir 必须真的挂在实例上：壳代码用 iget-object 读它
+			// （它是实例字段而非静态字段），而这里此前返回的是一个空对象，
+			// 于是传给 ClassLoader 的 librarySearchPath 一直是 null —— 旧的
+			// DexClassLoader 模拟又没校验该参数，缺陷就被测试放过去了。
+			// 真机上的表现是应用加载自己的 .so 时 UnsatisfiedLinkError
+			// （RustDesk 的 librustdesk.so）。
+			return 0, &fakeObj{
+				desc: "Landroid/content/pm/ApplicationInfo;",
+				// 键必须是「类描述符->字段名」：解释器的 iget-object 按这个
+				// 全名取字段（见 interp_test.go 的 fieldName 与 sigcheck_test.go）。
+				objFields: map[string]any{
+					"Landroid/content/pm/ApplicationInfo;->nativeLibraryDir": &fakeStr{s: testNativeLibDir},
+				},
+			}, nil
 		}
 	h["Ljava/io/File;->setReadOnly()Z"] =
 		func(in *interp, regs []int) (int32, any, error) {
@@ -368,6 +386,15 @@ func installLoaderMocks(env *loaderEnv) func() {
 			if !ok {
 				return 0, nil, errf("DexClassLoader 的 dexPath 不是字符串")
 			}
+			// 第 3 个参数是 librarySearchPath：它必须非空。少了它应用自己的
+			// System.loadLibrary 会找不到 .so 而 UnsatisfiedLinkError
+			// （实测 RustDesk 的 librustdesk.so）。此前这里只校验 dexPath，
+			// 于是「库搜索路径悄悄变成 null」这类缺陷测试完全看不见。
+			lib, ok := in.objs[regs[3]].(*fakeStr)
+			if !ok || lib.s == "" {
+				return 0, nil, errf("DexClassLoader 的 librarySearchPath 为空，应用自己的 .so 会加载失败")
+			}
+			env.libPath = lib.s
 			env.dexPath = p.s
 			env.clObj = in.objs[regs[0]]
 			return 0, nil, nil
@@ -471,9 +498,10 @@ func installLoaderMocks(env *loaderEnv) func() {
 	prevStatics := objStatics
 	objStatics = map[string]any{
 		"Ljava/io/File;->pathSeparator": &fakeStr{s: ":"},
-		// 应用的 native 库目录：DexClassLoader 必须拿到它，否则应用加载自己的
-		// .so 会 UnsatisfiedLinkError（真实案例：RustDesk 的 libflutter.so）。
-		"Landroid/content/pm/ApplicationInfo;->nativeLibraryDir": &fakeStr{s: "/data/app/lib/x86_64"},
+		// 应用的 native 库目录：ClassLoader 必须拿到它，否则应用加载自己的
+		// .so 会 UnsatisfiedLinkError（真实案例：RustDesk 的 librustdesk.so）。
+		// 该值同时由 testNativeLibDir 用于 ApplicationInfo 的实例字段模拟。
+		"Landroid/content/pm/ApplicationInfo;->nativeLibraryDir": &fakeStr{s: testNativeLibDir},
 	}
 	return func() {
 		fakeCalls = prev

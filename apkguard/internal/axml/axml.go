@@ -32,6 +32,9 @@ const (
 const (
 	TypeString = 0x03
 	TypeIntDec = 0x10
+	// TypeIntBoolean 是布尔值：值直接放在 Res_value.data（0/1），rawValue 为 -1。
+	// aapt2 生成 android:exported="false" 时用的就是它。
+	TypeIntBoolean = 0x12
 )
 
 // AndroidNS 是 Android 平台属性的命名空间 URI。

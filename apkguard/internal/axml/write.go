@@ -30,12 +30,52 @@ type AttrValue struct {
 	Value string
 }
 
+// NewAttr 描述新元素的一个属性。
+//
+// 用构造器而不是裸结构体：属性值要么是字符串、要么是布尔，两者在
+// Res_value 里的编码完全不同（字符串要把池索引同时写进 rawValue 与 data，
+// 布尔则把 rawValue 置 -1、把 0/1 写进 data），用类型区分可以避免写错。
+type NewAttr struct {
+	NS   string // 命名空间 URI；空表示无命名空间
+	Name string // 属性名（不带前缀）
+	// 二者恰有一个非 nil。
+	strVal  *string
+	boolVal *bool
+}
+
+// StringAttr 构造一个字符串型属性。
+func StringAttr(ns, name, value string) NewAttr {
+	return NewAttr{NS: ns, Name: name, strVal: &value}
+}
+
+// BoolAttr 构造一个布尔型属性（对应 aapt2 的 android:exported="false" 之类）。
+func BoolAttr(ns, name string, v bool) NewAttr {
+	return NewAttr{NS: ns, Name: name, boolVal: &v}
+}
+
+// NewElement 描述要插到某个已有元素**末尾**的新元素。
+//
+// 二进制 XML 的块列表是线性的，子元素必须落在父元素的结束块**之前**，
+// 因此这里用 Parent/ParentIndex 定位父元素，再找到与它配对的结束块，插在其前。
+type NewElement struct {
+	// Parent 是父元素名，如 "application"。
+	Parent string
+	// ParentIndex 是父元素在同类元素中的序号（从 0 开始）。
+	ParentIndex int
+	// Name 是新元素名，如 "receiver"。
+	Name string
+	// Attrs 是新元素的属性。
+	Attrs []NewAttr
+}
+
 // Edit 描述对二进制 XML 的一次改写。
 type Edit struct {
 	// Replace 把字符串池中等于 key 的文本替换为 value。
 	Replace map[string]string
 	// SetAttr 逐条设置元素属性。
 	SetAttr []AttrValue
+	// AddElements 在指定父元素末尾插入新元素。
+	AddElements []NewElement
 }
 
 // Rewrite 按 edit 改写二进制 XML，返回新的字节流。
@@ -49,7 +89,7 @@ type Edit struct {
 //
 //	但错误地保留标志会让二分查找返回错误结果）。
 func (f *File) Rewrite(edit Edit) ([]byte, error) {
-	if len(edit.Replace) == 0 && len(edit.SetAttr) == 0 {
+	if len(edit.Replace) == 0 && len(edit.SetAttr) == 0 && len(edit.AddElements) == 0 {
 		return append([]byte(nil), f.data...), nil
 	}
 
@@ -116,10 +156,59 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 		inserts = append(inserts, insertion{off: el.HeaderOff, entry: e})
 	}
 
-	// ---- 3) 生成新的字符串池块 ----
+	// ---- 3) 解析要插入的新元素，编码成 start+end 块对 ----
+	//
+	// 必须放在生成字符串池**之前**：新元素的元素名与属性值都要 intern 进池。
+	insertBefore := map[int][][]byte{}
+	for i, ne := range edit.AddElements {
+		parent := f.nthElement(ne.Parent, ne.ParentIndex)
+		if parent == nil {
+			return nil, fmt.Errorf("axml: 第 %d 个新元素找不到父元素 <%s> 第 %d 个", i, ne.Parent, ne.ParentIndex)
+		}
+		endOff := f.matchingEnd(parent.HeaderOff)
+		if endOff < 0 {
+			return nil, fmt.Errorf("axml: 元素 <%s> 第 %d 个没有配对的结束块", ne.Parent, ne.ParentIndex)
+		}
+		attrs := make([][attrEntryLen]byte, 0, len(ne.Attrs))
+		for _, na := range ne.Attrs {
+			var e [attrEntryLen]byte
+			var nsIdx uint32 = noEntry
+			if na.NS != "" {
+				nsIdx = intern(na.NS)
+			}
+			binary.LittleEndian.PutUint32(e[0:], nsIdx)
+			binary.LittleEndian.PutUint32(e[4:], intern(na.Name))
+			switch {
+			case na.strVal != nil:
+				valIdx := intern(*na.strVal)
+				binary.LittleEndian.PutUint32(e[8:], valIdx) // rawValue
+				binary.LittleEndian.PutUint16(e[12:], 8)     // Res_value.size
+				e[15] = TypeString
+				binary.LittleEndian.PutUint32(e[16:], valIdx) // Res_value.data
+			case na.boolVal != nil:
+				var v uint32
+				if *na.boolVal {
+					v = 1
+				}
+				binary.LittleEndian.PutUint32(e[8:], noEntry) // 布尔没有原始文本
+				binary.LittleEndian.PutUint16(e[12:], 8)
+				e[15] = TypeIntBoolean
+				binary.LittleEndian.PutUint32(e[16:], v)
+			default:
+				return nil, fmt.Errorf("axml: 新元素 <%s> 的属性 %s 没有取值", ne.Name, na.Name)
+			}
+			attrs = append(attrs, e)
+		}
+		nameIdx := intern(ne.Name)
+		blob := encodeStartElement(nameIdx, attrs)
+		blob = append(blob, encodeEndElement(nameIdx)...)
+		insertBefore[endOff] = append(insertBefore[endOff], blob)
+	}
+
+	// ---- 4) 生成新的字符串池块 ----
 	poolBlob := encodeStringPool(values, f.poolUTF8)
 
-	// ---- 4) 组装：根块头 + 新池 + 其余块（按需改值/插入属性）----
+	// ---- 5) 组装：根块头 + 新池 + 其余块（按需改值/插入属性/插入元素）----
 	const rootHeaderSize = 8
 	if len(f.data) < rootHeaderSize {
 		return nil, fmt.Errorf("axml: 数据长度不足")
@@ -161,15 +250,87 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 				return nil, err
 			}
 		}
+		// 新元素整棵子树插在该块**之前**：目标是父元素的结束块，
+		// 因此插入后新元素恰好落在父元素内容末尾、父元素结束块之前。
+		for _, pre := range insertBefore[off] {
+			out = append(out, pre...)
+		}
 		out = append(out, blob...)
 		off += size
 	}
 
-	// ---- 5) 修正根块与池块的总长度 ----
+	// ---- 6) 修正根块与池块的总长度 ----
 	// 根块 size 位于 +4；字符串池块的 size 位于 8+4。
 	binary.LittleEndian.PutUint32(out[4:], uint32(len(out)))
 	binary.LittleEndian.PutUint32(out[12:], uint32(len(poolBlob)))
 	return out, nil
+}
+
+// matchingEnd 返回与 startOff 处 start element 配对的 end element 块偏移。
+//
+// 二进制 XML 的块列表是线性的，没有显式的父子指针：嵌套关系只能靠
+// start/end 块的出现顺序推断——从该 start element 起深度计数，回到 0 即为配对者。
+func (f *File) matchingEnd(startOff int) int {
+	d := f.data
+	depth := 0
+	for off := startOff; off+chunkHdrLen <= len(d); {
+		size := int(binary.LittleEndian.Uint32(d[off+4:]))
+		if size < chunkHdrLen || off+size > len(d) {
+			return -1
+		}
+		switch binary.LittleEndian.Uint16(d[off:]) {
+		case TypeXMLStartElem:
+			depth++
+		case TypeXMLEndElem:
+			depth--
+			if depth == 0 {
+				return off
+			}
+		}
+		off += size
+	}
+	return -1
+}
+
+// encodeStartElement 生成一个 RES_XML_START_ELEMENT_TYPE 块。
+//
+// 布局：ResChunk_header(8，headerSize=16) + lineNumber(4) + comment(4)
+//   - ResXMLTree_attrExt(20) + attributeCount * ResXMLTree_attribute(20)
+//
+// attributeStart 是相对 attrExt 起点的偏移，因此恒为 20（attrExt 自身长度）。
+func encodeStartElement(nameIdx uint32, attrs [][attrEntryLen]byte) []byte {
+	size := 16 + 20 + len(attrs)*attrEntryLen
+	b := make([]byte, size)
+	binary.LittleEndian.PutUint16(b[0:], TypeXMLStartElem)
+	binary.LittleEndian.PutUint16(b[2:], 16) // headerSize 只到 ResXMLTree_node 末尾
+	binary.LittleEndian.PutUint32(b[4:], uint32(size))
+	// lineNumber / comment 保持 0（新元素没有源码位置）
+	binary.LittleEndian.PutUint32(b[16:], noEntry) // attrExt.ns：无命名空间
+	binary.LittleEndian.PutUint32(b[20:], nameIdx)
+	binary.LittleEndian.PutUint16(b[24:], 20)
+	binary.LittleEndian.PutUint16(b[26:], attrEntryLen)
+	binary.LittleEndian.PutUint16(b[28:], uint16(len(attrs)))
+	// idIndex / classIndex / styleIndex 保持 0
+	p := 36
+	for _, a := range attrs {
+		copy(b[p:], a[:])
+		p += attrEntryLen
+	}
+	return b
+}
+
+// encodeEndElement 生成一个 RES_XML_END_ELEMENT_TYPE 块。
+//
+// 布局：ResChunk_header(8，headerSize=16) + lineNumber(4) + comment(4)
+//   - ResXMLTree_endElementExt(8)
+func encodeEndElement(nameIdx uint32) []byte {
+	b := make([]byte, 24)
+	binary.LittleEndian.PutUint16(b[0:], TypeXMLEndElem)
+	binary.LittleEndian.PutUint16(b[2:], 16)
+	binary.LittleEndian.PutUint32(b[4:], 24)
+	binary.LittleEndian.PutUint32(b[16:], noEntry)
+	binary.LittleEndian.PutUint32(b[20:], nameIdx)
+	return b
 }
 
 // insertAttrs 在一个 start element 块的属性表末尾追加若干属性。
