@@ -2,6 +2,7 @@ package pack
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"strings"
 	"testing"
 )
@@ -167,4 +168,151 @@ func TestMakeDeterministic(t *testing.T) {
 	if a[0].Asset != b[0].Asset || !bytes.Equal(a[0].Blob, b[0].Blob) {
 		t.Fatal("同输入两次生成结果不一致")
 	}
+}
+
+// ---- 载荷 MAC（encrypt-then-MAC）----
+
+// TestMACRoundTrip 验证带 MAC 载荷的「先验后解」往返。
+func TestMACRoundTrip(t *testing.T) {
+	key := Key("mac-key")
+	plain := bytes.Repeat([]byte{0x5a}, 333)
+	dex := Dex{Name: "classes.dex", Data: plain}
+
+	ps, err := MakeMAC([]Dex{dex}, key, "s")
+	if err != nil {
+		t.Fatalf("MakeMAC 失败: %v", err)
+	}
+	if len(ps) != 1 {
+		t.Fatalf("应生成 1 份载荷，实际 %d", len(ps))
+	}
+	p := ps[0]
+	if !p.Tagged {
+		t.Fatal("载荷未标记 Tagged")
+	}
+	if len(p.Blob) < BlockSize+TagSize {
+		t.Fatalf("载荷过短: %d", len(p.Blob))
+	}
+	if len(p.Blob) != len(mustEncryptRef(t, plain, key, IVFromSeed("s/"+dex.Name)))+TagSize {
+		t.Fatalf("带 tag 载荷长度应为 旧格式 + %d", TagSize)
+	}
+	got, err := DecryptMAC(p.Blob, key, p.Name)
+	if err != nil {
+		t.Fatalf("DecryptMAC 失败: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("MAC 往返内容不一致")
+	}
+	// 直接 Decrypt 应当失败：尾部 tag 不是合法的 CBC 密文块。
+	if _, err := Decrypt(p.Blob, key); err == nil {
+		t.Fatal("未剥离 tag 时 Decrypt 不应成功")
+	}
+}
+
+// TestMACTamperDetected 验证篡改任意关键字节都会被 DecryptMAC 拒绝。
+func TestMACTamperDetected(t *testing.T) {
+	key := Key("mac-key")
+	plain := bytes.Repeat([]byte{0x11}, 200)
+	ps, err := MakeMAC([]Dex{{Name: "classes2.dex", Data: plain}}, key, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := ps[0]
+
+	cases := []struct {
+		label string
+		at    int
+	}{
+		{"IV", 0},
+		{"密文", 17},
+		{"tag", len(p.Blob) - 1},
+	}
+	for _, tc := range cases {
+		blob := append([]byte(nil), p.Blob...)
+		blob[tc.at] ^= 0x01
+		if _, err := DecryptMAC(blob, key, p.Name); err == nil {
+			t.Fatalf("篡改 %s 后仍通过 MAC 校验", tc.label)
+		}
+	}
+	// 正确 key / 错误 name：绑定身份失败。
+	if _, err := DecryptMAC(p.Blob, key, "classes9.dex"); err == nil {
+		t.Fatal("错误 name 仍通过 MAC 校验（载荷可被互换）")
+	}
+	// 错误 key：macKey 不同，失败。
+	if _, err := DecryptMAC(p.Blob, Key("other"), p.Name); err == nil {
+		t.Fatal("错误 key 仍通过 MAC 校验")
+	}
+	// 过短载荷必须失败而不是 panic。
+	if _, err := DecryptMAC(p.Blob[:BlockSize+TagSize-1], key, p.Name); err == nil {
+		t.Fatal("过短载荷应失败")
+	}
+}
+
+// TestMACDisabledByteCompatible 验证 PayloadMAC 关闭时产物与旧格式逐字节一致。
+//
+// 这是向后兼容的硬约束：不追加尾部字节、不改变 IV/密文。
+func TestMACDisabledByteCompatible(t *testing.T) {
+	key := Key("compat")
+	dex := Dex{Name: "classes.dex", Data: bytes.Repeat([]byte{0x42}, 100)}
+	ps, err := Make([]Dex{dex}, key, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := ps[0]
+	if p.Tagged {
+		t.Fatal("未启用 MAC 时不应标记 Tagged")
+	}
+	want := mustEncryptRef(t, dex.Data, key, IVFromSeed("s/"+dex.Name))
+	if !bytes.Equal(p.Blob, want) {
+		t.Fatal("未启用 MAC 时产物与旧格式不一致（不应追加任何尾部字节）")
+	}
+	got, err := Decrypt(p.Blob, key)
+	if err != nil || !bytes.Equal(got, dex.Data) {
+		t.Fatal("未启用 MAC 时 Decrypt 行为应不变")
+	}
+}
+
+// TestMacKeyDomainSeparation 验证 MAC 密钥经过域分离，不等于 AES 密钥本身，
+// 且与实现使用同一公式（跨文件对拍）。
+func TestMacKeyDomainSeparation(t *testing.T) {
+	key := Key("k")
+	mk := MacKey(key)
+	if bytes.Equal(mk[:], key[:]) {
+		t.Fatal("MAC 密钥不应等于 AES 密钥")
+	}
+	// 手工复算：SHA-256(key ‖ "apkguard/payload-mac")
+	h := sha256.New()
+	h.Write(key[:])
+	h.Write([]byte("apkguard/payload-mac"))
+	if !bytes.Equal(mk[:], h.Sum(nil)) {
+		t.Fatal("MAC 密钥派生公式与文档不符")
+	}
+}
+
+// TestCryptoConstants 钉住跨语言对拍常量。
+//
+// pack.go 与 dex/loader.go 各有一份常量定义；任何漂移都会让壳侧算出的
+// MAC/长度与打包时对不上，且只有真机才暴露。这里显式断言数值。
+func TestCryptoConstants(t *testing.T) {
+	if KeySize != 32 {
+		t.Fatalf("KeySize=%d，应为 32（AES-256）", KeySize)
+	}
+	if BlockSize != 16 {
+		t.Fatalf("BlockSize=%d，应为 16", BlockSize)
+	}
+	if TagSize != 32 {
+		t.Fatalf("TagSize=%d，应为 32（HMAC-SHA256）", TagSize)
+	}
+	if macDomain != "apkguard/payload-mac" {
+		t.Fatalf("macDomain=%q 与壳侧不一致", macDomain)
+	}
+}
+
+// mustEncryptRef 是 Encrypt 的独立参照实现，用于格式兼容断言。
+func mustEncryptRef(t *testing.T, plain []byte, key [KeySize]byte, iv [BlockSize]byte) []byte {
+	t.Helper()
+	blob, err := Encrypt(plain, key, iv)
+	if err != nil {
+		t.Fatalf("Encrypt 失败: %v", err)
+	}
+	return blob
 }

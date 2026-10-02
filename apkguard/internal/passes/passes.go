@@ -32,6 +32,11 @@ func Registry() *pipeline.Registry {
 	r.Register(&constantArray{})
 	r.Register(&classPad{})
 	r.Register(&dropDebugInfo{})
+	// A6（控制流混淆）**不注册**：实现与单元测试已就位（internal/dex/cff.go），
+	// 但在三个真实应用上实测会破坏产物（ART 报
+	//   VerifyError: ... wide register v7 has type Low-half Constant/Conflict），
+	// 关掉即恢复正常。安全地改写方法体需要寄存器类型/活跃性分析，属后续工作；
+	// 在那之前按项目原则「启用未实现项必须报错」，不把它暴露给使用方。
 	r.Register(&fakeDex{})
 	r.Register(&junkEntries{})
 	r.Register(&zipPathAttack{})
@@ -47,6 +52,10 @@ func Registry() *pipeline.Registry {
 	//   B3 最后把 Loader 类体注入 B2 建好的那个壳 DEX。
 	// B4 必须排在 B1 **之前**：它先把业务 DEX 拆成多份，B1 再把每一份
 	// 各自加密成独立载荷。反过来则拆分无从下手（B1 已把明文移出 APK）。
+	// C2 必须在 B4/B1 之前：它要把 lib/<abi>/*.so 从 APK 里移走并加密成载荷，
+	// 同时记录原始 ABI 集合（C1 依赖它决定给哪些 ABI 注入守卫库——
+	// lib/ 被移走后 abisOf 会返回空，那会让 C1 给全部 ABI 都注入）。
+	r.Register(&encryptNativeLibs{})
 	r.Register(&splitDex{})
 	r.Register(&encryptDex{})
 	// B8 必须排在 B1 之后（要读加密载荷清单）、B3 之前（要改载荷条目名，

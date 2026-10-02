@@ -88,11 +88,11 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		ok++
 	}
 
-	art.Note("A2 字符串加密：%d 个 DEX，加密 %d 个字符串，解密器 %s->a（密钥 0x%02x，最短长度 %d）；%d → %d 字节（增加 %d）",
+	art.Note("A2 字符串加密：%d 个 DEX，加密 %d 个字符串，解密器 %s->a（密钥 %x，最短长度 %d）；%d → %d 字节（增加 %d）",
 		ok, totalEnc, cls, key, minLen, totalBefore, totalAfter, totalAfter-totalBefore)
 	art.Stat("A2.dex", fmt.Sprint(ok))
 	art.Stat("A2.strings", fmt.Sprint(totalEnc))
-	art.Stat("A2.key", fmt.Sprintf("0x%02x", key))
+	art.Stat("A2.key", fmt.Sprintf("%x", key))
 	art.Stat("A2.grow", fmt.Sprint(totalAfter-totalBefore))
 	return nil
 }
@@ -152,6 +152,15 @@ func (c *constantArray) Run(_ context.Context, art *pipeline.Artifact, opts *con
 	if minLen < 0 {
 		minLen = 0
 	}
+	// A2 解密器自身用到的字符串（"SHA-256"、"UTF-8" 等）必须排除。
+	//
+	// 这类知识只能在 Pass 层传递：A3 是**独立的第二次重建**，那时
+	// RebuildOptions.StringEncrypt 为 nil，dex 层无从知道上一轮注入过什么，
+	// 于是会把解密器的常量当成应用常量数组化。
+	a2Strings := map[string]bool{}
+	for _, s := range dex.DecryptorStrings() {
+		a2Strings[s] = true
+	}
 
 	before, after, total := 0, 0, 0
 	ok := 0
@@ -161,6 +170,10 @@ func (c *constantArray) Run(_ context.Context, art *pipeline.Artifact, opts *con
 			MethodName:  "b",
 			MinLen:      minLen,
 			InjectClass: u == host,
+			// A2 注入的解密器在本轮重建里已是「既有类」，它的字符串常量
+			// 属于工具自身而非应用，不能被 A3 再数组化（否则解密器反过来
+			// 依赖还原器，且破坏「A2 覆盖全部时 A3 不做任何事」的不变量）。
+			Skip: func(s string) bool { return a2Strings[s] },
 		}
 		out, st, err := dex.RebuildWithStats(u.file, dex.RebuildOptions{ConstantArray: ca})
 		if err != nil {
@@ -209,12 +222,16 @@ func shellPkgOf(opts *config.Options) string {
 	return p
 }
 
-// deriveKey 从用户密钥或随机种子派生一个字节密钥。
+// deriveKey 从用户密钥或随机种子派生 32 字节主密钥。
 //
 // 这里只做「确定性派生」：同样的输入必须得到同样的密钥，
 // 以便同一 APK 的多次加固结果可复现（便于排查问题）。
 // 真正「不以明文存在、按设备派生」的密钥管理由 C1 在阶段4接管。
-func deriveKey(dexKey, seed string) byte {
+//
+// 取 SHA-256 的**全部 32 字节**：旧实现只取 sum[0] 一个字节，配合当时
+// 仿射密钥流可被单点已知明文攻破；现在密钥流由 SHA-256 派生，
+// 密钥宽度必须足够（32 字节），否则暴力枚举 256 种密钥即可解密全部字符串。
+func deriveKey(dexKey, seed string) [32]byte {
 	src := dexKey
 	if src == "" {
 		src = seed
@@ -222,6 +239,5 @@ func deriveKey(dexKey, seed string) byte {
 	if src == "" {
 		src = "apkguard"
 	}
-	sum := sha256.Sum256([]byte("apkguard/strkey/" + src))
-	return sum[0]
+	return sha256.Sum256([]byte("apkguard/strkey/" + src))
 }

@@ -278,7 +278,7 @@ func TestRebuildClassPadComposes(t *testing.T) {
 		t.Fatalf("生成失败: %v", err)
 	}
 	se := &StringEncrypt{
-		Class: "Lapkguard/Dec;", MethodName: "a", Key: 0x33,
+		Class: "Lapkguard/Dec;", MethodName: "a", Key: [32]byte{0x33},
 		MinLen: 4, InjectClass: true,
 	}
 	ca := &ConstantArray{

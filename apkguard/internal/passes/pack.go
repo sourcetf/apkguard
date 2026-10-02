@@ -30,6 +30,10 @@ type shellPayloads struct {
 	Items []pack.Payload
 	// Removed 是被移除的原始 DEX 条目名。
 	Removed []string
+	// MAC 表示本批载荷尾部带 HMAC-SHA256 标签（对应 -payload-mac）。
+	//
+	// B3 据此决定壳侧是否生成 MAC 校验指令：关闭时壳产物与旧版逐字节一致。
+	MAC bool
 }
 
 // encryptDex 把原始 DEX 整体加密后存入 assets/，并移除明文 DEX 条目。
@@ -89,7 +93,16 @@ func (e *encryptDex) Run(_ context.Context, art *pipeline.Artifact, opts *config
 	if err != nil {
 		return err
 	}
-	payloads, err := pack.Make(dexes, key, opts.Seed)
+	// -payload-mac 打开时给每份载荷尾部追加 HMAC-SHA256（encrypt-then-MAC）；
+	// 关闭时走 Make，产物格式与旧版逐字节一致（不追加任何尾部字节）。
+	// 两者必须原子完成：加密与 MAC 共用同一份密钥与同一批载荷，拆开会产生
+	// 「加了 tag 却没接线」或反之的不一致窗口。
+	var payloads []pack.Payload
+	if opts.PayloadMAC {
+		payloads, err = pack.MakeMAC(dexes, key, opts.Seed)
+	} else {
+		payloads, err = pack.Make(dexes, key, opts.Seed)
+	}
 	if err != nil {
 		return fmt.Errorf("生成加密载荷失败: %w", err)
 	}
@@ -121,12 +134,21 @@ func (e *encryptDex) Run(_ context.Context, art *pipeline.Artifact, opts *config
 		return fmt.Errorf("应移除 %d 个明文 DEX，实际移除 %d 个", len(removed), n)
 	}
 
-	art.Put(sharedKeyPayloads, &shellPayloads{Key: key, Items: payloads, Removed: removed})
+	art.Put(sharedKeyPayloads, &shellPayloads{Key: key, Items: payloads, Removed: removed, MAC: opts.PayloadMAC})
 
 	plainTotal := pack.TotalPlain(payloads)
 	blobTotal := pack.TotalBlob(payloads)
-	art.Note("B1 DEX 整体加密：%d 个 DEX → %d 份 AES-256-CBC 载荷（%d → %d 字节），明文 DEX 已移除；载荷名 %s",
-		len(payloads), len(payloads), plainTotal, blobTotal, assetSample(payloads))
+	if opts.PayloadMAC {
+		art.Note("B1 DEX 整体加密：%d 个 DEX → %d 份 AES-256-CBC 载荷（%d → %d 字节），明文 DEX 已移除；"+
+			"每份载荷尾部附 32 字节 HMAC-SHA256（encrypt-then-MAC，绑定原始 DEX 名），壳解密前先校验；载荷名 %s",
+			len(payloads), len(payloads), plainTotal, blobTotal, assetSample(payloads))
+		art.Stat("B1.mac", "1")
+		art.Stat("B1.mac_bytes", fmt.Sprint(pack.TagSize*len(payloads)))
+	} else {
+		art.Note("B1 DEX 整体加密：%d 个 DEX → %d 份 AES-256-CBC 载荷（%d → %d 字节），明文 DEX 已移除；载荷名 %s",
+			len(payloads), len(payloads), plainTotal, blobTotal, assetSample(payloads))
+		art.Stat("B1.mac", "0")
+	}
 	art.Stat("B1.dex", fmt.Sprint(len(payloads)))
 	art.Stat("B1.plain", fmt.Sprint(plainTotal))
 	art.Stat("B1.blob", fmt.Sprint(blobTotal))

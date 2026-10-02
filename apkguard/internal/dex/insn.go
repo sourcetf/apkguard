@@ -586,6 +586,38 @@ func (l *InsnList) Replace(i int, words []uint16, fresh ...int) {
 	l.items[i].fresh = append([]int(nil), fresh...)
 }
 
+// AppendSynth 在指令流末尾追加一条合成指令，返回其项下标。
+//
+// A6（控制流混淆）需要生成「没有原始指令与之对应」的死代码块（伪分支的
+// 落点），这些块必须能被分支稳定地指向。若像 InsertBefore 那样让合成项
+// 与原项共享旧偏移，多个分支指向同一旧偏移时会全部落到原项上（Encode 的
+// old2new 以最后出现的项为准），死代码块就成了不可达的孤儿。
+//
+// 因此这里为合成项分配**唯一**旧偏移：从 total 之后顺次取（total+1、
+// total+2 …）。Encode 建立 old2new 时会把这些偏移映射到它们的真实新位置，
+// try 区间端点的推导又会刻意排除它们（old > total），两者互不干扰。
+func (l *InsnList) AppendSynth(words []uint16) int {
+	l.synth++
+	old := l.total + l.synth
+	l.items = append(l.items, &insnItem{
+		words: append([]uint16(nil), words...),
+		kind:  itemInsn,
+		old:   old,
+	})
+	return len(l.items) - 1
+}
+
+// AddBranch 登记一条手动插入的分支引用。
+//
+// 分支指令的偏移字段由 Encode 依据 target（绝对旧字偏移）统一回填；
+// 调用方只需给出「分支指令所在的项下标、项内偏移字段位置、基准字偏移、
+// 目标旧偏移与编码格式」。
+func (l *InsnList) AddBranch(item, word, base, target int, form branchForm) {
+	l.branches = append(l.branches, branchRef{
+		item: item, word: word, base: base, target: target, form: form,
+	})
+}
+
 // fillArrayPayload 构造一个 fill-array-data-payload 的指令字。
 //
 // 布局：ident(1) + element_width(1) + size(2) + data（按字打包，末尾补齐）。

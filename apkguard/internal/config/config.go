@@ -102,7 +102,7 @@ var implementedIDs = map[FeatureID]bool{
 	// 阶段2/3 运行时防护
 	"D1": true, "D2": true, "D3": true,
 	// 阶段4 L3 native 防护（已落地的部分）
-	"C1": true, "C4": true, "C5": true, "C6": true,
+	"C1": true, "C2": true, "C4": true, "C5": true, "C6": true,
 	"D4": true, "D5": true,
 }
 
@@ -149,7 +149,7 @@ func All() []Feature {
 			Note: "可能破坏依赖资源名的第三方 SDK 与热修复框架"},
 		{ID: "A6", Name: "控制流混淆", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
 			Desc: "基本块平坦化、虚假分支（不透明谓词）、指令替换",
-			Note: "性能下降 10~30%，仅建议对关键方法启用"},
+			Note: "实现已就位但暂未开放：改写方法体需要寄存器类型/活跃性分析，当前形态在真实应用上会触发 ART 的宽值类型冲突（详见 realworld 实测记录）"},
 		{ID: "A7", Name: "反射化调用", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
 			Desc: "将敏感 API 调用改为 Class.forName + getMethod + invoke",
 			Note: "性能下降明显，且是逆向者的强信号"},
@@ -211,8 +211,8 @@ func All() []Feature {
 			Desc: "密钥由 native 结合设备指纹、APK 签名、编译期随机种子派生，不以明文存在于 Java 层",
 			Note: "修复样本密钥硬编码的致命缺陷"},
 		{ID: "C2", Name: "SO 加壳", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
-			Desc: "加密 SO 的代码段/数据段，JNI_OnLoad 时解密",
-			Note: "静态分析 SO 失效"},
+			Desc: "原生库整体加密存入 assets，壳启动时解密到应用私有目录，并把该目录并入类加载器的库搜索路径",
+			Note: "检测到 native 自加载框架（Flutter/RN/Unity）会整体跳过并给出提示——这类框架用 android_dlopen_ext 从 APK 按偏移加载，移走 lib/ 会让应用启动即崩；C2 开启时 lib/ 下不再有明文 .so"},
 		{ID: "C3", Name: "OLLVM 混淆", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
 			Desc: "对 native 代码应用控制流平坦化、虚假控制流、指令替换",
 			Note: "需外部 OLLVM 工具链"},
@@ -340,8 +340,20 @@ type Options struct {
 	ManifestPadMB int    `json:"manifest_pad_mb"` // A15 巨型 Manifest 填充量（MB，0=默认 100）
 
 	// 加壳参数
-	DexKey       string `json:"dex_key"`       // B1 加密密钥（留空自动生成）
-	DecoyPkg     string `json:"decoy_pkg"`     // B8 诱饵配置里的假包名（留空用默认）
+	DexKey   string `json:"dex_key"`   // B1 加密密钥（留空自动生成）
+	DecoyPkg string `json:"decoy_pkg"` // B8 诱饵配置里的假包名（留空用默认）
+	// PayloadMAC 让 B1 在密文后附加 HMAC-SHA256，壳在解密前先校验。
+	//
+	// 默认关闭：完整性目前由 APK 签名（E1）与运行时签名校验（D1）保证，
+	// 载荷自带 MAC 属于纵深防御——即使攻击者绕过 D1，也无法在不知道
+	// 密钥的情况下改出「能通过校验」的载荷。代价是壳侧多一次 HMAC 与一小段字节码。
+	PayloadMAC bool `json:"payload_mac"`
+	// SOEncrypt 把 APK 里的原生库整体加密存进 assets，壳在启动时解密到应用
+	// 私有目录，并把该目录作为 ClassLoader 的库搜索路径。
+	//
+	// 默认关闭：它改变了应用加载 .so 的来源，对「用 nativeLibraryDir 拼绝对
+	// 路径自行 System.load」的应用不兼容，必须逐个应用验证。
+	SOEncrypt    bool   `json:"so_encrypt"`
 	ShellPkg     string `json:"shell_pkg"`     // B2/B3 壳类所在包名
 	SplitCount   int    `json:"split_count"`   // B4 拆分 DEX 个数（0=按原样）
 	ExtractRatio int    `json:"extract_ratio"` // B5 抽取方法比例（1~100）
@@ -416,9 +428,12 @@ func (o *Options) Validate() error {
 	deps := map[FeatureID][]dep{
 		"B1": {{"B2", "DEX 整体加密需要壳 Application 才能解密加载"},
 			{"B3", "DEX 整体加密需要 ClassLoader 接管才能加载解密后的 DEX"}},
-		"B3":  {{"B2", "ClassLoader 接管需要壳 Application 提供最早执行时机"}},
-		"B4":  {{"B1", "多 DEX 拆分需要 DEX 加密才能体现防护价值"}},
-		"B8":  {{"B1", "载荷容器化需要先有加密载荷"}},
+		"B3": {{"B2", "ClassLoader 接管需要壳 Application 提供最早执行时机"}},
+		"B4": {{"B1", "多 DEX 拆分需要 DEX 加密才能体现防护价值"}},
+		"B8": {{"B1", "载荷容器化需要先有加密载荷"}},
+		// C2 把 lib/<abi>/*.so 整体移进 assets，应用再也拿不到这些库，
+		// 必须由壳在启动时解密到私有目录、并把该目录并入类加载器的库搜索路径。
+		"C2":  {{"B1", "原生库加密需要壳的解密载荷机制"}, {"B2", "需要壳 Application 提供最早执行时机"}, {"B3", "需要 ClassLoader 接管（库搜索路径由它承载）"}},
 		"B5":  {{"B1", "函数抽取需要 DEX 加密作为基础"}},
 		"B6":  {{"B2", "VMP 需要壳 Application"}, {"B3", "VMP 需要 ClassLoader 接管"}},
 		"B7":  {{"B2", "Dex2C 需要壳 Application"}, {"B3", "Dex2C 需要 ClassLoader 接管"}},
@@ -437,6 +452,12 @@ func (o *Options) Validate() error {
 		"D4": {{"B2", "运行期复检需要壳 Application 提供启动时机"}, {"C1", "运行期复检与密钥派生共用同一份原生库与桥接类"}},
 		"D5": {{"B2", "设备绑定需要壳 Application 提供启动时机"}},
 	}
+	// 选项级依赖：PayloadMAC 只有 B1 会消费，单独打开等于静默无效果。
+	// 这里是「选项」而不是「功能项」，故不进 deps 表。
+	if o.PayloadMAC && !o.IsEnabled("B1") {
+		errs = append(errs, "已指定 -payload-mac，但未启用 B1（DEX 整体加密）：载荷 MAC 由 B1 生成、由壳校验，单独打开不会产生任何效果")
+	}
+
 	for id, ds := range deps {
 		if !o.IsEnabled(id) {
 			continue

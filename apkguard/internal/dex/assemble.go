@@ -453,6 +453,9 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 	parsedCD := map[uint32]*ClassData{}
 	codeOffs := []uint32{}
 	seenCode := map[uint32]bool{}
+	// codeName 记录「code_item 偏移 -> 方法名」，供 A6 保守跳过 <init>/<clinit>。
+	// 多个方法可共享同一 code_off（少见但合法），取第一个到的名字即可。
+	codeName := map[uint32]string{}
 	for i := range pl.classes {
 		c := &pl.classes[i]
 		if c.old == noOld || c.dataOff == 0 {
@@ -468,9 +471,19 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 		parsedCD[c.dataOff] = pcd
 		for _, lst := range [][]EncodedMethod{pcd.DirectMethods, pcd.VirtualMethods} {
 			for _, m := range lst {
-				if m.CodeOff != 0 && !seenCode[m.CodeOff] {
+				if m.CodeOff == 0 {
+					continue
+				}
+				if !seenCode[m.CodeOff] {
 					seenCode[m.CodeOff] = true
 					codeOffs = append(codeOffs, m.CodeOff)
+				}
+				if _, ok := codeName[m.CodeOff]; !ok {
+					if ref, err := f.MethodRefAt(m.Idx); err == nil {
+						if nm, err := f.String(ref.NameIdx); err == nil {
+							codeName[m.CodeOff] = nm
+						}
+					}
 				}
 			}
 		}
@@ -507,6 +520,17 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 	}
 
 	// ---- 3) code_item ----
+	// A6 的统计在每轮 generate 开头清零：assemble 会迭代多次 generate 以收敛
+	// 数据区布局，method 改写是确定性的，但统计若累加会翻倍。
+	if pl.controlFlow != nil {
+		pl.controlFlow.stats = ControlFlowStats{}
+	}
+	// A3 的计数同样必须每轮清零：arrayizeCodeItem 是累加式的，
+	// 而 assemble 会迭代多次 generate 以收敛数据区布局，累加会把
+	// 「实际改写 1 个」记成 2 个（实测：A2→A3 串行时 A3.strings 报 2）。
+	if pl.constArr != nil {
+		pl.constArr.count = 0
+	}
 	codeMap := map[uint32]uint32{}
 	for _, co := range codeOffs {
 		var blob []byte
@@ -518,13 +542,10 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 				return nil, err
 			}
 			blob = append([]byte(nil), d[co:co+uint32(length)]...)
-			// A2/A3：改写 const-string。
-			//
-			// 两者都作用于同一条指令，因此必须串行：先 A2（把明文换成
-			// 「密文 + 解密调用」），再 A3（对未被 A2 处理的常量做数组化）。
-			// 每一步都会改变指令流长度，而 try/handler 的偏移已由各步内部修正。
-			//
 			// skip 汇总「已是新索引、不可再映射」的字位置，交给 remapCode。
+			// 它必须与**产生它的改写步骤**的输出字节流严格对应，因此每一步
+			// 改写后若再平移字位置，之前的 skip 就失效——这正是 A6 必须排在
+			// A2/A3 之前的原因（见下）。
 			var skip map[int]bool
 			mergeSkip := func(s map[int]bool) {
 				if len(s) == 0 {
@@ -537,6 +558,29 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 					skip[k] = true
 				}
 			}
+			// A6：控制流混淆。
+			//
+			// 必须排在 A2/A3 **之前**。A2/A3 返回的是**绝对字位置**，交给后面的
+			// remapCode 使用；A6 会插入/替换指令、整体平移后续字位置，若排在
+			// A2/A3 之后，那些位置会全部错位，remapCode 要么跳过错误的字、要么
+			// 漏跳正确的字，导致池引用被二次映射或漏映射，产物静默损坏。
+			// A6 自身不产生任何池引用、不需要 skip，且不触碰 const-string，
+			// 对后续 A2/A3 无干扰，因此放在最前最稳。
+			if pl.controlFlow != nil {
+				nb, sk, changed, err := b.controlFlowCodeItem(pl, codeName[co], blob)
+				if err != nil {
+					return nil, err
+				}
+				if changed {
+					blob = nb
+					mergeSkip(sk)
+				}
+			}
+			// A2/A3：改写 const-string。
+			//
+			// 两者都作用于同一条指令，因此必须串行：先 A2（把明文换成
+			// 「密文 + 解密调用」），再 A3（对未被 A2 处理的常量做数组化）。
+			// 每一步都会改变指令流长度，而 try/handler 的偏移已由各步内部修正。
 			if pl.strEnc != nil {
 				nb, sk, changed, err := b.encryptCodeItem(pl, blob)
 				if err != nil {

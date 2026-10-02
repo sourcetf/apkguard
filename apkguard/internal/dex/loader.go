@@ -41,6 +41,40 @@ type LoaderSpec struct {
 	// 附带的安全性质：重打包必然更换签名证书，派生出的密钥随之不同，
 	// 密文载荷在密码学层面无法解开——不存在「跳过检测」的绕过路径。
 	NativeKey string
+	// MAC 为 true 时，每份载荷在解密前先用 HMAC-SHA256 校验完整性
+	// （encrypt-then-MAC，见 pack.MAC）。为 false 时不生成任何 MAC 指令，
+	// 产物与旧格式完全一致。
+	MAC bool
+	// LibItems 是 C2（SO 加壳）留下的原生库载荷：壳在构造 DexClassLoader
+	// 之前把它们解密落地到私有目录，并把该目录并入库搜索路径。
+	//
+	// 为空表示未启用 C2，Loader 生成的字节码与旧版逐字节一致。
+	LibItems []LoaderLibItem
+	// LibDir 是原生库解密后落地的私有子目录名（相对应用私有目录）。
+	//
+	// 与 TempDir 同理必须落在私有目录：外部存储通常 noexec，且不在链接器
+	// 命名空间内，dlopen 会失败。C2 还要求落盘后置只读（W^X，见 LibReadOnly）。
+	LibDir string
+	// LibReadOnly 为 true 时，落地后的 .so 调用 setReadOnly()。
+	//
+	// Android 10（API 29）起强制 W^X：targetSdk ≥ 29 的应用不能 dlopen
+	// 「可写」文件。这与 DEX 的只读阈值（API 34）不同，故单独设开关。
+	LibReadOnly bool
+}
+
+// LoaderLibItem 是一份待运行时解密的原生库载荷（C2）。
+type LoaderLibItem struct {
+	// Asset 是 APK 内的条目名，形如 "assets/res_ab12.bin"。
+	Asset string
+	// Name 是解密后落地使用的文件名（如 "libfoo.so"）。
+	//
+	// 必须是原始文件名：System.loadLibrary 经 ClassLoader.findLibrary 在
+	// 库搜索路径里按 "lib<name>.so" 查找，改名会导致找不到。
+	Name string
+	// Abi 是原始 ABI 目录名，仅用于报告与排障。
+	Abi string
+	// Size 是载荷字节数（含前置 IV）。
+	Size int
 }
 
 // LoaderItem 是一份待运行时解密的载荷。
@@ -56,7 +90,16 @@ type LoaderItem struct {
 	//
 	// 读取循环需要预知总长才能一次分配到位并避免反复扩容；
 	// 该值在加固时已知，因此可以直接内联为常量。
+	//
+	// 注意：启用载荷 MAC 时 Blob 尾部多 32 字节 tag，此处必须取
+	// len(Blob)（B3 已如此）——若仍按旧格式少算 32，r() 会少读尾部字节，
+	// 表现为解密后 DEX 校验失败或 MAC 校验必然失败。
 	Size int
+	// Name 是原始 DEX 名（如 "classes.dex"），仅启用 MAC 时用于绑定校验。
+	//
+	// 必须是 Payload.Name 而不是容器化后的 Asset 名：B8 会重命名 Asset，
+	// 用 Asset 会让壳侧算出的 MAC 与打包时不一致。
+	Name string
 }
 
 // 注入代码引用的框架类型。
@@ -71,6 +114,7 @@ const (
 	descCipher       = "Ljavax/crypto/Cipher;"
 	descSecretKey    = "Ljavax/crypto/spec/SecretKeySpec;"
 	descIvSpec       = "Ljavax/crypto/spec/IvParameterSpec;"
+	descMac          = "Ljavax/crypto/Mac;"
 	descField        = "Ljava/lang/reflect/Field;"
 	descObjectArray  = "[Ljava/lang/Object;"
 	descClassArray   = "[Ljava/lang/Class;"
@@ -102,6 +146,18 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 	if len(ls.Items) == 0 {
 		return Addition{}, fmt.Errorf("dex: Loader 没有任何载荷")
 	}
+	if ls.MAC {
+		// MAC 校验要把原始 DEX 名内联进字节码；缺失说明 B3 接线漏了
+		// Name 字段，必须在打包期就报错，而不是产出一个必然启动失败的壳。
+		for _, it := range ls.Items {
+			if it.Name == "" {
+				return Addition{}, fmt.Errorf("dex: Loader 启用了 MAC 但载荷 %s 缺少原始 DEX 名（无法绑定校验）", it.Asset)
+			}
+		}
+	}
+	if len(ls.LibItems) > 0 && ls.LibDir == "" {
+		return Addition{}, fmt.Errorf("dex: Loader 有原生库载荷但未指定落地目录 LibDir")
+	}
 
 	// 逐个生成方法体；每个方法的引用会自动登记进 Addition（见 expandAdditionRefs）。
 	entry, err := loaderEntryCode(ls)
@@ -132,6 +188,13 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 	if err != nil {
 		return Addition{}, err
 	}
+	var macVerify *CodeBlob
+	if ls.MAC {
+		macVerify, err = loaderMACCode(ls.Class)
+		if err != nil {
+			return Addition{}, err
+		}
+	}
 
 	const (
 		nameEntry   = LoaderEntry
@@ -141,42 +204,55 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 		nameInstall = "i"
 		nameGetF    = "g"
 		nameSetF    = "s"
+		nameMAC     = "v"
 	)
 
 	protoCtxCL := ProtoSpec{Ret: descClassLoader, Params: []string{descContext}}
 	protoInBytes := ProtoSpec{Ret: descByteArray, Params: []string{descInputStream, "I"}}
-	protoBytes2 := ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray}}
+	protoBytes2 := ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, "I"}}
 	protoFileBytes := ProtoSpec{Ret: "V", Params: []string{descFile, descByteArray}}
 	protoCLI := ProtoSpec{Ret: "I", Params: []string{descClassLoader}}
 	protoObjStr := ProtoSpec{Ret: descObject, Params: []string{descObject, descStringType}}
 	protoObjStrObjBool := ProtoSpec{Ret: "Z", Params: []string{descObject, descStringType, descObject}}
+	// v(blob, key, name)：blob=IV‖密文‖tag，key=AES 密钥，name=原始 DEX 名。
+	protoMAC := ProtoSpec{Ret: "Z", Params: []string{descByteArray, descByteArray, descStringType}}
+
+	methods := []ClassMethod{
+		{Name: nameEntry, Proto: protoCtxCL, Access: accPublic | accStatic, Code: entry},
+		{Name: nameRead, Proto: protoInBytes, Access: accPrivate | accStatic, Code: readAll},
+		{Name: nameDecrypt, Proto: protoBytes2, Access: accPrivate | accStatic, Code: decrypt},
+		{Name: nameWrite, Proto: protoFileBytes, Access: accPrivate | accStatic, Code: writeAll},
+		{Name: nameInstall, Proto: protoCLI, Access: accPrivate | accStatic, Code: install},
+		{Name: nameGetF, Proto: protoObjStr, Access: accPrivate | accStatic, Code: getField},
+		{Name: nameSetF, Proto: protoObjStrObjBool, Access: accPrivate | accStatic, Code: setField},
+	}
+	// 方法表必须与类体一一对应，planInjectedClass 会校验。
+	regMethods := []MethodSpec{
+		{Class: ls.Class, Name: nameEntry, Proto: protoCtxCL},
+		{Class: ls.Class, Name: nameRead, Proto: protoInBytes},
+		{Class: ls.Class, Name: nameDecrypt, Proto: protoBytes2},
+		{Class: ls.Class, Name: nameWrite, Proto: protoFileBytes},
+		{Class: ls.Class, Name: nameInstall, Proto: protoCLI},
+		{Class: ls.Class, Name: nameGetF, Proto: protoObjStr},
+		{Class: ls.Class, Name: nameSetF, Proto: protoObjStrObjBool},
+	}
+	// 未启用 MAC 时**不**生成 v：产物字节与旧版完全一致，也不引入
+	// javax.crypto.Mac 相关引用。
+	if ls.MAC {
+		methods = append(methods, ClassMethod{Name: nameMAC, Proto: protoMAC, Access: accPrivate | accStatic, Code: macVerify})
+		regMethods = append(regMethods, MethodSpec{Class: ls.Class, Name: nameMAC, Proto: protoMAC})
+	}
 
 	spec := ClassSpec{
-		Name:   ls.Class,
-		Super:  descObject,
-		Access: accPublic,
-		Methods: []ClassMethod{
-			{Name: nameEntry, Proto: protoCtxCL, Access: accPublic | accStatic, Code: entry},
-			{Name: nameRead, Proto: protoInBytes, Access: accPrivate | accStatic, Code: readAll},
-			{Name: nameDecrypt, Proto: protoBytes2, Access: accPrivate | accStatic, Code: decrypt},
-			{Name: nameWrite, Proto: protoFileBytes, Access: accPrivate | accStatic, Code: writeAll},
-			{Name: nameInstall, Proto: protoCLI, Access: accPrivate | accStatic, Code: install},
-			{Name: nameGetF, Proto: protoObjStr, Access: accPrivate | accStatic, Code: getField},
-			{Name: nameSetF, Proto: protoObjStrObjBool, Access: accPrivate | accStatic, Code: setField},
-		},
+		Name:    ls.Class,
+		Super:   descObject,
+		Access:  accPublic,
+		Methods: methods,
 	}
 
 	// 类必须自己出现在方法表里，planInjectedClass 会校验注入方法已登记。
 	add := Addition{
-		Methods: []MethodSpec{
-			{Class: ls.Class, Name: nameEntry, Proto: protoCtxCL},
-			{Class: ls.Class, Name: nameRead, Proto: protoInBytes},
-			{Class: ls.Class, Name: nameDecrypt, Proto: protoBytes2},
-			{Class: ls.Class, Name: nameWrite, Proto: protoFileBytes},
-			{Class: ls.Class, Name: nameInstall, Proto: protoCLI},
-			{Class: ls.Class, Name: nameGetF, Proto: protoObjStr},
-			{Class: ls.Class, Name: nameSetF, Proto: protoObjStrObjBool},
-		},
+		Methods: regMethods,
 		Classes: []ClassSpec{spec},
 	}
 	return add, nil
@@ -265,11 +341,18 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 	readM := MethodSpec{Class: ls.Class, Name: "r",
 		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descInputStream, "I"}}}
 	decM := MethodSpec{Class: ls.Class, Name: "c",
-		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray}}}
+		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, "I"}}}
 	writeM := MethodSpec{Class: ls.Class, Name: "w",
 		Proto: ProtoSpec{Ret: "V", Params: []string{descFile, descByteArray}}}
 	instM := MethodSpec{Class: ls.Class, Name: "i",
 		Proto: ProtoSpec{Ret: "I", Params: []string{descClassLoader}}}
+	// MAC 校验（仅在 ls.MAC 时被引用）与失败终止。
+	macM := MethodSpec{Class: ls.Class, Name: "v",
+		Proto: ProtoSpec{Ret: "Z", Params: []string{descByteArray, descByteArray, descStringType}}}
+	exitM := MethodSpec{Class: descSystem, Name: "exit",
+		Proto: ProtoSpec{Ret: "V", Params: []string{"I"}}}
+	// .so 落地后置只读（W^X，Android 10+ 对 targetSdk ≥ 29 的硬性要求）。
+	setROM := MethodSpec{Class: descFile, Name: "setReadOnly", Proto: ProtoSpec{Ret: "Z"}}
 
 	// 载荷密钥：要么由 native 派生（C1），要么内联在字节码里。
 	bridgeSig := MethodSpec{Class: ls.NativeKey, Name: NativeSig,
@@ -337,8 +420,29 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 			return nil, err
 		}
 		a.MoveResultObject(rBlob)
-		// dex = c(blob, key)
-		if err := a.InvokeStatic([]int{rBlob, rKey}, decM); err != nil {
+		// 启用 MAC 时先校验再解密：顺序不可颠倒。
+		//
+		// 若先解密再比对，攻击者就能从「填充是否合法」的差异里获得
+		// 填充 oracle；encrypt-then-MAC 的意义正在于让校验失败与密钥
+		// 错误在外部观察上不可区分（都走同一条终止路径）。
+		if ls.MAC {
+			a.ConstString(rT0, it.Name)
+			if err := a.InvokeStatic([]int{rBlob, rKey, rT0}, macM); err != nil {
+				return nil, err
+			}
+			a.MoveResult(rT1)
+			a.IfEqz(rT1, "mac_fail")
+		}
+		// dex = c(blob, key, drop)
+		//
+		// 启用 MAC 时 blob 尾部有 32 字节 tag，必须把 drop 传给 c 让其排除，
+		// 否则 tag 会被当成 CBC 密文，填充校验失败。
+		if ls.MAC {
+			a.Const16(rT2, int16(tagLen))
+		} else {
+			a.Const4(rT2, 0)
+		}
+		if err := a.InvokeStatic([]int{rBlob, rKey, rT2}, decM); err != nil {
 			return nil, err
 		}
 		a.MoveResultObject(rDex)
@@ -374,6 +478,80 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 		}
 	}
 
+	// C2：解密原生库载荷到私有目录。
+	//
+	// 必须在构造 DexClassLoader 之前完成：应用的 System.loadLibrary 在
+	// attachBaseContext 之后（onCreate 等）才会被调用，届时库文件必须已就绪。
+	//
+	// 寄存器复用：DEX 循环结束后 rIn(3)/rBlob(4)/rDex(5)/rFile(6) 都已无用。
+	// rIn 改存 libDir(File)、rBlob 改存 libPath(String)，避免顶高寄存器总数
+	// （invoke 的 35c 只编码 v0..v15，一旦超过就无法传参）。
+	if len(ls.LibItems) > 0 {
+		const (
+			rLibDir  = rIn
+			rLibPath = rBlob
+			rLibIn   = rDex
+			rLibBlob = rT0
+			rLibSo   = rT1
+			rLibFile = rFile
+		)
+		// libDir = base.getDir(LIBDIR, 0)
+		a.ConstString(rT0, ls.LibDir)
+		a.Const4(rT1, 0)
+		if err := a.InvokeVirtual([]int{rBase, rT0, rT1}, getDir); err != nil {
+			return nil, err
+		}
+		a.MoveResultObject(rLibDir)
+		// libPath = libDir.getAbsolutePath()
+		if err := a.InvokeVirtual([]int{rLibDir}, absPath); err != nil {
+			return nil, err
+		}
+		a.MoveResultObject(rLibPath)
+
+		for _, it := range ls.LibItems {
+			// in = base.getAssets().open(ASSET)
+			if err := a.InvokeVirtual([]int{rBase}, getAssets); err != nil {
+				return nil, err
+			}
+			a.MoveResultObject(rT2)
+			a.ConstString(rT3, assetKey(it.Asset))
+			if err := a.InvokeVirtual([]int{rT2, rT3}, amOpen); err != nil {
+				return nil, err
+			}
+			a.MoveResultObject(rLibIn)
+			// blob = r(in, SIZE)
+			a.Const32(rT2, int32(it.Size))
+			if err := a.InvokeStatic([]int{rLibIn, rT2}, readM); err != nil {
+				return nil, err
+			}
+			a.MoveResultObject(rLibBlob)
+			// so = c(blob, key, 0)：复用 DEX 的解密实现（同样是 IV‖AES-CBC）。
+			// .so 载荷不带 MAC，drop 传 0。
+			a.Const4(rT2, 0)
+			if err := a.InvokeStatic([]int{rLibBlob, rKey, rT2}, decM); err != nil {
+				return nil, err
+			}
+			a.MoveResultObject(rLibSo)
+			// f = new File(libDir, NAME)
+			a.NewInstance(rLibFile, descFile)
+			a.ConstString(rT2, it.Name)
+			if err := a.InvokeDirect([]int{rLibFile, rLibDir, rT2}, fileInit); err != nil {
+				return nil, err
+			}
+			// w(f, so)
+			if err := a.InvokeStatic([]int{rLibFile, rLibSo}, writeM); err != nil {
+				return nil, err
+			}
+			// f.setReadOnly()：Android 10+ 的 W^X 要求，targetSdk ≥ 29 必须置只读，
+			// 否则 dlopen 会报 "is writable by the app"。
+			if ls.LibReadOnly {
+				if err := a.InvokeVirtual([]int{rLibFile}, setROM); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
 	if ls.Debug {
 		if err := emitToast(a, tm, rBase, rT2, rT4, "AG-L1 载荷已解密并落地"); err != nil {
 			return nil, err
@@ -395,6 +573,38 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 	// 以免顶高寄存器总数（invoke 的 35c 格式只编码 v0..v15）。
 	if err := a.IGetObject(rFile, rT0, libDirField); err != nil {
 		return nil, err
+	}
+
+	// C2 启用时把解密目录并入库搜索路径：libPath + ":" + nativeLibraryDir。
+	//
+	// 解密目录在前、原目录兜底：未被 C2 处理的库（以及 C1 注入的
+	// libapkguard.so）仍在原目录可解析。System.loadLibrary 会经
+	// ClassLoader.findLibrary 在 nativeLibraryDirectories 里按顺序查找。
+	//
+	// 注意这只覆盖 Java 层加载路径；native 层裸名 dlopen 与
+	// android_dlopen_ext（Flutter/RN/Unity 从 APK 按偏移加载）读不到
+	// 这个 Java 字段，无法接管（见 C2 方案文档 §2.2.4）。
+	if len(ls.LibItems) > 0 {
+		a.NewInstance(rT2, descStringB)
+		if err := a.InvokeDirect([]int{rT2}, sbInit); err != nil {
+			return nil, err
+		}
+		// libPath 仍存放在 DEX 循环用的 rBlob 里。
+		if err := a.InvokeVirtual([]int{rT2, rBlob}, sbAppend); err != nil {
+			return nil, err
+		}
+		a.SGetObject(rT3, sepField)
+		if err := a.InvokeVirtual([]int{rT2, rT3}, sbAppend); err != nil {
+			return nil, err
+		}
+		if err := a.InvokeVirtual([]int{rT2, rFile}, sbAppend); err != nil {
+			return nil, err
+		}
+		if err := a.InvokeVirtual([]int{rT2}, sbToString); err != nil {
+			return nil, err
+		}
+		a.MoveResultObject(rT3)
+		a.MoveObject(rFile, rT3)
 	}
 
 	// parent = base.getClassLoader()
@@ -444,6 +654,22 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 		a.Label("L_swap_done")
 	}
 	a.ReturnObject(rCL)
+
+	// MAC 校验失败：硬终止，与 D1 签名校验同一处置方式（System.exit(1)）。
+	//
+	// 不做静默假路径：注入字节码没有异常表，构造假路径既复杂又可能误伤
+	// 合法环境；而 MAC 的不可伪造性不依赖「隐藏校验点」，攻击者知道这里
+	// 有校验也改不出合法载荷。返回值仅为满足校验器的控制流要求，
+	// 真机上 System.exit 不会返回。
+	if ls.MAC {
+		a.Label("mac_fail")
+		a.Const4(rT0, 1)
+		if err := a.InvokeStatic([]int{rT0}, exitM); err != nil {
+			return nil, err
+		}
+		a.Const4(rT0, 0)
+		a.ReturnObject(rT0)
+	}
 
 	insns, patches, err := a.Assemble()
 	if err != nil {
@@ -534,22 +760,26 @@ func loaderReadAllCode() (*CodeBlob, error) {
 	return &CodeBlob{Registers: 6, Ins: 2, Outs: 4, Insns: insns, Patches: patches}, nil
 }
 
-// ---- 解密：c(byte[], byte[]) -> byte[] ----
+// ---- 解密：c(byte[], byte[], int) -> byte[] ----
 //
 // 等价 Java：
 //
-//	static byte[] c(byte[] blob, byte[] key) {
+//	static byte[] c(byte[] blob, byte[] key, int drop) {
 //	    byte[] iv = new byte[16];
 //	    System.arraycopy(blob, 0, iv, 0, 16);
 //	    Cipher cp = Cipher.getInstance("AES/CBC/PKCS5Padding");
 //	    cp.init(DECRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
-//	    return cp.doFinal(blob, 16, blob.length - 16);
+//	    return cp.doFinal(blob, 16, blob.length - 16 - drop);
 //	}
+//
+// drop 是「载荷尾部需要忽略的字节数」：启用载荷 MAC 时尾部有 32 字节 tag，
+// 必须排除在 CBC 密文之外，否则填充校验必然失败（表现为解密后 DEX 校验失败）。
+// 未启用 MAC 与 C2 的 .so 载荷都传 0，语义与旧版完全一致。
 //
 // 密钥由调用方传入而不是在此内联：C1 生效时它来自 native 派生，
 // 未启用时才是内联常量。这样解密路径本身与密钥来源解耦。
 //
-// registers=8、ins=2 → blob 在 v6、key 在 v7。
+// registers=9、ins=3 → blob 在 v6、key 在 v7、drop 在 v8。
 func loaderDecryptCode() (*CodeBlob, error) {
 	const (
 		rIv   = 0
@@ -560,6 +790,7 @@ func loaderDecryptCode() (*CodeBlob, error) {
 		rT1   = 5
 		rBlob = 6
 		rKey  = 7
+		rDrop = 8
 	)
 	getInstance := MethodSpec{Class: descCipher, Name: "getInstance",
 		Proto: ProtoSpec{Ret: descCipher, Params: []string{descStringType}}}
@@ -609,10 +840,11 @@ func loaderDecryptCode() (*CodeBlob, error) {
 	if err := a.InvokeVirtual([]int{rCp, rT0, rSks, rIvs}, cipherInit); err != nil {
 		return nil, err
 	}
-	// return cp.doFinal(blob, 16, blob.length - 16)
+	// return cp.doFinal(blob, 16, blob.length - 16 - drop)
 	a.Const16(rT0, int16(ivLen))
 	a.ArrayLength(rT1, rBlob)
 	a.SubInt(rT1, rT1, rT0)
+	a.SubInt(rT1, rT1, rDrop)
 	if err := a.InvokeVirtual([]int{rCp, rBlob, rT0, rT1}, doFinal); err != nil {
 		return nil, err
 	}
@@ -623,15 +855,189 @@ func loaderDecryptCode() (*CodeBlob, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &CodeBlob{Registers: 8, Ins: 2, Outs: 5, Insns: insns, Patches: patches}, nil
+	return &CodeBlob{Registers: 9, Ins: 3, Outs: 5, Insns: insns, Patches: patches}, nil
 }
 
-// 载荷的密码学参数（必须与 internal/pack 一致）。
+// ---- 载荷 MAC：v(byte[] blob, byte[] key, String name) -> boolean ----
+//
+// 等价 Java：
+//
+//	static boolean v(byte[] blob, byte[] key, String name) {
+//	    if (blob.length < 16 + 32) return false;             // IV + Tag
+//	    MessageDigest md = MessageDigest.getInstance("SHA-256");
+//	    md.update(key);
+//	    md.update("apkguard/payload-mac".getBytes());
+//	    byte[] macKey = md.digest();                          // 域分离
+//	    Mac mac = Mac.getInstance("HmacSHA256");
+//	    mac.init(new SecretKeySpec(macKey, "HmacSHA256"));
+//	    mac.update(name.getBytes());
+//	    mac.update(blob, 0, blob.length - 32);               // 覆盖 IV‖密文
+//	    byte[] got = mac.doFinal();
+//	    int diff = 0;                                        // 常量时间比较
+//	    for (int i = 0; i < 32; i++)
+//	        diff |= got[i] ^ blob[blob.length - 32 + i];
+//	    return diff == 0;
+//	}
+//
+// 评审要点：
+//   - 先验 MAC 后解密（调用点在 entry 里位于 c() 之前），消除填充 oracle；
+//   - 比较用「逐字节 XOR 累加再判 0」，不提前返回，避免 tag 前缀的定时侧信道；
+//   - 长度不足与 tag 不符都返回 false，不做差异化行为；
+//   - name 绑定的是**原始 DEX 名**（Payload.Name），不是容器化后的 Asset 名。
+//
+// 形参类型必须按接口写：Mac.init 的参数是 java.security.Key（SecretKeySpec
+// 实现它），写成具体类会被 ART 校验器拒绝（与 loaderDecryptCode 同理）。
+//
+// registers=14、ins=3 → blob 在 v11、key 在 v12、name 在 v13。
+func loaderMACCode(self string) (*CodeBlob, error) {
+	const (
+		rDom    = 0 // byte[] 域分离串
+		rMd     = 1 // MessageDigest
+		rMacKey = 2 // byte[]
+		rMac    = 3 // Mac
+		rNameB  = 4 // byte[] name.getBytes()
+		rGot    = 5 // byte[] mac.doFinal()
+		rI      = 6 // int
+		rDiff   = 7 // int
+		rLen    = 8 // int 复用为 blob.length - 32
+		rT0     = 9
+		rT1     = 10
+		rBlob   = 11
+		rKey    = 12
+		rName   = 13
+	)
+	strGetBytes := MethodSpec{Class: descString, Name: "getBytes", Proto: ProtoSpec{Ret: descByteArray}}
+	mdGetInstance := MethodSpec{Class: descMessageDigest, Name: "getInstance",
+		Proto: ProtoSpec{Ret: descMessageDigest, Params: []string{descStringType}}}
+	mdUpdate := MethodSpec{Class: descMessageDigest, Name: "update",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descByteArray}}}
+	mdDigest := MethodSpec{Class: descMessageDigest, Name: "digest", Proto: ProtoSpec{Ret: descByteArray}}
+	macGetInstance := MethodSpec{Class: descMac, Name: "getInstance",
+		Proto: ProtoSpec{Ret: descMac, Params: []string{descStringType}}}
+	macInit := MethodSpec{Class: descMac, Name: "init",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descKeyIface}}}
+	macUpdate1 := MethodSpec{Class: descMac, Name: "update",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descByteArray}}}
+	macUpdate3 := MethodSpec{Class: descMac, Name: "update",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descByteArray, "I", "I"}}}
+	macDoFinal := MethodSpec{Class: descMac, Name: "doFinal", Proto: ProtoSpec{Ret: descByteArray}}
+	sksInit := MethodSpec{Class: descSecretKey, Name: "<init>",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descByteArray, descStringType}}}
+
+	a := NewAsm()
+	// if (blob.length < 48) return false;
+	a.ArrayLength(rLen, rBlob)
+	a.Const16(rT0, int16(ivLen+tagLen))
+	if err := a.IfLt(rLen, rT0, "fail"); err != nil {
+		return nil, err
+	}
+	// dom = "apkguard/payload-mac".getBytes()
+	a.ConstString(rT0, macDomain)
+	if err := a.InvokeVirtual([]int{rT0}, strGetBytes); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rDom)
+	// md = MessageDigest.getInstance("SHA-256")
+	a.ConstString(rT0, digestAlg)
+	if err := a.InvokeStatic([]int{rT0}, mdGetInstance); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rMd)
+	// md.update(key); md.update(dom); macKey = md.digest()
+	if err := a.InvokeVirtual([]int{rMd, rKey}, mdUpdate); err != nil {
+		return nil, err
+	}
+	if err := a.InvokeVirtual([]int{rMd, rDom}, mdUpdate); err != nil {
+		return nil, err
+	}
+	if err := a.InvokeVirtual([]int{rMd}, mdDigest); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rMacKey)
+	// mac = Mac.getInstance("HmacSHA256")
+	a.ConstString(rT0, macAlg)
+	if err := a.InvokeStatic([]int{rT0}, macGetInstance); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rMac)
+	// mac.init(new SecretKeySpec(macKey, "HmacSHA256"))
+	a.NewInstance(rT0, descSecretKey)
+	a.ConstString(rT1, macAlg)
+	if err := a.InvokeDirect([]int{rT0, rMacKey, rT1}, sksInit); err != nil {
+		return nil, err
+	}
+	if err := a.InvokeVirtual([]int{rMac, rT0}, macInit); err != nil {
+		return nil, err
+	}
+	// mac.update(name.getBytes())
+	if err := a.InvokeVirtual([]int{rName}, strGetBytes); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rNameB)
+	if err := a.InvokeVirtual([]int{rMac, rNameB}, macUpdate1); err != nil {
+		return nil, err
+	}
+	// mac.update(blob, 0, blob.length - 32)
+	a.Const4(rT0, 0)
+	a.Const16(rT1, int16(tagLen))
+	a.SubInt(rLen, rLen, rT1)
+	if err := a.InvokeVirtual([]int{rMac, rBlob, rT0, rLen}, macUpdate3); err != nil {
+		return nil, err
+	}
+	// got = mac.doFinal()
+	if err := a.InvokeVirtual([]int{rMac}, macDoFinal); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rGot)
+	// diff = 0; i = 0
+	a.Const4(rDiff, 0)
+	a.Const4(rI, 0)
+	a.Label("loop")
+	a.Const16(rT0, int16(tagLen))
+	if err := a.IfGe(rI, rT0, "done"); err != nil {
+		return nil, err
+	}
+	a.AGetByte(rT1, rGot, rI)
+	// 直接读 blob 尾部的 tag，省一次 arraycopy。rLen 已是 len-32。
+	a.AddInt(rT0, rLen, rI)
+	a.AGetByte(rT0, rBlob, rT0)
+	a.XorInt(rT1, rT1, rT0)
+	a.OrInt(rDiff, rDiff, rT1)
+	a.AddIntLit8(rI, 1)
+	a.Goto("loop")
+	a.Label("done")
+	a.Const4(rT0, 0)
+	if err := a.IfEq(rDiff, rT0, "ok"); err != nil {
+		return nil, err
+	}
+	a.Const4(rT0, 0)
+	a.Return(rT0)
+	a.Label("ok")
+	a.Const4(rT0, 1)
+	a.Return(rT0)
+	a.Label("fail")
+	a.Const4(rT0, 0)
+	a.Return(rT0)
+
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		return nil, err
+	}
+	return &CodeBlob{Registers: 14, Ins: 3, Outs: 4, Insns: insns, Patches: patches}, nil
+}
+
+// 这些常量与 internal/pack/pack.go 是两处独立定义，任何一处漂移都会让
+// 壳算出的 MAC/解密参数与打包时对不上——且只有真机启动才暴露。
+// 除本文件的解释器测试外，pack 侧另有对拍守卫测试钉住同一组值。
 const (
 	keyLen    = 32 // AES-256
 	ivLen     = 16 // CBC 分组长度
+	tagLen    = 32 // HMAC-SHA256 标签长度
 	cipherAlg = "AES/CBC/PKCS5Padding"
 	keyAlg    = "AES"
+	macAlg    = "HmacSHA256"
+	// macDomain 必须与 pack.macDomain 逐字节一致。
+	macDomain = "apkguard/payload-mac"
 )
 
 // descSystem 是 java.lang.System 的描述符。

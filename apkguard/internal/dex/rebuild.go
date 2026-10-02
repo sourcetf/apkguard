@@ -123,6 +123,21 @@ type RebuildOptions struct {
 	// Rename 把旧字符串替换为新字符串（未列出的保持不变）。
 	// 若多个旧字符串被替换为同一个新值，它们在字符串池中会合并为一项。
 	Rename map[string]string
+	// MethodNameByID / FieldNameByID：旧 method_id / field_id 索引 -> 新名字。
+	//
+	// 与 Rename 的关键区别：Rename 按**字符串值**生效——字符串池是去重的，
+	// 一个名字（如 TAG、getString）常被多个类的多条 method_id/field_id 共用，
+	// 改一个字符串会波及所有引用它的条目。本表只改写指定索引那一条，旧名字
+	// 字符串原样保留给其它引用者。
+	//
+	// 成员名覆盖率提升正依赖这个区别：私有/静态成员即使恰好与框架方法同名，
+	// 也能只改自己那一条，而不会误改框架引用（见内部 passes 的成员覆盖轮次）。
+	//
+	// 新名字会被加入字符串池（若已存在则自然复用同一池项）。调用方必须保证
+	// 新名字在本 DEX 内不与任何既有成员名冲突，否则可能产生两条相同
+	// (class,name,proto) 的条目并被去重逻辑静默丢弃。
+	MethodNameByID map[uint32]string
+	FieldNameByID  map[uint32]string
 	// NewStrings 是需要额外加入字符串池的字符串。
 	NewStrings []string
 	// DropDebugInfo 为 true 时移除所有 debug_info（A4）。
@@ -135,6 +150,8 @@ type RebuildOptions struct {
 	ConstantArray *ConstantArray
 	// ClassPad 非 nil 时启用 A13 类膨胀。
 	ClassPad *ClassPadder
+	// ControlFlow 非 nil 时启用 A6 控制流混淆（不透明谓词 + 等价指令替换）。
+	ControlFlow *ControlFlow
 	// Addition 描述要追加的索引表条目与类（A2/A3/A13/B2/B3 等使用）。
 	Addition *Addition
 	// ClassFilter 非 nil 时，只有名字通过筛选的**原有类**才会被写入产物。
@@ -179,6 +196,9 @@ type plan struct {
 
 	// classPad 非 nil 时启用类膨胀（A13）。
 	classPad *classPadPlan
+
+	// controlFlow 非 nil 时启用控制流混淆（A6）。
+	controlFlow *controlFlowPlan
 }
 
 // classPadPlan 记录 A13 的生成统计。
@@ -241,6 +261,8 @@ type RebuildStats struct {
 	ClassesPadded int
 	// ClassPad 是 A13 的明细统计。
 	ClassPad ClassPadStats
+	// ControlFlow 是 A6 控制流混淆的明细统计。
+	ControlFlow ControlFlowStats
 }
 
 // RebuildWithStats 与 Rebuild 相同，但额外返回量化统计。
@@ -266,6 +288,9 @@ func RebuildWithStats(f *File, opts RebuildOptions) ([]byte, RebuildStats, error
 		st.ClassesPadded = pl.classPad.count
 		st.ClassPad = pl.classPad.stats
 	}
+	if pl.controlFlow != nil {
+		st.ControlFlow = pl.controlFlow.stats
+	}
 	return out, st, nil
 }
 
@@ -290,6 +315,16 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		values[i] = s
 	}
 
+	// injectedStrs 汇总「本工具自己注入的代码所引用的字符串」。
+	//
+	// 为什么需要它：A2 与 A3 是两次独立的重建，A2 写回的 DEX 里注入类
+	// （解密器 Dec）已经是**既有类**，A3 会把它当普通类处理、进而数组化
+	// 它自己的常量。实测：A2 的新解密器带 "SHA-256" 常量，A3 就把
+	// 解密器方法体里的 "SHA-256" 数组化了一遍——既白增体积，又让解密器
+	// 依赖还原器，多一条无谓的失败路径。（旧版解密器只有 "UTF-8"，恰好
+	// 与 A3 自己注入类用到的串同名而被连带跳过，把这个缺陷掩盖了。）
+	injectedStrs := map[string]bool{}
+
 	// A2：在池构建之前确定加密集合。密文只含 0-9a-f，
 	// 因此可以安全地把「仅被 const-string 引用」的明文整体替换掉。
 	if opts.StringEncrypt != nil {
@@ -302,6 +337,9 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		inner := se.Skip
 		self := map[string]bool{}
 		collectAdditionStrings(&decAdd, self)
+		for k := range self {
+			injectedStrs[k] = true
+		}
 		se.Skip = func(s string) bool {
 			if self[s] {
 				return true
@@ -333,6 +371,15 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 	for _, s := range opts.NewStrings {
 		extra[s] = true
 	}
+	// 按条目覆盖的新成员名必须进入池：它们只被对应的 method_id/field_id 引用，
+	// 不会出现在 values 里（values 只按字符串值改名）。已存在的字符串会自然
+	// 复用到同一池项，无需去重代码。
+	for _, nw := range opts.MethodNameByID {
+		extra[nw] = true
+	}
+	for _, nw := range opts.FieldNameByID {
+		extra[nw] = true
+	}
 	if pl.strEnc != nil {
 		// 密文必须进入池：已替换的明文会被整体改写为密文（此时已在 values 中），
 		// 而未替换的（如同时被类型表引用）仍需把密文额外加入。
@@ -352,13 +399,15 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		if err != nil {
 			return nil, err
 		}
-		// 还原方法自身的字符串常量（"UTF-8"）必须排除，否则会自引用。
+		// 还原方法自身的字符串常量（"UTF-8"）必须排除，否则会自引用；
+		// 本工具其它注入代码（A2 的解密器等）用到的字符串同样排除，
+		// 理由见上面 injectedStrs 的说明。
 		ca := *opts.ConstantArray
 		inner := ca.Skip
 		self := map[string]bool{}
 		collectAdditionStrings(&caAdd, self)
 		ca.Skip = func(s string) bool {
-			if self[s] {
+			if self[s] || injectedStrs[s] {
 				return true
 			}
 			return inner != nil && inner(s)
@@ -384,6 +433,14 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		}
 		pl.classPad = &classPadPlan{stats: padStats, count: len(padClasses)}
 		add = mergeAddition(add, ClassPadAdditionOf(padClasses))
+	}
+	// A6：控制流混淆。
+	//
+	// 不新增任何索引表条目（谓词与替换指令全是纯整数、无池引用），因此不参与
+	// Addition 的合并；只在 plan 里记录参数，实际改写发生在 generate 的
+	// code_item 处理链中。
+	if opts.ControlFlow != nil {
+		pl.controlFlow = &controlFlowPlan{spec: cffNormalize(*opts.ControlFlow)}
 	}
 	if add != nil {
 		// 先补齐方法体引用的类型/方法/字段/原型，再收集字符串：
@@ -553,11 +610,17 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		if err != nil {
 			return nil, err
 		}
+		name := values[n]
+		// 按条目覆盖优先于值键改名：只改这一条 field_id 的名字，
+		// 同一旧字符串的其它引用完全不受影响。
+		if nw, ok := opts.FieldNameByID[i]; ok {
+			name = nw
+		}
 		e := fieldEntry{
 			old:  i,
 			cls:  values[typeNameIdx(f, uint32(c))],
 			typ:  values[typeNameIdx(f, uint32(t))],
-			name: values[n],
+			name: name,
 		}
 		k := fieldKey(e.cls, e.name, e.typ)
 		if _, dup := fseen[k]; dup {
@@ -611,6 +674,10 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		}
 		cls := values[typeNameIdx(f, uint32(ref.ClassIdx))]
 		name := values[ref.NameIdx]
+		// 按条目覆盖优先于值键改名，理由同字段。
+		if nw, ok := opts.MethodNameByID[i]; ok {
+			name = nw
+		}
 		pk, err := oldProtoKey(f, values, uint32(ref.ProtoIdx))
 		if err != nil {
 			return nil, err
@@ -901,6 +968,24 @@ func collectAdditionStrings(add *Addition, out map[string]bool) {
 		out[m.Class] = true
 		out[m.Name] = true
 		addProto(m.Proto)
+	}
+	// 方法体里用 ConstString 引用的字符串同样是「追加条目所需的字符串」，
+	// 必须一并登记。此前的实现漏了这一步（expandAdditionRefs 把 RefString
+	// 留给本函数处理，而本函数却不遍历代码补丁），于是注入代码用到的字符串
+	// 只靠「恰好已存在于输入 DEX 的池里」侥幸成立——输入池里没有时会直接
+	// 报「字符串密文未进入字符串池」而失败。实测触发点：A2 的新解密器带
+	// "SHA-256" 常量，而该常量原本不在 testdata 样本的池里。
+	for i := range add.Classes {
+		for _, m := range add.Classes[i].Methods {
+			if m.Code == nil {
+				continue
+			}
+			for _, p := range m.Code.Patches {
+				if p.Ref.Kind == RefString {
+					out[p.Ref.String] = true
+				}
+			}
+		}
 	}
 	for _, fl := range add.Fields {
 		out[fl.Class] = true

@@ -138,7 +138,7 @@ func TestShortyNotReplacedByStringEncrypt(t *testing.T) {
 		t.Fatal("样本中应存在 shorty 字符串，扫描结果为空说明收集逻辑失效")
 	}
 	out, _, err := RebuildWithStats(f, RebuildOptions{
-		StringEncrypt: &StringEncrypt{Class: "Lx/Dec;", MethodName: "a", Key: 0x33,
+		StringEncrypt: &StringEncrypt{Class: "Lx/Dec;", MethodName: "a", Key: [32]byte{0x33},
 			MinLen: 0, InjectClass: true},
 	})
 	if err != nil {

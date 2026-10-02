@@ -49,7 +49,7 @@ func TestOutsSizeIsSufficient(t *testing.T) {
 	})
 	mk("crash", func() (Addition, error) { return CrashHandlerAddition("Lx/Ex;") })
 	mk("dec", func() (Addition, error) {
-		return stringDecryptorAddition(&StringEncrypt{Class: "Lx/Dec;", MethodName: "a", Key: 5, InjectClass: true})
+		return stringDecryptorAddition(&StringEncrypt{Class: "Lx/Dec;", MethodName: "a", Key: [32]byte{5}, InjectClass: true})
 	})
 	mk("arr", func() (Addition, error) {
 		return constantArrayAddition(&ConstantArray{Class: "Lx/Arr;", MethodName: "b", InjectClass: true})

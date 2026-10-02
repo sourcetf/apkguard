@@ -219,8 +219,37 @@ type Renamer struct {
 
 	// byDesc 是「类描述符 -> 类定义」，用于查父类型与成员访问标志。
 	byDesc map[string]*ClassInfo
-	// invisCache 缓存「该类（传递地）是否有本 DEX 之外的父类型」。
+	// res 是在 byDesc 上做继承解析的只读视图（可复用于跨 DEX 的全局视图）。
+	res *typeResolver
+}
+
+// typeResolver 在一组可见类定义上做继承解析。
+//
+// 之所以抽成独立类型：跨 DEX 成员改名必须先汇总**全部 DEX**的类定义再解析
+// （同一个静态成员可能 A DEX 定义、B DEX 引用，B 自己看不到声明类），
+// 而单 DEX 的 Renamer 也需要同一套逻辑。抽出来后两边共用，避免行为分叉。
+//
+// 这里的判据全部是保守的：遇到本集合之外的父类型一律视为「看不见」，
+// 宁可不改名，也不能猜。
+type typeResolver struct {
+	byDesc map[string]*ClassInfo
+	// invisCache 缓存「该类（传递地）是否有集合之外的父类型」。
 	invisCache map[string]bool
+}
+
+// newTypeResolver 用给定的类定义集合构造解析器。
+func newTypeResolver(infos []ClassInfo) *typeResolver {
+	t := &typeResolver{
+		byDesc:     make(map[string]*ClassInfo, len(infos)),
+		invisCache: map[string]bool{},
+	}
+	for i := range infos {
+		// 重复描述符（合法多 DEX 中不应出现）保留第一个，调用方另行保守处理。
+		if _, ok := t.byDesc[infos[i].Desc]; !ok {
+			t.byDesc[infos[i].Desc] = &infos[i]
+		}
+	}
+	return t
 }
 
 // NewRenamer 构造一个重命名器。
@@ -243,12 +272,9 @@ func NewRenamer(f *File, cfg RenameConfig) (*Renamer, error) {
 		methodRename: map[uint32]string{},
 		fieldRename:  map[uint32]string{},
 		used:         map[string]map[string]bool{"C": {}, "M": {}, "F": {}},
-		byDesc:       make(map[string]*ClassInfo, len(infos)),
-		invisCache:   map[string]bool{},
 	}
-	for i := range r.infos {
-		r.byDesc[r.infos[i].Desc] = &r.infos[i]
-	}
+	r.res = newTypeResolver(infos)
+	r.byDesc = r.res.byDesc
 	for i := uint32(0); i < f.NString; i++ {
 		s, err := f.String(i)
 		if err != nil {
@@ -593,13 +619,13 @@ func (r *Renamer) planMethods(kept map[string]string) error {
 //
 // 判定是保守的：只要继承链上有一环落在 DEX 之外，就认为该类的方法「可能覆写
 // 不可见方法」。纯应用内部的类（父类、接口都在同一 DEX 里）不受影响，仍然改名。
-func (r *Renamer) hasInvisibleSuper(desc string) bool {
-	if v, ok := r.invisCache[desc]; ok {
+func (t *typeResolver) hasInvisibleSuper(desc string) bool {
+	if v, ok := t.invisCache[desc]; ok {
 		return v
 	}
 	// 先占位，避免继承链出现环时无限递归。
-	r.invisCache[desc] = false
-	ci := r.byDesc[desc]
+	t.invisCache[desc] = false
+	ci := t.byDesc[desc]
 	if ci == nil {
 		return false
 	}
@@ -611,28 +637,31 @@ func (r *Renamer) hasInvisibleSuper(desc string) bool {
 		if s == "" || s == "Ljava/lang/Object;" {
 			continue
 		}
-		if _, ok := r.byDesc[s]; !ok {
+		if _, ok := t.byDesc[s]; !ok {
 			// 父类型不在本 DEX 里 → 看不见它的方法表
 			res = true
 			break
 		}
-		if r.hasInvisibleSuper(s) {
+		if t.hasInvisibleSuper(s) {
 			res = true
 			break
 		}
 	}
-	r.invisCache[desc] = res
+	t.invisCache[desc] = res
 	return res
 }
 
+// hasInvisibleSuper 是 Renamer 对 typeResolver 的转发，保持既有调用点不变。
+func (r *Renamer) hasInvisibleSuper(desc string) bool { return r.res.hasInvisibleSuper(desc) }
+
 // mayOverrideInvisible 判断「类 classDesc 上名为 name、签名为 sig 的方法」
 // 是否可能覆写本 DEX 之外的方法（私有/静态方法不参与覆写，不算）。
-func (r *Renamer) mayOverrideInvisible(name, classDesc, sig string) bool {
-	ci := r.byDesc[classDesc]
+func (t *typeResolver) mayOverrideInvisible(name, classDesc, sig string) bool {
+	ci := t.byDesc[classDesc]
 	if ci == nil {
 		return false
 	}
-	if !r.hasInvisibleSuper(classDesc) {
+	if !t.hasInvisibleSuper(classDesc) {
 		return false
 	}
 	for _, m := range ci.Methods() {
@@ -645,6 +674,11 @@ func (r *Renamer) mayOverrideInvisible(name, classDesc, sig string) bool {
 		return true
 	}
 	return false
+}
+
+// mayOverrideInvisible 是 Renamer 对 typeResolver 的转发。
+func (r *Renamer) mayOverrideInvisible(name, classDesc, sig string) bool {
+	return r.res.mayOverrideInvisible(name, classDesc, sig)
 }
 
 // memberRef 描述一个「名称字符串」被哪个类的哪个成员签名引用。
@@ -771,6 +805,11 @@ func (r *Renamer) planFields(kept map[string]string) error {
 
 // isAlwaysKeepMethodName 判断方法名是否命中「永远保留」清单。
 func (r *Renamer) isAlwaysKeepMethodName(name string) bool {
+	return isAlwaysKeepMethodName(name)
+}
+
+// isAlwaysKeepMethodName 是包级实现，供跨 DEX 成员覆盖轮次复用。
+func isAlwaysKeepMethodName(name string) bool {
 	for _, k := range keepMethodNames {
 		if name == k {
 			return true
@@ -778,6 +817,16 @@ func (r *Renamer) isAlwaysKeepMethodName(name string) bool {
 	}
 	// 以 < 开头的是编译器生成的特殊方法
 	return strings.HasPrefix(name, "<")
+}
+
+// isKeepFieldName 判断字段名是否命中「永远保留」清单。
+func isKeepFieldName(name string) bool {
+	for _, k := range keepFieldNames {
+		if name == k {
+			return true
+		}
+	}
+	return false
 }
 
 // isKeptClass 判断类是否命中用户保留规则。
@@ -864,8 +913,14 @@ func isEntryPoint(ci *ClassInfo) bool {
 
 // isKeptMember 判断「类名.成员名」是否命中保留规则。
 func (r *Renamer) isKeptMember(classDesc, member string) bool {
+	return isKeptMemberRule(r.cfg.Keep, classDesc, member)
+}
+
+// isKeptMemberRule 判断「类名.成员名」是否命中保留规则（-keep-rules）。
+// 抽成独立函数以便跨 DEX 的成员覆盖轮次复用同一套匹配语义。
+func isKeptMemberRule(keep []string, classDesc, member string) bool {
 	full := descToJava(classDesc) + "." + member
-	for _, rule := range r.cfg.Keep {
+	for _, rule := range keep {
 		rule = strings.TrimSpace(rule)
 		if rule == "" || strings.HasPrefix(rule, "#") {
 			continue
@@ -1010,34 +1065,106 @@ func declaresNative(ci *ClassInfo) bool {
 //	in class Lorg/lsposed/hiddenapibypass/nc;
 //
 // java/lang/Object 的成员视作已知（所有类的公共祖先，DEX 里不重复声明）。
-func (r *Renamer) resolvesVisibly(classDesc, name, proto string) bool {
+func (t *typeResolver) resolveMethodDecl(classDesc, name, proto string) (string, *MemberInfo, bool) {
 	seen := map[string]bool{}
-	var walk func(d string, depth int) bool
-	walk = func(d string, depth int) bool {
+	var walk func(d string, depth int) (string, *MemberInfo, bool)
+	walk = func(d string, depth int) (string, *MemberInfo, bool) {
 		if d == "" || seen[d] || depth > 32 {
-			return false
+			return "", nil, false
 		}
 		seen[d] = true
-		ci := r.byDesc[d]
+		ci := t.byDesc[d]
 		if ci == nil {
-			return d == "Ljava/lang/Object;" && objectHasMember(name, proto)
+			// java/lang/Object 的已知成员视作可达的「外部声明」；返回描述符
+			// 让调用方看到它不在本 DEX 集合里（ClassMap 查不到），从而跳过改名。
+			if d == "Ljava/lang/Object;" && objectHasMember(name, proto) {
+				return d, nil, true
+			}
+			return "", nil, false
 		}
-		for _, m := range ci.Methods() {
-			if m.Name == name && m.Proto == proto {
-				return true
+		for i := range ci.DirectMethods {
+			if ci.DirectMethods[i].Name == name && ci.DirectMethods[i].Proto == proto {
+				return d, &ci.DirectMethods[i], true
 			}
 		}
-		if walk(ci.Super, depth+1) {
-			return true
+		for i := range ci.VirtualMethods {
+			if ci.VirtualMethods[i].Name == name && ci.VirtualMethods[i].Proto == proto {
+				return d, &ci.VirtualMethods[i], true
+			}
+		}
+		if dd, m, ok := walk(ci.Super, depth+1); ok {
+			return dd, m, true
 		}
 		for _, i := range ci.Interfaces {
-			if walk(i, depth+1) {
-				return true
+			if dd, m, ok := walk(i, depth+1); ok {
+				return dd, m, true
 			}
 		}
-		return false
+		return "", nil, false
 	}
 	return walk(classDesc, 0)
+}
+
+// resolveFieldDecl 解析字段引用到的声明类（沿父链找最近声明）。
+//
+// 字段没有虚派发，解析顺序（自身 -> 父类 -> 接口）与 JVM 字段解析一致：
+// 子类隐藏父类同名字段时，引用按静态类型解析到最近的那个声明。
+func (t *typeResolver) resolveFieldDecl(classDesc, name, typ string) (string, *MemberInfo, bool) {
+	seen := map[string]bool{}
+	var walk func(d string, depth int) (string, *MemberInfo, bool)
+	walk = func(d string, depth int) (string, *MemberInfo, bool) {
+		if d == "" || seen[d] || depth > 32 {
+			return "", nil, false
+		}
+		seen[d] = true
+		ci := t.byDesc[d]
+		if ci == nil {
+			return "", nil, false
+		}
+		for i := range ci.StaticFields {
+			if ci.StaticFields[i].Name == name && ci.StaticFields[i].Type == typ {
+				return d, &ci.StaticFields[i], true
+			}
+		}
+		for i := range ci.InstanceFields {
+			if ci.InstanceFields[i].Name == name && ci.InstanceFields[i].Type == typ {
+				return d, &ci.InstanceFields[i], true
+			}
+		}
+		if dd, m, ok := walk(ci.Super, depth+1); ok {
+			return dd, m, true
+		}
+		for _, i := range ci.Interfaces {
+			if dd, m, ok := walk(i, depth+1); ok {
+				return dd, m, true
+			}
+		}
+		return "", nil, false
+	}
+	return walk(classDesc, 0)
+}
+
+// resolvesVisibly 判断「类 classDesc 上的 (name, proto) 成员」能否在本集合可见的
+// 继承链里找到声明。找不到就意味着声明在集合之外（框架或未打包的库），这种成员名
+// 绝不能改。实现复用 resolveMethodDecl，保证与全局解析同一套语义。
+func (t *typeResolver) resolvesVisibly(classDesc, name, proto string) bool {
+	_, _, ok := t.resolveMethodDecl(classDesc, name, proto)
+	return ok
+}
+
+// resolvesVisibly 是 Renamer 对 typeResolver 的转发。
+func (r *Renamer) resolvesVisibly(classDesc, name, proto string) bool {
+	return r.res.resolvesVisibly(classDesc, name, proto)
+}
+
+// resolveMethodDecl 是 Renamer 对 typeResolver 的转发。
+func (r *Renamer) resolveMethodDecl(classDesc, name, proto string) (string, *MemberInfo, bool) {
+	return r.res.resolveMethodDecl(classDesc, name, proto)
+}
+
+// resolveFieldDecl 是 Renamer 对 typeResolver 的转发。
+func (r *Renamer) resolveFieldDecl(classDesc, name, typ string) (string, *MemberInfo, bool) {
+	return r.res.resolveFieldDecl(classDesc, name, typ)
 }
 
 // objectHasMember 判断名称/签名是否属于 java.lang.Object 的已知成员。
@@ -1061,4 +1188,387 @@ func objectHasMember(name, proto string) bool {
 		return proto == "()V"
 	}
 	return false
+}
+
+// 成员覆盖改名关心的额外访问标志（其余标志见 assemble.go）。
+const (
+	// accEnum 是类/字段的 ACC_ENUM 位。枚举常量字段名即语义（name()/valueOf()/
+	// switch map 都依赖它），枚举类整体不参与成员改名。
+	accEnum = 0x4000
+	// accBridge / accSynthetic 标记编译器生成的桥接/合成成员。它们可能被
+	// 反序列化、lambda 元工厂等按名字引用，默认保留（见方案文档 B5）。
+	accBridge    = 0x0040
+	accSynthetic = 0x1000
+)
+
+// isSyntheticMemberName 判断名字是否像编译器/desugar 生成的合成名。
+//
+// 这类名字被框架或生成代码按名字引用，即使访问标志漏标 synthetic 也不能改：
+//   - lambda 反序列化的方法名以 "lambda$" 开头；
+//   - desugar / nestmate 访问器形如 "x-$$Lambda$..."、"x-$$Nest$m..."。
+func isSyntheticMemberName(name string) bool {
+	if strings.HasPrefix(name, "lambda$") {
+		return true
+	}
+	return strings.Contains(name, "-$$")
+}
+
+// memberClassRenamable 判断成员声明类本身是否在类改名集合里（方案文档 A2）。
+//
+// 只改「声明类也会被改名」的成员，是一道很硬的前置门禁：被保留的类（入口组件、
+// native 类、反射类、命中 -keep 的类）其成员一律不动，一刀切掉 JNI/反射/组件
+// 回调的大部分风险。
+func memberClassRenamable(classMap map[string]string, desc string) bool {
+	nw, ok := classMap[desc]
+	return ok && nw != "" && nw != desc
+}
+
+// classUnrenameableForMembers 判断类是否因特殊语义而必须整体保留成员。
+func classUnrenameableForMembers(ci *ClassInfo) bool {
+	switch {
+	case ci.Access&accEnum != 0 || ci.Super == "Ljava/lang/Enum;":
+		return true // 枚举：常量字段名即语义
+	case ci.Access&accAnnotation != 0:
+		return true // 注解：元素名被反射读取
+	case declaresNative(ci):
+		return true // JNI：GetMethodID/GetFieldID 按名字回调
+	}
+	return false
+}
+
+// classImplementsSerializable 判断类是否（可见地）实现 java/io/Serializable。
+//
+// 默认序列化按字段名读写，因此 Serializable 类的实例字段绝不能改名。
+// 继承闭包不可见的类无法排除「隐藏地实现了 Serializable」，调用方会另行
+// 用 hasInvisibleSuper 保守跳过（见 PlanMemberRenames 的字段判据）。
+func classImplementsSerializable(t *typeResolver, desc string) bool {
+	seen := map[string]bool{}
+	var walk func(d string, depth int) bool
+	walk = func(d string, depth int) bool {
+		if d == "" || seen[d] || depth > 32 {
+			return false
+		}
+		seen[d] = true
+		if d == "Ljava/io/Serializable;" {
+			return true
+		}
+		ci := t.byDesc[d]
+		if ci == nil {
+			return false
+		}
+		if walk(ci.Super, depth+1) {
+			return true
+		}
+		for _, i := range ci.Interfaces {
+			if walk(i, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(desc, 0)
+}
+
+// MemberRenameConfig 是跨 DEX 成员覆盖改名的全局输入。
+type MemberRenameConfig struct {
+	// ClassMap 是已决定的类改名表（旧描述符 -> 新描述符）。成员改名只作用于
+	// 「声明类本身也在本表里」的成员（A2 门禁）。
+	ClassMap map[string]string
+	// NameKeep 是调用方额外要求全局保留的成员名（例如布局 android:onClick
+	// 引用的方法名）。const-string / 注解字符串由本函数自行汇总。
+	NameKeep map[string]bool
+	// Keep 是 -keep-rules（类.成员 通配）。
+	Keep []string
+	// ExcludeNames 是「已由值键改名路径处理」的名字集合。
+	//
+	// 值键路径（RebuildOptions.Rename）按字符串值改名，会一并改写所有同名引用。
+	// 若同一个名字既走值键又走按条目覆盖，两条通道会打架（同一定义被两个名字
+	// 引用），因此这里显式排除，保证互斥。
+	ExcludeNames map[string]bool
+	// Reserved 是值键路径/其它模块已经分配的新名字，生成器必须避开。
+	Reserved map[string]bool
+	// Prefix 是新名首字母（默认 "a"）。
+	Prefix string
+}
+
+// MemberRenameResult 是每个 DEX 的「旧索引 -> 新名」覆盖表。
+type MemberRenameResult struct {
+	// MethodByID / FieldByID 与输入 files 同序。
+	MethodByID []map[uint32]string
+	FieldByID  []map[uint32]string
+	// Methods / Fields 是分配了新名的**定义**数（去重后的 (类,名字,原型) 数）。
+	Methods, Fields int
+	// MethodRefs / FieldRefs 是被改写的 method_id / field_id 引用条目数。
+	MethodRefs, FieldRefs int
+}
+
+// PlanMemberRenames 在全部 DEX 的全局视图上，为「可证明安全」的成员决定按条目
+// 覆盖改名。
+//
+// 本实现严格收敛到方案文档的最小可落地子集（Phase 1）：
+//
+//  1. 私有方法 / 私有字段：ACC_PRIVATE 成员不参与虚方法派发，也不可能被外部类
+//     按名字调用，只要引用点都在我们处理的 DEX 集合内，改名就是安全的。
+//  2. 静态方法 / 静态字段：静态成员没有覆写语义（只有隐藏，且引用会一起改写）。
+//
+// 硬不变量（唯一会崩溃的点是覆写关系被破坏）：
+//
+//	私有/静态成员不参与虚派发，因此改名不会破坏任何覆写关系；且新名由全局
+//	唯一生成器分配（避开所有既有字符串），不会让两个原本不同名的方法撞成同名，
+//	也就不会凭空创造新的覆写链。
+//
+// 实例非私有成员（需要虚方法族并查集才能证明安全）**本实现一律不改**，
+// 宁可少改不可改错：那正是 Dhizuku onViewAttachedToWindow 崩溃的根源。
+func PlanMemberRenames(files []*File, cfg MemberRenameConfig) (*MemberRenameResult, error) {
+	res := &MemberRenameResult{
+		MethodByID: make([]map[uint32]string, len(files)),
+		FieldByID:  make([]map[uint32]string, len(files)),
+	}
+	if len(files) == 0 {
+		return res, nil
+	}
+
+	// ---- 1) 全局类定义视图（跨 DEX 解析静态成员的声明）----
+	var allInfos []ClassInfo
+	seenDesc := map[string]bool{}
+	dupDesc := map[string]bool{}
+	for _, f := range files {
+		infos, err := f.ClassInfos()
+		if err != nil {
+			return nil, fmt.Errorf("dex: 读取类信息失败: %w", err)
+		}
+		for _, ci := range infos {
+			if seenDesc[ci.Desc] {
+				// 同一类被两个 DEX 定义是非法 MultiDex；无法判断以谁为准，
+				// 保守地整类跳过（不改它的任何成员）。
+				dupDesc[ci.Desc] = true
+				continue
+			}
+			seenDesc[ci.Desc] = true
+			allInfos = append(allInfos, ci)
+		}
+	}
+	resolver := newTypeResolver(allInfos)
+
+	// ---- 2) 名称级保留并集（C1/C2）----
+	//
+	// 名字只要在**任一** DEX 的 const-string / 注解字符串里出现，就全局保留：
+	// getDeclaredMethod("foo") / getField("foo") / JNI 都按字符串找名字，而我们
+	// 无法区分它是反射还是普通文案，只能保守。
+	nameKeep := map[string]bool{}
+	for n := range cfg.NameKeep {
+		nameKeep[n] = true
+	}
+	for _, f := range files {
+		u, err := f.StringUsage()
+		if err != nil {
+			return nil, fmt.Errorf("dex: 扫描字符串用途失败: %w", err)
+		}
+		for idx := range u.Const {
+			if s, err := f.String(idx); err == nil {
+				nameKeep[s] = true
+			}
+		}
+		for idx := range u.Anno {
+			if s, err := f.String(idx); err == nil {
+				nameKeep[s] = true
+			}
+		}
+	}
+
+	// ---- 3) 生成器占用集合：全部既有字符串 + 调用方保留 ----
+	used := map[string]bool{}
+	for _, f := range files {
+		for i := uint32(0); i < f.NString; i++ {
+			if s, err := f.String(i); err == nil {
+				used[s] = true
+			}
+		}
+	}
+	for n := range cfg.Reserved {
+		used[n] = true
+	}
+
+	// ---- 4) 逐 DEX 收集候选：索引 -> 定义键 ----
+	type keyRef struct{ key, name string }
+	methodKeys := make([][]keyRef, len(files))
+	fieldKeys := make([][]keyRef, len(files))
+	methodDefs := map[string]bool{}
+	fieldDefs := map[string]bool{}
+
+	for fi, f := range files {
+		methodKeys[fi] = make([]keyRef, f.NMethod)
+		for i := uint32(0); i < f.NMethod; i++ {
+			ref, err := f.MethodRefAt(i)
+			if err != nil {
+				return nil, err
+			}
+			cls, err := f.Type(uint32(ref.ClassIdx))
+			if err != nil {
+				continue
+			}
+			name, err := f.String(ref.NameIdx)
+			if err != nil {
+				continue
+			}
+			if nameKeep[name] || cfg.ExcludeNames[name] || isAlwaysKeepMethodName(name) ||
+				isSyntheticMemberName(name) {
+				continue
+			}
+			proto, err := f.ProtoDesc(uint32(ref.ProtoIdx))
+			if err != nil {
+				continue
+			}
+			declDesc, decl, ok := resolver.resolveMethodDecl(cls, name, proto)
+			if !ok || decl == nil || dupDesc[declDesc] {
+				continue
+			}
+			if !memberClassRenamable(cfg.ClassMap, declDesc) {
+				continue
+			}
+			// 只改私有/静态方法：它们不参与虚派发，不可能是覆写。
+			if decl.Access&accPrivate == 0 && decl.Access&accStatic == 0 {
+				continue
+			}
+			if decl.Native || decl.Access&(accBridge|accSynthetic) != 0 {
+				continue
+			}
+			if ci := resolver.byDesc[declDesc]; ci == nil || classUnrenameableForMembers(ci) {
+				continue
+			}
+			if isKeptMemberRule(cfg.Keep, declDesc, name) {
+				continue
+			}
+			key := methodDefKey(declDesc, name, proto)
+			methodKeys[fi][i] = keyRef{key: key, name: name}
+			methodDefs[key] = true
+		}
+
+		fieldKeys[fi] = make([]keyRef, f.NField)
+		for i := uint32(0); i < f.NField; i++ {
+			classIdx, typeIdx, nameIdx, err := f.FieldRefAt(i)
+			if err != nil {
+				return nil, err
+			}
+			cls, err := f.Type(uint32(classIdx))
+			if err != nil {
+				continue
+			}
+			name, err := f.String(nameIdx)
+			if err != nil {
+				continue
+			}
+			typ, err := f.Type(uint32(typeIdx))
+			if err != nil {
+				continue
+			}
+			if nameKeep[name] || cfg.ExcludeNames[name] || isKeepFieldName(name) ||
+				isSyntheticMemberName(name) {
+				continue
+			}
+			declDesc, decl, ok := resolver.resolveFieldDecl(cls, name, typ)
+			if !ok || decl == nil || dupDesc[declDesc] {
+				continue
+			}
+			if !memberClassRenamable(cfg.ClassMap, declDesc) {
+				continue
+			}
+			if decl.Access&accPrivate == 0 && decl.Access&accStatic == 0 {
+				continue
+			}
+			if decl.Access&(accSynthetic|accEnum) != 0 {
+				continue
+			}
+			ci := resolver.byDesc[declDesc]
+			if ci == nil || classUnrenameableForMembers(ci) {
+				continue
+			}
+			// 实例字段可能被默认序列化按字段名读写：可见地实现 Serializable
+			// 的类不改；继承闭包不可见时无法排除隐藏实现，也保守不改。
+			// 静态字段不参与序列化，不受此限。
+			if decl.Access&accStatic == 0 {
+				if classImplementsSerializable(resolver, declDesc) || resolver.hasInvisibleSuper(declDesc) {
+					continue
+				}
+			}
+			if isKeptMemberRule(cfg.Keep, declDesc, name) {
+				continue
+			}
+			key := fieldDefKey(declDesc, name, typ)
+			fieldKeys[fi][i] = keyRef{key: key, name: name}
+			fieldDefs[key] = true
+		}
+	}
+
+	// ---- 5) 全局统一命名（跨 DEX 同一 (类,名字,原型) 取同一个新名）----
+	namesM := assignMemberNames(methodDefs, used, cfg.Prefix)
+	namesF := assignMemberNames(fieldDefs, used, cfg.Prefix)
+	res.Methods = len(namesM)
+	res.Fields = len(namesF)
+
+	// ---- 6) 回填每个 DEX 的索引覆盖表 ----
+	for fi := range files {
+		for i := range methodKeys[fi] {
+			k := methodKeys[fi][i].key
+			if k == "" {
+				continue
+			}
+			if res.MethodByID[fi] == nil {
+				res.MethodByID[fi] = map[uint32]string{}
+			}
+			res.MethodByID[fi][uint32(i)] = namesM[k]
+			res.MethodRefs++
+		}
+		for i := range fieldKeys[fi] {
+			k := fieldKeys[fi][i].key
+			if k == "" {
+				continue
+			}
+			if res.FieldByID[fi] == nil {
+				res.FieldByID[fi] = map[uint32]string{}
+			}
+			res.FieldByID[fi][uint32(i)] = namesF[k]
+			res.FieldRefs++
+		}
+	}
+	return res, nil
+}
+
+// methodDefKey / fieldDefKey 是跨 DEX 稳定的成员定义标识。
+//
+// 键里用**旧描述符**而不是新描述符：类名在各 DEX 上统一改名，但成员决策必须在
+// 改名之前汇总，用旧名才能让「定义方」与「引用方」指向同一个键。
+func methodDefKey(declDesc, name, proto string) string {
+	return "M\x00" + declDesc + "\x00" + name + "\x00" + proto
+}
+
+func fieldDefKey(declDesc, name, typ string) string {
+	return "F\x00" + declDesc + "\x00" + name + "\x00" + typ
+}
+
+// assignMemberNames 为一组定义键分配全局唯一新名。
+//
+// 排序保证确定性；生成器避开 used 里的全部既有字符串，因此新名不会与任何现存
+// 成员名/类型名碰撞，也不会让两个定义撞成同名（方案文档 B8：不新建覆写）。
+func assignMemberNames(defs map[string]bool, used map[string]bool, prefix string) map[string]string {
+	keys := make([]string, 0, len(defs))
+	for k := range defs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(keys))
+	seq := 0
+	for _, k := range keys {
+		for {
+			seq++
+			n := encodeName(seq, prefix)
+			if used[n] {
+				continue
+			}
+			used[n] = true
+			out[k] = n
+			break
+		}
+	}
+	return out
 }

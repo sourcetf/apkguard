@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -40,6 +42,15 @@ type fakeCipher struct {
 	iv  []byte
 }
 
+// fakeDigest 模拟 java.security.MessageDigest，内部用真实 SHA-256。
+type fakeDigest struct{ data []byte }
+
+// fakeMac 模拟 javax.crypto.Mac，内部用真实 HMAC-SHA256。
+type fakeMac struct {
+	key  []byte
+	data []byte
+}
+
 // testNativeLibDir 是测试里模拟的应用原生库目录。
 const testNativeLibDir = "/data/app/lib/x86_64"
 
@@ -57,6 +68,10 @@ type loaderEnv struct {
 	clObj any
 	// libPath 记录 DexClassLoader 收到的 librarySearchPath。
 	libPath string
+	// exited 记录壳是否调用了 System.exit（MAC 校验失败的硬终止路径）。
+	exited bool
+	// exitCodes 记录 System.exit 的实参，便于断言与 D1 失败路径一致。
+	exitCodes []int
 }
 
 // loaderFields 是各模拟类的字段表：Java 类名 -> 字段。
@@ -237,6 +252,119 @@ func installLoaderMocks(env *loaderEnv) func() {
 			o.aux = append([]byte(nil), b.b...)
 			return 0, nil, nil
 		}
+
+	// ---- 载荷 MAC（真实 SHA-256 + HMAC-SHA256）----
+	//
+	// 这几个模拟必须用**真实**密码学实现，否则「MAC 校验通过」只是被假定。
+	// MessageDigest 用于域分离派生 macKey，Mac 用于计算/比对 HMAC。
+	h["Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			alg, ok := in.objs[regs[0]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("MessageDigest.getInstance 的实参不是字符串")
+			}
+			if alg.s != digestAlg {
+				return 0, nil, errf("MessageDigest 算法不符: %s", alg.s)
+			}
+			return 0, &fakeDigest{}, nil
+		}
+	h["Ljava/security/MessageDigest;->update([B)V"] = func(in *interp, regs []int) (int32, any, error) {
+		md, ok := in.objs[regs[0]].(*fakeDigest)
+		if !ok {
+			return 0, nil, errf("MessageDigest.update 的接收者不是 MessageDigest")
+		}
+		b, ok := in.objs[regs[1]].(*fakeBytes)
+		if !ok {
+			return 0, nil, errf("MessageDigest.update 的实参不是 byte[]")
+		}
+		md.data = append(md.data, b.b...)
+		return 0, nil, nil
+	}
+	h["Ljava/security/MessageDigest;->digest()[B"] = func(in *interp, regs []int) (int32, any, error) {
+		md, ok := in.objs[regs[0]].(*fakeDigest)
+		if !ok {
+			return 0, nil, errf("MessageDigest.digest 的接收者不是 MessageDigest")
+		}
+		sum := sha256.Sum256(md.data)
+		return 0, &fakeBytes{b: append([]byte(nil), sum[:]...)}, nil
+	}
+	h["Ljavax/crypto/Mac;->getInstance(Ljava/lang/String;)Ljavax/crypto/Mac;"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			alg, ok := in.objs[regs[0]].(*fakeStr)
+			if !ok {
+				return 0, nil, errf("Mac.getInstance 的实参不是字符串")
+			}
+			if alg.s != macAlg {
+				return 0, nil, errf("Mac 算法不符: %s", alg.s)
+			}
+			return 0, &fakeMac{}, nil
+		}
+	h["Ljavax/crypto/Mac;->init(Ljava/security/Key;)V"] = func(in *interp, regs []int) (int32, any, error) {
+		m, ok := in.objs[regs[0]].(*fakeMac)
+		if !ok {
+			return 0, nil, errf("Mac.init 的接收者不是 Mac")
+		}
+		sks, ok := in.objs[regs[1]].(*fakeObj)
+		if !ok {
+			return 0, nil, errf("Mac.init 的实参不是 SecretKeySpec")
+		}
+		k, _ := sks.aux.([]byte)
+		m.key = append([]byte(nil), k...)
+		return 0, nil, nil
+	}
+	h["Ljavax/crypto/Mac;->update([B)V"] = func(in *interp, regs []int) (int32, any, error) {
+		m, ok := in.objs[regs[0]].(*fakeMac)
+		if !ok {
+			return 0, nil, errf("Mac.update 的接收者不是 Mac")
+		}
+		b, ok := in.objs[regs[1]].(*fakeBytes)
+		if !ok {
+			return 0, nil, errf("Mac.update 的实参不是 byte[]")
+		}
+		m.data = append(m.data, b.b...)
+		return 0, nil, nil
+	}
+	h["Ljavax/crypto/Mac;->update([BII)V"] = func(in *interp, regs []int) (int32, any, error) {
+		m, ok := in.objs[regs[0]].(*fakeMac)
+		if !ok {
+			return 0, nil, errf("Mac.update 的接收者不是 Mac")
+		}
+		b, ok := in.objs[regs[1]].(*fakeBytes)
+		if !ok {
+			return 0, nil, errf("Mac.update 的实参不是 byte[]")
+		}
+		off, n := int(in.regs[regs[2]]), int(in.regs[regs[3]])
+		if off < 0 || n < 0 || off+n > len(b.b) {
+			return 0, nil, errf("Mac.update 的区间非法 off=%d n=%d len=%d", off, n, len(b.b))
+		}
+		m.data = append(m.data, b.b[off:off+n]...)
+		return 0, nil, nil
+	}
+	h["Ljavax/crypto/Mac;->doFinal()[B"] = func(in *interp, regs []int) (int32, any, error) {
+		m, ok := in.objs[regs[0]].(*fakeMac)
+		if !ok {
+			return 0, nil, errf("Mac.doFinal 的接收者不是 Mac")
+		}
+		if len(m.key) != 32 {
+			return 0, nil, errf("Mac 的密钥长度不是 32: %d", len(m.key))
+		}
+		mac := hmac.New(sha256.New, m.key)
+		mac.Write(m.data)
+		return 0, &fakeBytes{b: mac.Sum(nil)}, nil
+	}
+	h["Ljava/lang/String;->getBytes()[B"] = func(in *interp, regs []int) (int32, any, error) {
+		s, ok := in.objs[regs[0]].(*fakeStr)
+		if !ok {
+			return 0, nil, errf("String.getBytes 的接收者不是字符串")
+		}
+		return 0, &fakeBytes{b: []byte(s.s)}, nil
+	}
+	h["Ljava/lang/System;->exit(I)V"] = func(in *interp, regs []int) (int32, any, error) {
+		env.exited = true
+		env.exitCodes = append(env.exitCodes, int(in.regs[regs[0]]))
+		return 0, nil, nil
+	}
+
 	h["Ljava/lang/System;->arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V"] =
 		func(in *interp, regs []int) (int32, any, error) {
 			src, ok := in.objs[regs[0]].(*fakeBytes)
@@ -954,6 +1082,21 @@ func mustEncrypt(t *testing.T, plain []byte, key [32]byte, iv [16]byte) []byte {
 	return append(out, body...)
 }
 
+// mustEncryptMAC 是用 Go 参照实现产出的「IV ‖ 密文 ‖ HMAC-SHA256」载荷。
+//
+// 与 mustEncrypt 同理，这里自带独立实现（而不是调用 internal/pack），
+// 以便壳侧字节码与 pack 实现同时出错时仍能对照出来。域分离串与
+// loader.go 的 macDomain 必须一致。
+func mustEncryptMAC(t *testing.T, plain []byte, key [32]byte, iv [16]byte, name string) []byte {
+	t.Helper()
+	body := mustEncrypt(t, plain, key, iv)
+	mkSum := sha256.Sum256(append(append([]byte(nil), key[:]...), []byte("apkguard/payload-mac")...))
+	mac := hmac.New(sha256.New, mkSum[:])
+	mac.Write([]byte(name))
+	mac.Write(body)
+	return append(body, mac.Sum(nil)...)
+}
+
 // installActivityThreadMock 搭出 ActivityThread 的字段链与反射入口，
 // 使 Loader 的接管步骤在模拟环境中可执行。
 //
@@ -1089,5 +1232,236 @@ func TestLoaderSkipsReadOnlyWhenNotRequired(t *testing.T) {
 	}
 	if len(env.readOnly) != 0 {
 		t.Fatalf("targetSdk < 34 时不应标记只读，实际标记了 %v", env.readOnly)
+	}
+}
+
+// runLoaderEntry 构造并执行 Loader.a，返回填充后的 env。
+//
+// 新测试共用它，避免每个用例重复 Build/Parse/注册/反射搭台。
+func runLoaderEntry(t *testing.T, ls *LoaderSpec, env *loaderEnv) {
+	t.Helper()
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造 Loader 失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if err := Verify(out); err != nil {
+		t.Fatalf("校验失败: %v", err)
+	}
+	g, err := Parse(out)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	restore := installLoaderMocks(env)
+	defer restore()
+	fakeCode = map[string]uint32{}
+	defer func() { fakeCode = map[string]uint32{} }()
+	registerFakeCode(t, g, ls.Class)
+	installActivityThreadMock()
+	defer clearActivityThreadMock()
+	idx, off := findMethod(t, g, ls.Class, "->"+LoaderEntry+"(")
+	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
+		t.Fatalf("Loader.a 执行失败: %v", err)
+	}
+}
+
+// TestLoaderMACRoundTrip 验证启用载荷 MAC 时：合法载荷通过校验并解出
+// 与原始 DEX 逐字节一致的明文。
+//
+// 这是 MAC 的正向证据：若壳侧的域分离派生、HMAC 输入顺序（name 后 body）
+// 或长度计算与 pack 不一致，这里就会失败。
+func TestLoaderMACRoundTrip(t *testing.T) {
+	key := testPackKey
+	plain := bytes.Repeat([]byte{0x42}, 300)
+	const name = "classes.dex"
+	blob := mustEncryptMAC(t, plain, key, testPackIV, name)
+
+	ls := &LoaderSpec{
+		Class: "Lcom/apkguard/shell/Loader;", Key: key, TempDir: "ag", MAC: true,
+		Items: []LoaderItem{{Asset: "assets/pay.bin", Name: name, DexName: "d0.dex", Size: len(blob)}},
+	}
+	env := &loaderEnv{assets: map[string][]byte{"pay.bin": blob}, fs: map[string][]byte{}}
+	runLoaderEntry(t, ls, env)
+
+	if env.exited {
+		t.Fatalf("合法载荷不应触发 MAC 失败终止（exit=%v）", env.exitCodes)
+	}
+	got, ok := env.fs["/data/user/0/app/ag/d0.dex"]
+	if !ok {
+		t.Fatalf("未落地解密后的 DEX，已有文件: %v", keysOfBytes(env.fs))
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("MAC 校验通过后解密结果不一致（%d vs %d 字节）", len(got), len(plain))
+	}
+	t.Logf("载荷 MAC 正向：%d 字节载荷通过 HMAC 校验并还原", len(blob))
+}
+
+// TestLoaderMACTamperFails 验证篡改载荷任意关键字节都会让壳在解密前硬终止。
+//
+// 这是 MAC 存在的全部意义所在：没有它，CBC 的单字节篡改可能仍通过填充校验
+// 并被加载。三个子用例分别覆盖密文区、tag 区与 IV 区，外加「换一个 name」
+// （证明 MAC 绑定了载荷身份，而不是只绑定字节）。
+func TestLoaderMACTamperFails(t *testing.T) {
+	key := testPackKey
+	plain := bytes.Repeat([]byte{0x33}, 200)
+	const name = "classes2.dex"
+	base := mustEncryptMAC(t, plain, key, testPackIV, name)
+
+	tampers := []struct {
+		label  string
+		mutate func([]byte)
+	}{
+		{"密文字节", func(b []byte) { b[20] ^= 0x01 }},         // IV(16) 之后的密文区
+		{"tag 字节", func(b []byte) { b[len(b)-1] ^= 0x01 }}, // 尾部 HMAC
+		{"IV 字节", func(b []byte) { b[0] ^= 0x01 }},         // IV 必须被 MAC 覆盖
+	}
+	for _, tc := range tampers {
+		t.Run(tc.label, func(t *testing.T) {
+			blob := append([]byte(nil), base...)
+			tc.mutate(blob)
+			ls := &LoaderSpec{
+				Class: "Lx/L;", Key: key, TempDir: "ag", MAC: true,
+				Items: []LoaderItem{{Asset: "assets/p.bin", Name: name, DexName: "d0.dex", Size: len(blob)}},
+			}
+			env := &loaderEnv{assets: map[string][]byte{"p.bin": blob}, fs: map[string][]byte{}}
+			runLoaderEntry(t, ls, env)
+			if !env.exited {
+				t.Fatal("篡改后壳未调用 System.exit：MAC 未被真正校验")
+			}
+			if _, ok := env.fs["/data/user/0/app/ag/d0.dex"]; ok {
+				t.Fatal("MAC 校验失败后仍写出了 DEX（先解密后校验？）")
+			}
+			if env.clObj != nil {
+				t.Fatal("MAC 校验失败后仍构造了 ClassLoader")
+			}
+		})
+	}
+
+	// 换一个 name：字节没变但身份不符，MAC 必须失败。
+	ls := &LoaderSpec{
+		Class: "Lx/L;", Key: key, TempDir: "ag", MAC: true,
+		Items: []LoaderItem{{Asset: "assets/p.bin", Name: "classes9.dex", DexName: "d0.dex", Size: len(base)}},
+	}
+	env := &loaderEnv{assets: map[string][]byte{"p.bin": base}, fs: map[string][]byte{}}
+	runLoaderEntry(t, ls, env)
+	if !env.exited {
+		t.Fatal("载荷身份（原始 DEX 名）不符时 MAC 应失败，否则载荷可被互换")
+	}
+}
+
+// TestLoaderMACDisabledNoMACInstructions 验证未启用 MAC 时壳产物里
+// 不含任何 MAC 相关引用——这是「向后兼容、格式逐字节不变」的静态证据。
+func TestLoaderMACDisabledNoMACInstructions(t *testing.T) {
+	blob := mustEncrypt(t, Empty(), testPackKey, testPackIV)
+	ls := &LoaderSpec{
+		Class: "Lx/L;", Key: testPackKey, TempDir: "ag",
+		Items: []LoaderItem{{Asset: "assets/p.bin", DexName: "d0.dex", Size: len(blob)}},
+	}
+	add, err := LoaderAddition(ls)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	out, err := Build(add)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if bytes.Contains(out, []byte(macAlg)) {
+		t.Fatalf("未启用 MAC 的壳不应含算法名 %q", macAlg)
+	}
+	if bytes.Contains(out, []byte(macDomain)) {
+		t.Fatalf("未启用 MAC 的壳不应含域串 %q", macDomain)
+	}
+
+	// 对照：启用 MAC 时必须出现（否则上面的断言可能因字符串被压缩而假阴性）。
+	macBlob := mustEncryptMAC(t, Empty(), testPackKey, testPackIV, "classes.dex")
+	ls2 := &LoaderSpec{
+		Class: "Lx/L;", Key: testPackKey, TempDir: "ag", MAC: true,
+		Items: []LoaderItem{{Asset: "assets/p.bin", Name: "classes.dex", DexName: "d0.dex", Size: len(macBlob)}},
+	}
+	add2, err := LoaderAddition(ls2)
+	if err != nil {
+		t.Fatalf("构造失败: %v", err)
+	}
+	out2, err := Build(add2)
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if err := Verify(out2); err != nil {
+		t.Fatalf("启用 MAC 的壳 DEX 校验失败: %v", err)
+	}
+	if !bytes.Contains(out2, []byte(macAlg)) || !bytes.Contains(out2, []byte(macDomain)) {
+		t.Fatal("启用 MAC 的壳应含 HmacSHA256 与域串")
+	}
+}
+
+// TestLoaderLibDecryptAndSearchPath 验证 C2 正向：Loader 把原生库载荷解密
+// 落地到私有目录，并把该目录（在前）与原 nativeLibraryDir（兜底）拼成
+// DexClassLoader 的 librarySearchPath。
+func TestLoaderLibDecryptAndSearchPath(t *testing.T) {
+	key := testPackKey
+	dexPlain := Empty()
+	dexBlob := mustEncrypt(t, dexPlain, key, testPackIV)
+	libPlain := []byte("\x7fELF\x02\x01\x01\x00libfoo-for-c2-test")
+	libIV := [16]byte{0xaa, 0xbb, 0xcc, 0xdd, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	libBlob := mustEncrypt(t, libPlain, key, libIV)
+
+	ls := &LoaderSpec{
+		Class: "Lcom/apkguard/shell/Loader;", Key: key, TempDir: "ag",
+		LibDir: "ag/lib", LibReadOnly: true,
+		Items:    []LoaderItem{{Asset: "assets/d.bin", Name: "classes.dex", DexName: "d0.dex", Size: len(dexBlob)}},
+		LibItems: []LoaderLibItem{{Asset: "assets/l.bin", Name: "libfoo.so", Abi: "x86_64", Size: len(libBlob)}},
+	}
+	env := &loaderEnv{
+		assets: map[string][]byte{"d.bin": dexBlob, "l.bin": libBlob},
+		fs:     map[string][]byte{},
+	}
+	runLoaderEntry(t, ls, env)
+
+	libPath := "/data/user/0/app/ag/lib/libfoo.so"
+	got, ok := env.fs[libPath]
+	if !ok {
+		t.Fatalf("原生库未解密落地到私有目录，已有文件: %v", keysOfBytes(env.fs))
+	}
+	if !bytes.Equal(got, libPlain) {
+		t.Fatalf("原生库解密结果不符（%d vs %d 字节）", len(got), len(libPlain))
+	}
+	wantSearch := "/data/user/0/app/ag/lib:" + testNativeLibDir
+	if env.libPath != wantSearch {
+		t.Fatalf("librarySearchPath 应为 %q，实际 %q", wantSearch, env.libPath)
+	}
+	foundRO := false
+	for _, p := range env.readOnly {
+		if p == libPath {
+			foundRO = true
+		}
+	}
+	if !foundRO {
+		t.Fatalf("targetSdk ≥ 29 时落地的 .so 必须置只读（W^X），实际只读列表 %v", env.readOnly)
+	}
+	// DEX 与 .so 都必须落地。
+	if _, ok := env.fs["/data/user/0/app/ag/d0.dex"]; !ok {
+		t.Fatal("DEX 载荷未落地")
+	}
+	t.Logf("C2：原生库已解密到 %s，库搜索路径 %s", libPath, env.libPath)
+}
+
+// TestLoaderNoLibsKeepsNativeLibraryDir 验证未启用 C2 时库搜索路径保持
+// 原 nativeLibraryDir，不引入任何 SO 相关行为（无副作用）。
+func TestLoaderNoLibsKeepsNativeLibraryDir(t *testing.T) {
+	blob := mustEncrypt(t, Empty(), testPackKey, testPackIV)
+	ls := &LoaderSpec{
+		Class: "Lx/L;", Key: testPackKey, TempDir: "ag",
+		Items: []LoaderItem{{Asset: "assets/p.bin", DexName: "d0.dex", Size: len(blob)}},
+	}
+	env := &loaderEnv{assets: map[string][]byte{"p.bin": blob}, fs: map[string][]byte{}}
+	runLoaderEntry(t, ls, env)
+	if env.libPath != testNativeLibDir {
+		t.Fatalf("未启用 C2 时 librarySearchPath 应保持 %q，实际 %q", testNativeLibDir, env.libPath)
+	}
+	if len(env.readOnly) != 0 {
+		t.Fatalf("未启用 C2 时不应为 .so 置只读，实际 %v", env.readOnly)
 	}
 }

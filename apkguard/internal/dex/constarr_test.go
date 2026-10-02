@@ -230,7 +230,7 @@ func TestRebuildConstantArrayComposesWithEncrypt(t *testing.T) {
 		t.Fatalf("解析失败: %v", err)
 	}
 	se := &StringEncrypt{
-		Class: "Lapkguard/Dec;", MethodName: "a", Key: 0x5a,
+		Class: "Lapkguard/Dec;", MethodName: "a", Key: [32]byte{0x5a},
 		MinLen: 4, InjectClass: true,
 	}
 	ca := &ConstantArray{

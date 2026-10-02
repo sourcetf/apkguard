@@ -72,6 +72,8 @@ type cliConfig struct {
 
 	dexKey       string
 	decoyPkg     string
+	payloadMAC   bool
+	soEncrypt    bool
 	shellPkg     string
 	splitCount   int
 	extractRatio int
@@ -114,17 +116,19 @@ func run() error {
 	flag.StringVar(&c.seed, "seed", "", "随机种子（留空则每次随机）")
 	flag.IntVar(&c.fakeDexCount, "fake-dex-count", 1, "A9 伪 DEX 块数量")
 	flag.IntVar(&c.fakeDexSize, "fake-dex-size", 80000, "A9 每块字节数")
-	flag.IntVar(&c.junkTopCount, "junk-top-count", 50, "A10 非 ASCII 顶层文件数")
-	flag.IntVar(&c.junkDirCount, "junk-dir-count", 50, "A10 随机深目录条目数")
-	flag.IntVar(&c.junkDirDepth, "junk-dir-depth", 8, "A10 深目录最大层数")
+	flag.IntVar(&c.junkTopCount, "junk-top-count", 800, "A10 非 ASCII 顶层文件数（默认对齐参考样本的 884）")
+	flag.IntVar(&c.junkDirCount, "junk-dir-count", 400, "A10 随机深目录条目数（每 10 条附带 1 条 64KB 同名深路径，是体积主要来源）")
+	flag.IntVar(&c.junkDirDepth, "junk-dir-depth", 16, "A10 深目录最大层数")
 	flag.IntVar(&c.junkMetaCount, "junk-meta-count", 20, "A10 畸形 META-INF 条目数")
-	flag.IntVar(&c.zipAtkCount, "zip-atk-count", 10, "A12 每类路径攻击条目数")
+	flag.IntVar(&c.zipAtkCount, "zip-atk-count", 150, "A12 路径攻击条目数（轮转分给 5 类前缀，故 150 约等于每类 30 条）")
 	flag.IntVar(&c.classPadCount, "class-pad-count", 100, "A13 膨胀类数量")
 	flag.StringVar(&c.stampTime, "stamp-time", "", "A14 统一时间戳（RFC3339，留空用固定值）")
 	flag.IntVar(&c.manifestPadMB, "manifest-pad-mb", 0, "A15 巨型 Manifest 填充量（MB，0=用默认 100）")
 
 	flag.StringVar(&c.dexKey, "dex-key", "", "B1 加密密钥（留空自动生成）")
 	flag.StringVar(&c.decoyPkg, "decoy-pkg", "", "B8 诱饵配置里的假包名（留空用默认 dummy.installed.check）")
+	flag.BoolVar(&c.payloadMAC, "payload-mac", false, "B1 密文附加 HMAC-SHA256，壳解密前先校验（纵深防御）")
+	flag.BoolVar(&c.soEncrypt, "so-encrypt", false, "C2 原生库整体加密存 assets，启动时解密到私有目录再加载")
 	flag.StringVar(&c.shellPkg, "shell-pkg", "com.apkguard.shell", "B2/B3 壳类所在包名")
 	flag.IntVar(&c.splitCount, "split-count", 0, "B4 拆分 DEX 个数（0=按原样）")
 	flag.IntVar(&c.extractRatio, "extract-ratio", 0, "B5 抽取方法比例（1~100）")
@@ -368,6 +372,8 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 
 		DexKey:       c.dexKey,
 		DecoyPkg:     c.decoyPkg,
+		PayloadMAC:   c.payloadMAC,
+		SOEncrypt:    c.soEncrypt,
 		ShellPkg:     c.shellPkg,
 		SplitCount:   c.splitCount,
 		ExtractRatio: c.extractRatio,
@@ -398,6 +404,17 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		}
 		opts.KeepRules = string(data)
 	}
+	// -so-encrypt 是 C2 的便捷开关：它等价于把 C2 加进启用集合。
+	//
+	// 不能让两者各自独立——Pass 只在 C2 被启用时才会跑，只设置 Options.SOEncrypt
+	// 会得到一个「开关打开了但什么都没发生」的静默空操作，正是本项目最忌讳的失败模式。
+	if c.soEncrypt {
+		if opts.Enabled == nil {
+			opts.Enabled = map[config.FeatureID]bool{}
+		}
+		opts.Enabled["C2"] = true
+	}
+
 	if c.channels != "" {
 		for _, ch := range strings.Split(c.channels, ",") {
 			if ch = strings.TrimSpace(ch); ch != "" {

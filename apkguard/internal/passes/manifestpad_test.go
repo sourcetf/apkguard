@@ -68,20 +68,45 @@ func TestManifestPadKeepsManifestParsable(t *testing.T) {
 		len(raw), len(data), len(after.Elements), after.Elements[0].Name)
 }
 
-// TestManifestPadIsStoredNotCompressed 钉住「填充条目必须未压缩存放」。
+// TestManifestPadIsCompressed 钉住「填充条目必须压缩存放」。
 //
-// A15 的目的是让**包内**体积与读取成本都变大；若被 Deflate 压成几百 KB，
-// 体积压力就消失了（参考样本压缩后仅 367 KB，其实削弱了自己的效果）。
-func TestManifestPadIsStoredNotCompressed(t *testing.T) {
+// 【为什么这条断言的语义与旧版相反】旧实现断言的是 IsStored（未压缩），
+// 因为当时认为压缩会把几十 MB 的零压成几百 KB、从而抹掉体积压力。但实测
+// 参考样本 sample.apk 推翻了这一点：它的 AndroidManifest.xml 解压后
+// 369,623,060 字节，压缩后仅 367,318 字节（压缩比约 0.001），中央目录里
+// 的压缩方式字段是 8（deflate）。既然 **Android 系统接受压缩存储的
+// AndroidManifest.xml**，压缩就是纯收益：解压后体积与读取压力分毫不减，
+// 包体却省约 1000 倍。因此断言反转为「必须是压缩存放」。
+func TestManifestPadIsCompressed(t *testing.T) {
 	raw := realisticAXML(newRand("pad2"), 512)
 	art := newArtifact(zipx.NewStored(manifestName, raw))
 	opts := &config.Options{Enabled: map[config.FeatureID]bool{"A15": true}, ManifestPadMB: 1}
 	if err := (&manifestPad{}).Run(context.Background(), art, opts); err != nil {
 		t.Fatalf("A15 执行失败: %v", err)
 	}
-	if got := art.Entries()[0]; !got.IsStored() {
-		t.Fatalf("填充后的 Manifest 是压缩存放（method=%d），体积压力被抹掉", got.Method)
+	got := art.Entries()[0]
+	if got.IsStored() {
+		t.Fatalf("填充后的 Manifest 是未压缩存放（method=%d），包体会被填充实打实撑大", got.Method)
 	}
+	if got.Method != 8 {
+		t.Fatalf("填充后的 Manifest 压缩方式应为 8（deflate），实际 %d", got.Method)
+	}
+	// 解压后体积必须仍是「巨型」：压缩不能成为偷工减料的借口。
+	data, err := got.Data()
+	if err != nil {
+		t.Fatalf("解压产物失败: %v", err)
+	}
+	if len(data) < 1<<20 {
+		t.Fatalf("解压后仅 %d 字节，未达到 1 MB 填充量", len(data))
+	}
+	// 防回归断言：填充内容是零，deflate 压缩比必须远小于 0.01。
+	// 若有人为了「让包体更小」把零填充换成随机数据，随机数据不可压缩，
+	// 压缩比会立刻逼近 1，这条断言就会失败。
+	ratio := float64(got.CompSize) / float64(got.UncompSize)
+	if ratio >= 0.01 {
+		t.Fatalf("压缩比 %.5f 未达标（应 < 0.01）：填充内容可能不是零，而是随机数据", ratio)
+	}
+	t.Logf("A15：解压 %d 字节 / 压缩 %d 字节，压缩比 %.5f", got.UncompSize, got.CompSize, ratio)
 }
 
 // TestManifestPadDefaultSize 校验未指定尺寸时用默认值（100 MB）。

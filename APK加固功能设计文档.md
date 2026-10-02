@@ -439,6 +439,24 @@ Laabab/b/c/y/i/c/e/i/g/k/l/m/n/o/p/q/aa/bbff/ssss/dd/ff/aa/abbaaaa/fb/c/tt/ii/aa
 | **解决的问题 / 场景** | 防止攻击者通过静态分析理解算法（如加密流程、风控规则）；**高价值算法保护场景**；代价是性能下降 10~30% |
 | **做法来源** | `[通用]` OLLVM（CFF/BCF/SUB）的 Java 版移植；`[厂商]` DexGuard 控制流混淆、梆梆/几维企业版 |
 
+> **实现现状（2026-10 更新）**：A6 的实现与单元测试已就位
+> （`internal/dex/cff.go`：不透明谓词 + 等价指令替换；`cff_test.go` 覆盖语义等价、
+> 分支目标不变、try/payload 方法字节不变、`registers_size` 不变），但**未开放**——
+> `-enable A6` 会被显式拒绝。原因是两类插入形态在真实应用上都触发 ART 校验失败：
+>
+> | 形态 | 结果 |
+> |---|---|
+> | 谓词 + 尾部死代码块（`goto` 跳回方法入口，形成回边） | `VerifyError: ... [0x6D] wide register v7 has type Low-half Constant/Conflict` |
+> | 两条分支**前向**汇聚（去掉回边） | 同一处、同样的错误 |
+>
+> 两种寄存器策略也都被实测否掉：只肯用「全方法从未被引用」的寄存器 → 优化过的
+> DEX 里几乎不存在，改写 0/28（**静默失效**，正是本项目最忌讳的失败模式）；
+> 放松为「入口处复用任意局部寄存器」→ 触发上述宽值类型冲突。
+>
+> 结论：安全改写方法体需要**寄存器类型/活跃性分析**，至少要能识别宽值寄存器对
+> （`long`/`double` 占两个寄存器，而我们写入的 int 常量会与之在合流点冲突）。
+> 在那之前按「启用未实现项必须报错」的原则不暴露给使用方。
+
 ### A7. 反射化调用
 
 | 维度 | 内容 |
@@ -667,10 +685,22 @@ Laabab/b/c/y/i/c/e/i/g/k/l/m/n/o/p/q/aa/bbff/ssss/dd/ff/aa/abbaaaa/fb/c/tt/ii/aa
 
 | 维度 | 内容 |
 |---|---|
-| **功能项** | 加密 SO 的代码段/数据段，`JNI_OnLoad` 时解密；或利用系统机制清除 ELF 头 |
+| **功能项** | **已实现形态**：`lib/<abi>/*.so` 整体加密存入 `assets/`，壳启动时解密到应用私有目录，并把该目录并入 `DexClassLoader` 的库搜索路径（`System.loadLibrary` 经 `ClassLoader.findLibrary` 解析即可找到）。段级加密（只加密 `.text`/`.data`）在「由同一个 .so 的 `JNI_OnLoad` 解密」形态下**时序不可行**——执行 `JNI_OnLoad` 的代码本身就在待解密的段里，必须先自建 ELF 加载器 |
 | **预期效果** | 静态分析 SO 失效；`readelf`/IDA 无法直接读取 |
 | **解决的问题 / 场景** | 保护 native 层逻辑（如密钥派生、签名算法） |
 | **做法来源** | `[厂商]` 娜迦（重定位清 ELF 头、字符串表加密、强力清除 ELF 头）、爱加密 SO 加密 |
+
+> **落地约束（实测）**：应用加载 `.so` 的方式决定兼容性上限，且**无法穷举**。
+> Java 的 `System.loadLibrary` 可以经库搜索路径接管；但 native 裸名 `dlopen`
+> 与 `android_dlopen_ext`（Flutter/RN/Unity 从 APK 按偏移加载）**接管不了**。
+> 因此实现里内置了框架特征审计：检测到 `libflutter.so`/`libapp.so`/`libhermes.so`/
+> `libunity.so` 等特征时**整体跳过** C2 并写明原因，而不是做出一个启动即崩的产物。
+> 实测：Termux（2 个 .so / 29.4 MB）加密后正常运行；RustDesk（Flutter）被审计跳过、
+> 正常运行；Dhizuku（无原生库）空操作。
+>
+> 另一个真实踩坑：落地目录名必须**扁平**——`Context.getDir(name, mode)` 拒绝含路径
+> 分隔符的名字，传 `"app_ag/lib"` 会让应用启动即抛
+> `IllegalArgumentException: File app_ag/lib contains a path separator`。
 
 ### C3. OLLVM 混淆
 

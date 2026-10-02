@@ -340,6 +340,11 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	}
 	payloads := payloadsOf(art)
 	if payloads == nil || len(payloads.Items) == 0 {
+		// C2 移走了 lib/ 下的业务 .so，若此时没有 B1 载荷，壳既无法解密
+		// DEX 也无法解密 .so，产物必然启动失败。显式报错而不是静默产出。
+		if soLibsOf(art) != nil {
+			return fmt.Errorf("C2 移除了原生库，但 B3 没有可加载的 DEX 载荷：请同时启用 B1（C2 依赖 B1/B2/B3）")
+		}
 		// 未启用 B1 时没有密文载荷可加载：壳退化为纯 Application 代理。
 		art.Note("B3 ClassLoader 接管：未启用 B1（无加密载荷），壳仅做 Application 代理")
 		return nil
@@ -367,6 +372,9 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			Asset:   p.Asset,
 			DexName: fmt.Sprintf("d%d.dex", i),
 			Size:    len(p.Blob),
+			// MAC 输入必须绑定原始 DEX 名：B8 已把 Asset 改过名，
+			// 用 Asset 会让壳侧算出的 MAC 与打包时不一致。
+			Name: p.Name,
 		})
 	}
 
@@ -379,6 +387,36 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		// 只读标记只对 targetSdk ≥ 34 有意义（Android 14+ 的加载要求）；
 		// 对更低 targetSdk 的应用标记反而会挡住 ART 打开这些文件。
 		MarkReadOnly: manifestSDKOf(art, "targetSdkVersion") >= 34,
+		// 载荷 MAC：由 B1 决定本批次是否带 tag。关闭时不生成任何 MAC 指令。
+		MAC: payloads.MAC,
+	}
+
+	// C2：把原生库载荷一并交给 Loader 解密落地。
+	//
+	// 库落地目录用 loaderTempDir 的子目录（私有目录内，可执行），
+	// 并置只读以满足 Android 10+ 的 W^X（targetSdk ≥ 29 即需，早于 DEX 的 34）。
+	soLibs := soLibsOf(art)
+	if soLibs != nil && len(soLibs.Items) > 0 {
+		// 密钥必须一致：C2 与 B1 都通过 payloadKey(opts) 派生，理应相同。
+		// 若不一致（例如未来某条路径改了派生公式），这里立刻报错，
+		// 而不是产出一个 .so 解密后是垃圾、dlopen 必崩的包。
+		if soLibs.Key != payloads.Key {
+			return fmt.Errorf("C2 的 SO 载荷密钥与 B1 载荷密钥不一致，无法由同一个壳解密")
+		}
+		// 目录名必须是**扁平的**（不含 "/"）：Context.getDir(name, mode)
+		// 明确拒绝含路径分隔符的名字，传 "app_ag/lib" 会在应用启动时抛出
+		//   java.lang.IllegalArgumentException: File app_ag/lib contains a path separator
+		// 表现为「一装上就崩」，且崩在壳的 attachBaseContext 里（实测 Termux）。
+		ls.LibDir = libTempDir
+		for _, it := range soLibs.Items {
+			ls.LibItems = append(ls.LibItems, dex.LoaderLibItem{
+				Asset: it.Asset,
+				Name:  it.Name,
+				Abi:   it.Abi,
+				Size:  it.Size,
+			})
+		}
+		ls.LibReadOnly = manifestSDKOf(art, "targetSdkVersion") >= 29
 	}
 	add, err := dex.LoaderAddition(ls)
 	if err != nil {
@@ -399,10 +437,31 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	for _, p := range sorted {
 		total += len(p.Blob)
 	}
-	art.Note("B3 ClassLoader 接管：Loader %s 已注入壳 DEX，运行时解密 %d 份载荷（%d 字节）并接管 ClassLoader",
-		info.LoaderClass, len(items), total)
+	macDesc := "无 MAC"
+	if payloads.MAC {
+		macDesc = "每份先验 HMAC-SHA256"
+	}
+	if len(ls.LibItems) > 0 {
+		libBytes := 0
+		for _, it := range ls.LibItems {
+			libBytes += it.Size
+		}
+		art.Note("B3 ClassLoader 接管：Loader %s 已注入壳 DEX，运行时解密 %d 份 DEX 载荷（%d 字节，%s）"+
+			"并解密 %d 份原生库载荷（%d 字节）到 %s，库搜索路径 = 该目录 + \":\" + nativeLibraryDir，再接管 ClassLoader",
+			info.LoaderClass, len(items), total, macDesc, len(ls.LibItems), libBytes, ls.LibDir)
+		art.Stat("B3.libs", fmt.Sprint(len(ls.LibItems)))
+		art.Stat("B3.lib_bytes", fmt.Sprint(libBytes))
+	} else {
+		art.Note("B3 ClassLoader 接管：Loader %s 已注入壳 DEX，运行时解密 %d 份载荷（%d 字节，%s）并接管 ClassLoader",
+			info.LoaderClass, len(items), total, macDesc)
+	}
 	art.Stat("B3.loader_class", info.LoaderClass)
 	art.Stat("B3.payloads", fmt.Sprint(len(items)))
+	if payloads.MAC {
+		art.Stat("B3.mac", "1")
+	} else {
+		art.Stat("B3.mac", "0")
+	}
 	return nil
 }
 
@@ -410,6 +469,11 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 //
 // 必须落在私有目录：系统只信任应用数据目录内的代码路径。
 const loaderTempDir = "ag"
+
+// libTempDir 是 C2 解密原生库落地的目录名。
+//
+// 注意必须写成**扁平名**：Context.getDir 拒绝含路径分隔符的名字。
+const libTempDir = "aglib"
 
 // ---- D1 签名校验 ----
 
@@ -733,7 +797,17 @@ func (d *nativeKeyDerive) Run(_ context.Context, art *pipeline.Artifact, opts *c
 		return err
 	}
 	target := libs
-	if own := abisOf(art); len(own) > 0 {
+	// ABI 选择优先用 C2 记录的原生库 ABI 集合：C2 把业务 .so 移出 lib/ 后，
+	// abisOf 会返回空集合，于是走「APK 完全没有原生库」分支、给全部 3 个
+	// ABI 都注入 libapkguard.so。后果是一个只支持 arm64 的应用被系统判定
+	// 为也支持 armeabi-v7a，可能被装到 32 位设备上而业务库不存在，一装就崩。
+	//
+	// C2 在移除前把原集合写入 Shared，这里优先读取；否则回退到扫描 lib/。
+	own := abisOf(art)
+	if c2 := soAbisOf(art); len(c2) > 0 {
+		own = c2
+	}
+	if len(own) > 0 {
 		target = nil
 		for _, l := range libs {
 			if own[l.Abi] {

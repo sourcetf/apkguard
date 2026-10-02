@@ -312,11 +312,79 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		}
 	}
 
+	// ---- 第二轮半：成员名「按 (类, 名字) 引用」覆盖（Phase 1）----
+	//
+	// 第二轮按「名称字符串」全局决策：只要有一个引用者不同意改名，整个名字保留。
+	// 但私有/静态成员不参与虚派发，改名只需重写它们各自的 method_id/field_id，
+	// 旧名字字符串原样留给其它引用即可。于是那些「恰好与框架方法同名」的业务
+	// 私有/静态成员也能被改掉——这正是当前字段改名为 0、方法几乎不动的原因。
+	//
+	// 与值键路径互斥：memberMap 里的名字交给值键路径（它会改写所有同名引用），
+	// 这里用 ExcludeNames 排除，避免同一定义被两条通道改成两个名字。
+	excludeNames := make(map[string]bool, len(memberMap))
+	reservedNames := make(map[string]bool, len(memberMap))
+	for n, v := range memberMap {
+		excludeNames[n] = true
+		reservedNames[v] = true
+	}
+	// 布局 android:onClick / android:onLongClick 的属性值是**方法名**，由框架反射
+	// 调用，DEX 里没有对应字符串常量（除非也被 const-string 引用）。静态回调方法
+	// 若被改名会直接崩，必须按名字保留。
+	passiveMethods := passiveMethodRefs(art)
+
+	// ---- 16 位字符串索引的余量检查 ----
+	//
+	// 「按条目覆盖」的成员改名要为每个新名字**追加字符串**，而重建后的池是按
+	// UTF-16 序排序的（DEX 要求 string_ids 有序，ART 会校验：
+	// 「Out-of-order string_ids」）。池一旦超过 65535，排序位移就可能让某个
+	// 原本合法的 const-string（16 位索引）落到 65536 以上，重建直接失败：
+	//
+	//	dex: 指令 0x1a @word 23 引用索引 65592 超出 16 位，需要指令加宽
+	//
+	// （实测：Termux 的 classes.dex 有 65866 个字符串，本身就超过 16 位，
+	// 原 DEX 用 jumbo 表达高位串；我们一追加字符串就可能越界。）
+	//
+	// 正确处理是「把越界的 const-string 加宽成 const-string/jumbo」，那需要
+	// 在指令流里做长度变化并重算偏移，属后续工作。在那之前这里**保守降级**：
+	// 只要有一个 DEX 的池已接近上限，就整体放弃追加字符串的改名通道
+	// （值键通道不新增字符串，保持与原行为一致）。做了多少、少了多少都会
+	// 写进 Note，绝不静默。
+	poolHeadroom := 0
+	for _, f := range dexFiles {
+		if int(f.NString) > poolHeadroom {
+			poolHeadroom = int(f.NString)
+		}
+	}
+	byIDDisabled := false
+	if poolHeadroom > 0xFFFF-1024 {
+		byIDDisabled = true
+	}
+
+	var memberRes *dex.MemberRenameResult
+	var err error
+	if byIDDisabled {
+		art.Note("A1：有 DEX 的字符串池已达 %d 个（16 位索引上限 65535），"+
+			"跳过「按条目覆盖」的成员改名通道——它需要追加字符串，会把池推过上限，"+
+			"导致 const-string 索引越界。正确修法是把越界的 const-string 加宽为 jumbo", poolHeadroom)
+	} else {
+		memberRes, err = dex.PlanMemberRenames(dexFiles, dex.MemberRenameConfig{
+			ClassMap:     classMap,
+			NameKeep:     passiveMethods,
+			Keep:         keep,
+			ExcludeNames: excludeNames,
+			Reserved:     reservedNames,
+		})
+		if err != nil {
+			return fmt.Errorf("成员覆盖改名规划失败: %w", err)
+		}
+	}
+
 	// ---- 第二轮：各 DEX 应用重命名 ----
 	totalCls, totalM, totalF := 0, 0, 0
 	ok := 0
 	before, after := 0, 0
-	for _, u := range units {
+	byIDMethods, byIDFields := 0, 0
+	for ui, u := range units {
 		rn, err := dex.NewRenamer(u.file, dex.RenameConfig{
 			Keep:             keep,
 			ExtraKeepClasses: keepClasses,
@@ -333,11 +401,21 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		if err != nil {
 			return fmt.Errorf("%s 生成重命名计划失败: %w", u.entry.NameString(), err)
 		}
-		if len(plan) == 0 {
+		var mByID, fByID map[uint32]string
+		if memberRes != nil {
+			mByID = memberRes.MethodByID[ui]
+			fByID = memberRes.FieldByID[ui]
+		}
+		// 值键计划与按条目覆盖都可能为空：两者同时为空才跳过重建。
+		if len(plan) == 0 && len(mByID) == 0 && len(fByID) == 0 {
 			continue
 		}
 		st := rn.LastStats()
-		out, err := dex.Rebuild(u.file, dex.RebuildOptions{Rename: plan})
+		out, err := dex.Rebuild(u.file, dex.RebuildOptions{
+			Rename:         plan,
+			MethodNameByID: mByID,
+			FieldNameByID:  fByID,
+		})
 		if err != nil {
 			return fmt.Errorf("重建 %s 失败: %w", u.entry.NameString(), err)
 		}
@@ -355,6 +433,8 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		totalCls += st.Classes
 		totalM += st.Methods
 		totalF += st.Fields
+		byIDMethods += len(mByID)
+		byIDFields += len(fByID)
 		before += len(u.data)
 		after += len(out)
 		ok++
@@ -365,12 +445,21 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		return nil
 	}
 	saved := before - after
+	// totalM/totalF 里既包含值键路径按「名字」计的改名，也包含按条目覆盖路径
+	// 按「引用」计的改名；后者是本次覆盖率提升的主要来源。
+	totalM += byIDMethods
+	totalF += byIDFields
 	art.Note("A1 名字混淆：%d 个 DEX，重命名类 %d、方法 %d、字段 %d；%d → %d 字节（减少 %d，%.1f%%）",
 		ok, totalCls, totalM, totalF, before, after, saved, pct(saved, before))
 	art.Stat("A1.dex", fmt.Sprint(ok))
 	art.Stat("A1.classes", fmt.Sprint(totalCls))
 	art.Stat("A1.methods", fmt.Sprint(totalM))
 	art.Stat("A1.fields", fmt.Sprint(totalF))
+	art.Stat("A1.methods_byid", fmt.Sprint(byIDMethods))
+	art.Stat("A1.fields_byid", fmt.Sprint(byIDFields))
+	if memberRes != nil {
+		art.Stat("A1.member_defs", fmt.Sprint(memberRes.Methods+memberRes.Fields))
+	}
 	art.Stat("A1.saved", fmt.Sprint(saved))
 	return nil
 }
@@ -599,4 +688,64 @@ func classLikeTokens(data []byte) []string {
 		}
 	}
 	return out
+}
+
+// passiveMethodRefs 返回「被非 DEX 内容按名字引用的方法名」。
+//
+// 目前只覆盖确定性最高、漏掉必崩的一类：布局 XML 的
+// `android:onClick` / `android:onLongClick`。它们的属性值就是**方法名**，
+// 由框架反射调用；方法既可能是实例方法，也可能是**静态方法**（后者正是
+// 本方案会改的对象），而 DEX 中通常没有对应字符串常量，扫描不到。
+//
+// 属性值形如 `@{...}` 的数据绑定表达式不是方法名，跳过。
+func passiveMethodRefs(art *pipeline.Artifact) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range art.Entries() {
+		name := e.NameString()
+		if isDexEntry(e) {
+			continue
+		}
+		isXML := name == "AndroidManifest.xml" ||
+			(strings.HasPrefix(name, "res/") && strings.HasSuffix(strings.ToLower(name), ".xml"))
+		if !isXML {
+			continue
+		}
+		data, err := e.Data()
+		if err != nil {
+			continue
+		}
+		f, err := axml.Parse(data)
+		if err != nil {
+			continue
+		}
+		for _, el := range f.Elements {
+			for i := range el.Attrs {
+				a := &el.Attrs[i]
+				switch a.Name {
+				case "onClick", "onLongClick":
+					if v := strings.TrimSpace(a.RawValue); looksLikeMemberIdentifier(v) {
+						out[v] = true
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// looksLikeMemberIdentifier 判断 s 是否为单个 Java 标识符（不含点/空格/@ 等）。
+func looksLikeMemberIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := c == '_' || c == '$' ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(i > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
 }

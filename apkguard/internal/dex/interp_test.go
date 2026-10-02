@@ -1,6 +1,7 @@
 package dex
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"strings"
@@ -46,6 +47,15 @@ type fakeStr struct{ s string }
 
 // fakeBytes 模拟 byte[]。
 type fakeBytes struct{ b []byte }
+
+// fakeMD 模拟 java.security.MessageDigest。
+//
+// 这个 mock 存在的理由：A2 的密钥流已从「单字节仿射流」改为
+// SHA-256(secret‖0x01‖nonce‖LE32(i))，注入的解密器必须真的调用
+// java.security.MessageDigest 才能还原明文。若解释器不实现它，
+// runDecryptor 无法执行解密器，最强的「Go 加密 ↔ 字节码解密」往返测试
+// 就成了空话。这里用 crypto/sha256 提供与真机一致的摘要结果。
+type fakeMD struct{}
 
 // fakeArr 模拟对象数组（如 Object[]、Method[]、Class[]）。
 //
@@ -797,6 +807,26 @@ func (in *interp) call(methodIdx uint32, regs []int) (int32, any, error) {
 			return 0, nil, errf("Base64.decode 失败: %v", err)
 		}
 		return 0, &fakeBytes{b: raw}, nil
+	// A2 的解密器用 MessageDigest/SHA-256 派生密钥流（见 fakeMD 的说明）。
+	case "Ljava/security/MessageDigest;->getInstance(Ljava/lang/String;)Ljava/security/MessageDigest;":
+		alg, ok := in.objs[regs[0]].(*fakeStr)
+		if !ok {
+			return 0, nil, errf("MessageDigest.getInstance 的实参不是字符串")
+		}
+		if alg.s != "SHA-256" {
+			return 0, nil, errf("MessageDigest.getInstance 只模拟 SHA-256，收到 %q", alg.s)
+		}
+		return 0, &fakeMD{}, nil
+	case "Ljava/security/MessageDigest;->digest([B)[B":
+		if _, ok := in.objs[regs[0]].(*fakeMD); !ok {
+			return 0, nil, errf("MessageDigest.digest 的接收者不是 MessageDigest")
+		}
+		arr, ok := in.objs[regs[1]].(*fakeBytes)
+		if !ok {
+			return 0, nil, errf("MessageDigest.digest 的实参不是 byte[]")
+		}
+		sum := sha256.Sum256(arr.b)
+		return 0, &fakeBytes{b: sum[:]}, nil
 	case "Ljava/lang/String;-><init>([BLjava/lang/String;)V":
 		arr, ok := in.objs[regs[1]].(*fakeBytes)
 		if !ok {

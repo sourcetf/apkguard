@@ -1,23 +1,35 @@
 package dex
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"strings"
 	"testing"
 )
+
+// testKey 生成一个 32 字节测试密钥：首字节给定，其余按简单规则填充，
+// 以便不同测试用不同密钥，同时保证可复现。
+func testKey(b byte) [32]byte {
+	var k [32]byte
+	for i := range k {
+		k[i] = b + byte(i*7+1)
+	}
+	return k
+}
 
 // TestEncryptStringRoundTrip 验证加解密互为逆运算。
 func TestEncryptStringRoundTrip(t *testing.T) {
 	cases := []struct {
 		s   string
-		key byte
+		key [32]byte
 	}{
-		{"hello", 0x5a},
-		{"", 0x00},
-		{"https://api.example.com/v1/pay", 0xff},
-		{"中文测试字符串", 0x37},
-		{"emoji \U0001F600 ok", 0x01},
-		{"a", 0x80},
+		{"hello", testKey(0x5a)},
+		{"", testKey(0x00)},
+		{"https://api.example.com/v1/pay", testKey(0xff)},
+		{"中文测试字符串", testKey(0x37)},
+		{"emoji \U0001F600 ok", testKey(0x01)},
+		{"a", testKey(0x80)},
 	}
 	for _, c := range cases {
 		ct := encryptString(c.s, c.key)
@@ -31,8 +43,8 @@ func TestEncryptStringRoundTrip(t *testing.T) {
 				t.Fatalf("%q 的密文含非 Base64 字符 %q", c.s, ch)
 			}
 		}
-		// Base64 是 4/3 膨胀，比十六进制的 2 倍小得多
-		wantLen := (len(c.s) + 2) / 3 * 4
+		// Base64 是 4/3 膨胀；明文前额外前置 stringNonceSize 字节 nonce。
+		wantLen := (len(c.s) + stringNonceSize + 2) / 3 * 4
 		if len(ct) != wantLen {
 			t.Fatalf("%q 的密文长度应为 %d（Base64），实际 %d", c.s, wantLen, len(ct))
 		}
@@ -44,17 +56,169 @@ func TestEncryptStringRoundTrip(t *testing.T) {
 
 // decryptString 是 encryptString 的逆运算，独立实现以便交叉验证。
 //
-// 它模拟注入到 DEX 中的解密方法的行为：先 Base64 解码，再与密钥流逐字节异或。
-// 刻意不复用 encryptString 的任何内部步骤，避免「用同一份可能出错的代码校验自己」。
-func decryptString(ct string, key byte) string {
+// 它模拟注入到 DEX 中的解密方法的行为：先 Base64 解码，取出前 stringNonceSize
+// 字节 nonce，再按 SHA-256(secret‖0x01‖nonce‖LE32(i)) 逐字节异或还原。
+// 刻意不复用 encryptString / keyStreamByte 的任何内部步骤，避免「用同一份可能
+// 出错的代码校验自己」。
+func decryptString(ct string, key [32]byte) string {
 	raw, err := base64.StdEncoding.DecodeString(ct)
-	if err != nil {
+	if err != nil || len(raw) < stringNonceSize {
 		return "!base64-decode-failed"
 	}
-	for i := range raw {
-		raw[i] ^= keyStream(key, i)
+	var nonce [stringNonceSize]byte
+	copy(nonce[:], raw[:stringNonceSize])
+	out := make([]byte, len(raw)-stringNonceSize)
+	for i := range out {
+		var idx [4]byte
+		binary.LittleEndian.PutUint32(idx[:], uint32(i))
+		h := sha256.New()
+		h.Write(key[:])
+		h.Write([]byte{0x01})
+		h.Write(nonce[:])
+		h.Write(idx[:])
+		out[i] = raw[stringNonceSize+i] ^ h.Sum(nil)[0]
 	}
-	return string(raw)
+	return string(out)
+}
+
+// TestEncryptStringDeterministic 验证加密可复现：同一密钥与明文必须得到同一密文。
+//
+// nonce 是明文的确定性函数（stringNonce），不含随机数，因此加固产物可复现；
+// 若这里改成随机 nonce，同一 APK 多次加固结果会不同，排查问题会变得困难。
+func TestEncryptStringDeterministic(t *testing.T) {
+	key := testKey(0x11)
+	s := "https://api.example.com/v1/pay"
+	first := encryptString(s, key)
+	second := encryptString(s, key)
+	if first != second {
+		t.Fatalf("同一输入两次加密不一致：%q vs %q", first, second)
+	}
+	// 换密钥必须换密文。
+	if other := encryptString(s, testKey(0x12)); other == first {
+		t.Fatal("换密钥后密文未变化")
+	}
+}
+
+// TestKnownPlaintextCannotRecoverKey 验证旧的单点已知明文攻击已失效。
+//
+// 旧实现 keyStream = key + i*17 的密钥只有 1 字节：攻击者拿到任意一个
+// (明文, 密文) 对后，遍历 256 种 key' 就能解出密钥、进而解出全部字符串。
+// 新实现的密钥是 32 字节、密钥流由 SHA-256 派生，这个攻击必须彻底失败。
+func TestKnownPlaintextCannotRecoverKey(t *testing.T) {
+	key := testKey(0x9e)
+	// "https://..." 这类常量在真实 APK 中必然存在，视为攻击者已知。
+	known := "https://api.example.com/v1/pay"
+	raw, err := base64.StdEncoding.DecodeString(encryptString(known, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := raw[stringNonceSize:]
+
+	// 攻击 1：假设密钥流仍是仿射的 key' + i*17，遍历全部 256 种 key'。
+	for cand := 0; cand < 256; cand++ {
+		ok := true
+		for i, b := range body {
+			if byte(int(cand)+i*17)^b != known[i] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			t.Fatalf("仿射密钥流假设成立（key'=%d）：旧攻击未被修复", cand)
+		}
+	}
+
+	// 攻击 2：把已知字符串的密钥流直接拿去解另一个字符串（同下标消元）。
+	// 若两个字符串的密钥流相同或只差常数，这一步就会得到明文。
+	other := "com.example.app.SecretToken"
+	oraw, err := base64.StdEncoding.DecodeString(encryptString(other, key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decrypted := true
+	n := len(other)
+	if len(body) < n {
+		n = len(body)
+	}
+	for i := 0; i < n; i++ {
+		if body[i]^oraw[stringNonceSize+i] != other[i] {
+			decrypted = false
+			break
+		}
+	}
+	if n > 0 && decrypted {
+		t.Fatal("用已知明密文对成功解出了另一个字符串：密钥流未按字符串隔离")
+	}
+}
+
+// TestKeyStreamNotAffine 验证若干字符串的密钥流之间不存在仿射/线性关系。
+//
+// 这是任务要求里那条最直接的断言：收集各字符串的 ct[i]^pt[i]，证明它既不是
+// key+i*17 这种仿射模式，两两之间也不存在常数差（常数差意味着可消元互解）。
+func TestKeyStreamNotAffine(t *testing.T) {
+	key := testKey(0x3c)
+	strs := []string{
+		"https://api.example.com/v1/pay",
+		"com.example.app.SecretToken",
+		"Android",
+		"UTF-8",
+		"用户登录失败",
+	}
+	streams := make([][]byte, len(strs))
+	for j, s := range strs {
+		raw, err := base64.StdEncoding.DecodeString(encryptString(s, key))
+		if err != nil {
+			t.Fatalf("%q: %v", s, err)
+		}
+		ks := make([]byte, len(s))
+		for i := range ks {
+			ks[i] = raw[stringNonceSize+i] ^ s[i]
+		}
+		streams[j] = ks
+	}
+
+	// 1) 任一字符串的密钥流都不能写成 key' + i*17。
+	for j, ks := range streams {
+		if len(ks) == 0 {
+			continue
+		}
+		for cand := 0; cand < 256; cand++ {
+			affine := true
+			for i, b := range ks {
+				if b != byte(int(cand)+i*17) {
+					affine = false
+					break
+				}
+			}
+			if affine {
+				t.Fatalf("字符串 %q 的密钥流是仿射的（key'=%d）", strs[j], cand)
+			}
+		}
+	}
+
+	// 2) 两两之间在相同下标处的密钥流之差不能是常数。
+	for a := 0; a < len(streams); a++ {
+		for b := a + 1; b < len(streams); b++ {
+			n := len(streams[a])
+			if len(streams[b]) < n {
+				n = len(streams[b])
+			}
+			if n < 3 {
+				continue
+			}
+			d0 := streams[a][0] ^ streams[b][0]
+			allSame := true
+			for i := 1; i < n; i++ {
+				if streams[a][i]^streams[b][i] != d0 {
+					allSame = false
+					break
+				}
+			}
+			if allSame {
+				t.Fatalf("%q 与 %q 的密钥流只差常数 %d，可互相解密", strs[a], strs[b], d0)
+			}
+		}
+	}
 }
 
 // TestAsmAssemble 验证汇编器的标签解析与引用回填。
@@ -171,7 +335,7 @@ func TestRebuildStringEncrypt(t *testing.T) {
 	}
 
 	const cls = "Lapkguard/Dec;"
-	const key = 0x5a
+	key := testKey(0x5a)
 	se := &StringEncrypt{Class: cls, MethodName: "a", Key: key, MinLen: 4, InjectClass: true}
 
 	out, stats, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se})
@@ -269,7 +433,7 @@ func TestRebuildStringEncryptNoClass(t *testing.T) {
 		t.Fatalf("解析失败: %v", err)
 	}
 	const cls = "Lapkguard/Dec;"
-	se := &StringEncrypt{Class: cls, MethodName: "a", Key: 0x11, MinLen: 8}
+	se := &StringEncrypt{Class: cls, MethodName: "a", Key: [32]byte{0x11}, MinLen: 8}
 	out, _, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se})
 	if err != nil {
 		t.Fatalf("重建失败: %v", err)
@@ -309,7 +473,7 @@ func TestDecryptorSemantics(t *testing.T) {
 		t.Fatalf("解析失败: %v", err)
 	}
 	const cls = "Lapkguard/Dec;"
-	key := byte(0x5a)
+	key := testKey(0x5a)
 	se := &StringEncrypt{Class: cls, MethodName: "a", Key: key, MinLen: 4, InjectClass: true}
 	out, _, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se})
 	if err != nil {
@@ -373,7 +537,7 @@ func TestDecryptorSemanticsNoClass(t *testing.T) {
 		t.Fatalf("解析失败: %v", err)
 	}
 	const cls = "Lapkguard/Dec;"
-	se := &StringEncrypt{Class: cls, MethodName: "a", Key: 0x33, MinLen: 4, InjectClass: false}
+	se := &StringEncrypt{Class: cls, MethodName: "a", Key: [32]byte{0x33}, MinLen: 4, InjectClass: false}
 	out, _, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se})
 	if err != nil {
 		t.Fatalf("重建失败: %v", err)
@@ -419,7 +583,7 @@ func TestRebuildStringEncryptKeepsTypeNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
-	se := &StringEncrypt{Class: "Lapkguard/Dec;", MethodName: "a", Key: 0x42, MinLen: 0}
+	se := &StringEncrypt{Class: "Lapkguard/Dec;", MethodName: "a", Key: [32]byte{0x42}, MinLen: 0}
 	out, _, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se})
 	if err != nil {
 		t.Fatalf("重建失败: %v", err)

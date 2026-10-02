@@ -65,11 +65,15 @@ func (m *manifestPad) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	if err != nil {
 		return err
 	}
-	// 必须**存储**而不是压缩：压缩会把几十 MB 的零压成几百 KB，
-	// 那样「体积压力」就消失了——样本的做法也是让它在包内保持体积可观。
-	// （实测样本里它仍是 DEFLATE，但压缩后 367 KB；我们选择不压缩更激进：
-	//  安装期读取成本从「解压 369MB」变成「直接读 369MB」。）
-	if err := e.SetData(out, false); err != nil {
+	// 必须**压缩**存放（deflate），而不是 STORED。
+	//
+	// 早期实现用 SetData(out, false) 即 STORED，16 MB 填充就实打实占 16 MB 包体。
+	// 但实测参考样本 sample.apk：它的 AndroidManifest.xml 解压后 369,623,060 字节，
+	// 压缩后仅 367,318 字节（压缩比约 0.001），中央目录里的压缩方式字段是 8
+	// （deflate）——证明 **Android 系统完全接受压缩存储的 AndroidManifest.xml**。
+	// 压缩因此是纯收益：解压后仍是同样的巨型体积（读取/预分配压力不变），
+	// 包体却省约 1000 倍。填充内容几乎全是零，deflate 能把它压到极小。
+	if err := e.SetData(out, true); err != nil {
 		return fmt.Errorf("写回 %s 失败: %w", manifestName, err)
 	}
 
