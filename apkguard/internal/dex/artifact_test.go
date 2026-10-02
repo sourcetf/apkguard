@@ -74,6 +74,23 @@ func apkShellDex(t *testing.T, path string) (*File, map[string][]byte) {
 	return g, assets
 }
 
+// hasLoaderClass 判断壳 DEX 里是否真的定义了 Loader 类。
+//
+// 各产物级守卫原本用「assets 非空」来判断「这是一个加壳包」，但那个假设已经
+// 不成立：A10 的垃圾条目也会落在 assets/ 下（参考样本的深目录垃圾同样如此），
+// 于是「只开了混淆、没有加壳」的产物会被误判成加壳包，接着去找并不存在的
+// Loader 方法而报错。判据必须落在**壳 DEX 里有没有 Loader 类**这个事实上。
+func hasLoaderClass(g *File) bool {
+	found := false
+	_ = g.Classes(func(_ uint32, _ ClassDef, name string) error {
+		if name == "Lcom/apkguard/shell/Loader;" {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
 // allClassNames 列出 DEX 中的全部类描述符。
 func allClassNames(t *testing.T, g *File) []string {
 	t.Helper()
@@ -716,7 +733,7 @@ func TestArtifactClassFlagsAreLegal(t *testing.T) {
 		}
 		scan(filepath.Base(apk), g)
 		// 壳包里的载荷同样要查：业务类与还原类都在里面。
-		if len(assets) > 0 {
+		if len(assets) > 0 && hasLoaderClass(g) {
 			env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
 			restore := installLoaderMocks(env)
 			installActivityThreadMock()

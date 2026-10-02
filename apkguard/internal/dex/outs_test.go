@@ -172,7 +172,7 @@ func TestArtifactOutsSize(t *testing.T) {
 	for _, apk := range files {
 		g, assets := apkShellDex(t, apk)
 		total += checkOutsOf(t, filepath.Base(apk), g)
-		if len(assets) == 0 {
+		if len(assets) == 0 || !hasLoaderClass(g) {
 			continue
 		}
 		// 壳包：解密后的载荷同样要查。

@@ -1,6 +1,7 @@
 package dex
 
 import (
+	"encoding/base64"
 	"fmt"
 	"sort"
 )
@@ -8,11 +9,17 @@ import (
 // StringEncrypt 描述 A2 字符串加密的参数。
 //
 // 加密方案：把字符串的 UTF-8 字节与「密钥 + 下标派生」的密钥流逐字节异或，
-// 再编码为十六进制字符串存入字符串池。运行时由注入的解密方法还原。
+// 再以 **Base64** 编码成 ASCII 字符串存入字符串池，运行时由注入的解密方法还原。
 //
-// 之所以用十六进制而不是直接存密文：DEX 的字符串池是 MUTF-8 编码的
-// UTF-16 序列，任意异或结果可能产生孤立代理码元，而 Go 的 string
-// 无法表示孤立代理；十六进制只用到 0-9a-f，天然安全。
+// 为什么用 Base64 而不是十六进制：
+//   - 体积：十六进制把密文撑大一倍，Base64 只多 1/3；
+//   - 特征：十六进制密文是「长串 0-9a-f」，扫描器一行正则就能把它挑出来；
+//     Base64 混入大小写字母，同样的正则命中率大幅下降；
+//   - 为什么不能直接存原始密文字节：DEX 的字符串池是 MUTF-8 编码的 UTF-16
+//     序列，任意异或结果可能产生孤立代理码元，而 Go 的 string 无法表示孤立代理。
+//
+// 安全前提（见 planStringEncrypt）：密文必须与池内既有字符串**不重复**，
+// 否则池会去重成同一项，导致别的引用解密出错误的明文。
 type StringEncrypt struct {
 	// Class 是解密器类描述符，形如 "Lapkguard/Dec;"。
 	Class string
@@ -48,17 +55,18 @@ type stringEncryptPlan struct {
 // keyStream 返回第 i 个字节的密钥流字节。
 func keyStream(key byte, i int) byte { return key + byte(i*17) }
 
-// encryptString 把明文字符串加密为十六进制密文。
+// encryptString 把明文字符串加密为 Base64 密文。
+//
+// 密钥流按「UTF-8 字节下标」派生，与运行时解密方法逐字节对应。
+// Base64 用标准字母表（含 + / =），运行时由 android.util.Base64.decode 还原，
+// 因此两侧的字母表必须一致。
 func encryptString(s string, key byte) string {
 	b := []byte(s)
-	const digits = "0123456789abcdef"
-	out := make([]byte, len(b)*2)
+	buf := make([]byte, len(b))
 	for i, c := range b {
-		v := c ^ keyStream(key, i)
-		out[2*i] = digits[v>>4]
-		out[2*i+1] = digits[v&0xf]
+		buf[i] = c ^ keyStream(key, i)
 	}
-	return string(out)
+	return base64.StdEncoding.EncodeToString(buf)
 }
 
 // collectConstStrings 返回全部被 const-string 指令引用的旧字符串索引（升序去重），
@@ -133,6 +141,11 @@ func planStringEncrypt(f *File, se *StringEncrypt, values []string) (cipher, rep
 			!usage.Anno[idx] && !usage.SourceFile[idx] && !usage.Debug[idx] &&
 			!usage.Shorty[idx]
 	}
+	// 池内既有字符串集合：用于「密文撞车」检查（见下）。
+	existing := make(map[string]bool, len(values))
+	for _, v := range values {
+		existing[v] = true
+	}
 	for _, i := range idxs {
 		s := values[i]
 		if len(s) < se.MinLen {
@@ -145,6 +158,16 @@ func planStringEncrypt(f *File, se *StringEncrypt, values []string) (cipher, rep
 			continue
 		}
 		ct := encryptString(s, se.Key)
+		// 密文不得与池内**任一**既有字符串相同。
+		//
+		// 字符串池是按内容去重的：若密文恰好等于另一个条目的内容，两者会合并成
+		// 同一项，于是那个条目的指令解出来的会是本条目的明文——静默的数据损坏。
+		// 十六进制时代这种碰撞几乎不可能，换 Base64 后密文含有可读字母，概率
+		// 上升到必须显式挡住（宁可少加密一个字符串，也不能改错语义）。
+		if existing[ct] {
+			continue
+		}
+		existing[ct] = true
 		cipher[s] = ct
 		if constOnly(i) && !blocked[i] {
 			replace[s] = ct
@@ -159,30 +182,27 @@ func planStringEncrypt(f *File, se *StringEncrypt, values []string) (cipher, rep
 // 不生成 class_def —— 用于多 DEX 场景下「非主 DEX 引用主 DEX 的解密器」。
 func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 	protoStr := ProtoSpec{Ret: "Ljava/lang/String;", Params: []string{"Ljava/lang/String;"}}
-	protoCharI := ProtoSpec{Ret: "C", Params: []string{"I"}}
-	protoInt := ProtoSpec{Ret: "I"}
-	protoDigit := ProtoSpec{Ret: "I", Params: []string{"C", "I"}}
 	protoInit := ProtoSpec{Ret: "V", Params: []string{"[B", "Ljava/lang/String;"}}
+	// android.util.Base64.decode(String, int) -> byte[]
+	protoDecode := ProtoSpec{Ret: "[B", Params: []string{"Ljava/lang/String;", "I"}}
 
-	charAt := MethodSpec{Class: "Ljava/lang/String;", Name: "charAt", Proto: protoCharI}
-	length := MethodSpec{Class: "Ljava/lang/String;", Name: "length", Proto: protoInt}
-	digit := MethodSpec{Class: "Ljava/lang/Character;", Name: "digit", Proto: protoDigit}
 	strInit := MethodSpec{Class: "Ljava/lang/String;", Name: "<init>", Proto: protoInit}
+	decB64 := MethodSpec{Class: "Landroid/util/Base64;", Name: "decode", Proto: protoDecode}
 	decrypt := MethodSpec{Class: se.Class, Name: se.MethodName, Proto: protoStr}
 
 	add := Addition{
 		Types: []string{
-			se.Class, "[B", "C", "I", "V",
-			"Ljava/lang/String;", "Ljava/lang/Character;",
+			se.Class, "[B", "I", "V",
+			"Ljava/lang/String;", "Landroid/util/Base64;",
 		},
-		Protos:  []ProtoSpec{protoStr, protoCharI, protoInt, protoDigit, protoInit},
-		Methods: []MethodSpec{decrypt, charAt, length, digit, strInit},
+		Protos:  []ProtoSpec{protoStr, protoInit, protoDecode},
+		Methods: []MethodSpec{decrypt, strInit, decB64},
 	}
 	if !se.InjectClass {
 		return add, nil
 	}
 
-	code, err := stringDecryptorCode(se.Key, charAt, length, digit, strInit)
+	code, err := stringDecryptorCode(se.Key, decB64, strInit)
 	if err != nil {
 		return Addition{}, err
 	}
@@ -208,96 +228,66 @@ func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 // 等价 Java 源码：
 //
 //	static String a(String s) {
-//	    int n = s.length() >> 1;
-//	    byte[] b = new byte[n];
-//	    for (int i = 0; i < n; i++) {
-//	        int hi = Character.digit(s.charAt(i << 1), 16);
-//	        int lo = Character.digit(s.charAt(i << 1 | 1), 16);
-//	        b[i] = (byte) (((hi << 4) | lo) ^ (KEY + i * 17));
-//	    }
+//	    byte[] b = android.util.Base64.decode(s, 0);   // Base64.DEFAULT == 0
+//	    for (int i = 0; i < b.length; i++)
+//	        b[i] = (byte) (b[i] ^ (KEY + i * 17));
 //	    return new String(b, "UTF-8");
 //	}
 //
-// 寄存器分配（共 8 个）。注意 Dalvik 的入参寄存器固定在**最高**编号处：
-// registers=8、ins=1 时，唯一入参 s 落在 v7，局部变量只能用 v0~v6。
+// 与十六进制版本相比，Base64 直接把「解码」交给框架，字节码短得多，
+// 也顺带避免了「用 Character.digit 逐字符解析」这种一眼可辨的特征。
 //
-//	v0 = n    v1 = b    v2 = i    v3 = hi    v4 = lo    v5 = 临时    v6 = 常量 16
-//	v7 = s（入参）
-func stringDecryptorCode(key byte, charAt, length, digit, strInit MethodSpec) (*CodeBlob, error) {
+// 寄存器分配（registers=5、ins=1 → 入参 s 落在 v4）：
+//
+//	v0 = b    v1 = i    v2 = 临时    v3 = 临时    v4 = s（入参）
+func stringDecryptorCode(key byte, decB64, strInit MethodSpec) (*CodeBlob, error) {
 	const (
-		rN   = 0
-		rB   = 1
-		rI   = 2
-		rHi  = 3
-		rLo  = 4
-		rTmp = 5
-		rC16 = 6
-		rS   = 7
+		rB   = 0
+		rI   = 1
+		rTmp = 2
+		rT2  = 3
+		rS   = 4
 	)
 	a := NewAsm()
 
-	if err := a.InvokeVirtual([]int{rS}, length); err != nil {
+	// b = Base64.decode(s, 0)
+	a.Const4(rT2, 0)
+	if err := a.InvokeStatic([]int{rS, rT2}, decB64); err != nil {
 		return nil, err
 	}
-	a.MoveResult(rN)
-	a.ShrIntLit8(rN, 1) // n = s.length() >> 1
-	if err := a.NewArray(rB, rN, "[B"); err != nil {
-		return nil, err
-	}
+	a.MoveResultObject(rB)
 	a.Const4(rI, 0)
-	a.Const16(rC16, 16)
 
 	a.Label("loop")
-	if err := a.IfGe(rI, rN, "end"); err != nil {
+	a.ArrayLength(rTmp, rB)
+	if err := a.IfGe(rI, rTmp, "end"); err != nil {
 		return nil, err
 	}
-	// hi = Character.digit(s.charAt(i << 1), 16)
-	a.Move(rTmp, rI)
-	a.ShlIntLit8(rTmp, 1)
-	if err := a.InvokeVirtual([]int{rS, rTmp}, charAt); err != nil {
-		return nil, err
-	}
-	a.MoveResult(rHi)
-	if err := a.InvokeStatic([]int{rHi, rC16}, digit); err != nil {
-		return nil, err
-	}
-	a.MoveResult(rHi)
-	// lo = Character.digit(s.charAt((i << 1) + 1), 16)
-	a.AddIntLit8(rTmp, 1)
-	if err := a.InvokeVirtual([]int{rS, rTmp}, charAt); err != nil {
-		return nil, err
-	}
-	a.MoveResult(rLo)
-	if err := a.InvokeStatic([]int{rLo, rC16}, digit); err != nil {
-		return nil, err
-	}
-	a.MoveResult(rLo)
-	// b[i] = (byte) (((hi << 4) | lo) ^ (KEY + i * 17))
-	a.ShlIntLit8(rHi, 4)
-	a.OrInt(rHi, rHi, rLo)
-	a.Move(rTmp, rI)
-	a.MulIntLit8(rTmp, 17)
-	a.AddIntLit8(rTmp, int8(key))
-	a.XorInt(rHi, rHi, rTmp)
-	a.IntToByte(rHi, rHi)
-	a.APutByte(rHi, rB, rI)
+	// b[i] = (byte)(b[i] ^ (KEY + i*17))
+	a.AGetByte(rTmp, rB, rI)
+	a.Move(rT2, rI)
+	a.MulIntLit8(rT2, 17)
+	a.AddIntLit8(rT2, int8(key))
+	a.XorInt(rTmp, rTmp, rT2)
+	a.IntToByte(rTmp, rTmp)
+	a.APutByte(rTmp, rB, rI)
 	a.AddIntLit8(rI, 1)
 	a.Goto16("loop")
 
 	a.Label("end")
-	a.NewInstance(rI, "Ljava/lang/String;")
-	a.ConstString(rHi, "UTF-8")
-	if err := a.InvokeDirect([]int{rI, rB, rHi}, strInit); err != nil {
+	a.NewInstance(rTmp, "Ljava/lang/String;")
+	a.ConstString(rT2, "UTF-8")
+	if err := a.InvokeDirect([]int{rTmp, rB, rT2}, strInit); err != nil {
 		return nil, err
 	}
-	a.ReturnObject(rI)
+	a.ReturnObject(rTmp)
 
 	insns, patches, err := a.Assemble()
 	if err != nil {
 		return nil, err
 	}
 	return &CodeBlob{
-		Registers: 8,
+		Registers: 5,
 		Ins:       1,
 		Outs:      3,
 		Insns:     insns,

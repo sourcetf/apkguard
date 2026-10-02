@@ -51,9 +51,15 @@
 /deliver/*.idsig
 /deliver/*.txt
 
-# ---- realworld：只保留实测记录 ----
+# ---- realworld：只保留实测记录与复现脚本 ----
+# 大体积素材（apps/ 下的原始与加固 APK、交叉编译的 apkguard-linux、JDK/Go 工具链）
+# 一律不入库：它们都可复现（下载 + 重新加固），入库会让仓库膨胀数百 MB。
 /realworld/*
 !/realworld/*.md
+!/realworld/*.sh
+/realworld/apps/
+/realworld/apkguard-linux
+/realworld/*.tar.gz
 
 # ---- 通用：二进制与构建产物 ----
 *.exe

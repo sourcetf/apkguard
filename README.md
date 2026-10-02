@@ -5,19 +5,19 @@
 （密钥派生、反调试、反注入、完整性自校验）与运行时检测，全部用 Go 实现，
 **不依赖 dx/d8 等外部工具链**。
 
-设计依据与功能清单见 [`APK加固功能设计文档.md`](APK加固功能设计文档.md)（38 个功能项，6 个阶段）。
+设计依据与功能清单见 [`APK加固功能设计文档.md`](APK加固功能设计文档.md)（40 个功能项，6 个阶段）。
 
 ---
 
 ## 当前进度
 
-**31 / 38 个功能项已实现**（未实现的 7 项均为最高强度档，落地设计见
+**33 / 40 个功能项已实现**（未实现的 7 项均为最高强度档，落地设计见
 [`剩余功能落地设计.md`](剩余功能落地设计.md)）。
 
 | 阶段 | 已实现 |
 |---|---|
-| **A 混淆** | A1 类名混淆 · A2 字符串加密 · A3 常量数组化 · A4 去调试信息 · A5 资源混淆 · A8 诱饵类 · A9 伪 DEX · A10 垃圾条目 · A11 资源扁平化 · A12 ZIP 路径攻击 · A13 类膨胀 · A14 时间戳统一 |
-| **B 加壳** | B1 DEX 加密 · B2 Application 替换 · B3 ClassLoader 接管 · B4 多 DEX 拆分 |
+| **A 混淆** | A1 类名混淆(可选包名压缩) · A2 字符串加密 · A3 常量数组化 · A4 去调试信息 · A5 资源混淆 · A8 诱饵类 · A9 伪 DEX · A10 垃圾条目 · A11 资源扁平化 · A12 ZIP 路径攻击 · A13 类膨胀 · A14 时间戳统一 · A15 巨型 Manifest 填充 |
+| **B 加壳** | B1 DEX 加密 · B2 Application 替换 · B3 ClassLoader 接管 · B4 多 DEX 拆分 · B8 载荷容器化 |
 | **C 原生保护** | C1 密钥由 native 派生 · C4 反调试 · C5 反注入 · C6 完整性自校验 |
 | **D 运行时防护** | D1 签名校验 · D2 Root 检测 · D3 模拟器检测 · D4 运行期周期复检 · D5 设备绑定 |
 | **E 打包交付** | E1 签名(v1/v2/v3) · E2 对齐 · E3 签名块 · E4 渠道标记 · E5 批量处理 · E6 兼容性自检 |
@@ -99,10 +99,26 @@ apkguard                     # 双击或直接运行 = 启动图形界面并自�
 [`realworld/实测记录-RustDesk.md`](realworld/实测记录-RustDesk.md)。
 
 **三个真实应用 × 全选项 × Android 16（API 36）**：Termux（30 DEX / 8576 类）、
-Dhizuku（3292 类）、RustDesk（Flutter / 5449 类）在启用全部 29 个可用功能项
+Dhizuku（3292 类）、RustDesk 1.5.0（Flutter / 5449 类）在启用全部 33 个可用功能项
 （D2/D3 因设备是已 root 的模拟器而按设计排除）后**全部正常运行**。
-本轮据此修掉 8 个缺陷（其中 3 个是「一装上就崩」级别），详见
+本轮据此修掉 11 个缺陷（其中 4 个是「一装上就崩」级别），详见
 [`realworld/实测记录-三应用全选项.md`](realworld/实测记录-三应用全选项.md)。
+
+其中 3 个只有「全选项 + 真实 Flutter 应用」才会同时触发、且在单元测试里完全
+看不见的缺陷：
+
+- **A1 压包破坏 package-private**：`-package-shrink` 曾把所有类压进默认包，
+  而 `$` 内部类被保留在原包，跨包访问导致 `IllegalAccessError`
+  （Termux）。改为「每个原包整体映射为一个短包名」，保住包内同包语义。
+- **ServiceLoader 两半都引用类名**：`META-INF/services/<接口>` 的**文件名**是
+  服务接口类名、**内容**是提供者类名，二者都只存在于资源里。改名后
+  `ServiceLoader.load` 找不到实现，报 `Module with the Main dispatcher is
+  missing`（RustDesk 1.5.0 的 kotlinx 主调度器）。
+- **A10 注入假 MANIFEST.MF 破坏 v1 签名校验**：注入的
+  `META-INF//MANIFEST.MF` / `meta-inf/MANIFEST.MF` 会被 `JarVerifier`（大小写
+  不敏感）当成真正的主清单，ServiceLoader 经 `JarFile` 读 `META-INF/services`
+  时触发 v1 校验，抛 `SecurityException: Invalid signature file digest for
+  Manifest main attributes`。现在所有注入条目都经 `manifestCollision` 守卫。
 
 **受控测试应用 × Android 16（API 36）**：`testapp` 的 11 个产物在 x86_64 模拟器上
 逐个装机实测，**11/11 通过**（安装成功、运行正常或被按设计拦停、运行时零结构性错误）。
@@ -120,7 +136,7 @@ Dhizuku（3292 类）、RustDesk（Flutter / 5449 类）在启用全部 29 个�
 
 ### 端到端矩阵
 
-`scripts/e2e.sh` 用 **9 组功能集**覆盖全部 31 个已实现项（早先只覆盖 22 项，
+`scripts/e2e.sh` 用 **9 组功能集**覆盖全部 33 个已实现项（早先只覆盖 22 项，
 A5/A8/A9/A10/A11/A12/A13/E4 从未进过端到端链路），并对产物做两类校验：
 
 1. **签名/对齐**：apksigner 校验 + `zipalign -c -p 4`；

@@ -14,6 +14,23 @@ type RenameConfig struct {
 	Keep []string
 	// ObfuscateFields 为 true 时同时重命名字段。
 	ObfuscateFields bool
+	// ShrinkPackage 为 true 时，新类名不再保留原包前缀，而是落到**默认包**
+	// （如 Lcom/foo/Bar; -> La;）。
+	//
+	// 参考样本就是这样：955 个类被压成默认包里的 A0 / A1$a 这类名字，
+	// 于是从类名完全读不出模块划分。
+	//
+	// 注意：这是**单 DEX 内**的粗粒度开关，它对「包」一无所知——把不同包的类
+	// 压进同一个默认包，会让原本同包的 package-private 访问（如内部类
+	// CrashUtils$1 与同包普通类之间）变成跨包访问，运行时报
+	//
+	//	IllegalAccessError: Illegal class access: 'ac' attempting to access
+	//	'com.termux.app.utils.CrashUtils$1'
+	//
+	// 因此 CLI 的 -package-shrink 并不使用它，而是在 passes 层做「按包压缩」
+	// （每个原包整体映射为一个无意义短包名，保持包内同包语义）。
+	// 本开关仅作为库 API 保留，供调用方在确知无跨包 package-private 依赖时使用。
+	ShrinkPackage bool
 	// ExtraKeepClasses 是额外强制保留的类（Java 名，形如 "com.foo.Bar"）。
 	// 用于传入从 AndroidManifest.xml 解析出的四大组件类名。
 	ExtraKeepClasses []string
@@ -907,8 +924,10 @@ func (r *Renamer) freshClassName(old string) string {
 		return old
 	}
 	pkg := "L"
-	if slash := strings.LastIndex(body, "/"); slash >= 0 {
-		pkg = "L" + body[:slash+1]
+	if !r.cfg.ShrinkPackage {
+		if slash := strings.LastIndex(body, "/"); slash >= 0 {
+			pkg = "L" + body[:slash+1]
+		}
 	}
 	for {
 		r.seq++

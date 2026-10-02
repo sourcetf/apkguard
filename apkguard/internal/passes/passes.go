@@ -48,6 +48,9 @@ func Registry() *pipeline.Registry {
 	// 各自加密成独立载荷。反过来则拆分无从下手（B1 已把明文移出 APK）。
 	r.Register(&splitDex{})
 	r.Register(&encryptDex{})
+	// B8 必须排在 B1 之后（要读加密载荷清单）、B3 之前（要改载荷条目名，
+	// 而 B3 生成 Loader 时会把这些名字内联进字节码）。
+	r.Register(&payloadContainer{})
 	r.Register(&appReplace{})
 	r.Register(&classLoader{})
 
@@ -77,6 +80,11 @@ func Registry() *pipeline.Registry {
 	r.Register(&channelMark{})
 	r.Register(&compatCheck{})
 	r.Register(&metaUnify{})
+
+	// A15 必须排在**最后**：它会把 Manifest 膨胀到数百 MB，
+	// 而 B2（改 android:name）、E6（读 minSdk）、A14 都不再需要读它；
+	// 反过来若排在前面，后续任何一次 Manifest 解析都要多走几十 MB 零。
+	r.Register(&manifestPad{})
 
 	return r
 }
@@ -176,6 +184,12 @@ func (f *fakeDex) Run(_ context.Context, art *pipeline.Artifact, opts *config.Op
 		used[e.NameString()] = true
 	}
 
+	// DEX 版本号与真实产物一致（我们新建/重建后都是 037）：
+	// 样本的伪块写 035，反而成了「这一块不是我们生成的」的指纹。
+	// 版本号越高越像真实产物，但也不能高到超出目标设备支持的范围——
+	// 037 是 d8 的常规输出，最自然。
+	version := dexVersionForFake()
+
 	added := 0
 	for i := 0; added < n; i++ {
 		base := names[i%len(names)]
@@ -188,24 +202,92 @@ func (f *fakeDex) Run(_ context.Context, art *pipeline.Artifact, opts *config.Op
 		}
 		used[name] = true
 
-		blob := make([]byte, size)
-		for k := range blob {
-			blob[k] = byte(rnd.Intn(256))
-		}
-		// 伪造 DEX magic；其余头部字段保持随机，使其必然解析失败
-		copy(blob, []byte("dex\n035\x00"))
-
+		blob := fakeDexBody(rnd, size, version)
 		pipeline.Add(art, zipx.NewStored(name, blob))
 		added++
 	}
 
-	art.Note("A9 伪 DEX 填充块：注入 %d 个（每个 %d 字节，随机不可压缩）", added, size)
+	art.Note("A9 伪 DEX 填充块：注入 %d 个（每个 %d 字节，随机不可压缩，magic dex\\n%03d）", added, size, version)
 	art.Stat("A9.count", fmt.Sprint(added))
 	art.Stat("A9.bytes", fmt.Sprint(added*size))
 	return nil
 }
 
+// dexVersionForFake 返回伪 DEX 块使用的版本号。
+//
+// 用 037 与真实产物一致（样本写 035，而 035 在现代设备上加载即崩，
+// 反而暴露「这不是真 DEX」）。
+func dexVersionForFake() int { return 37 }
+
+// fakeDexBody 构造一个伪 DEX 块：合法的 magic + **合理范围内的头部字段** + 随机数据。
+//
+// 早期实现是「magic + 纯随机」，头部的 header_size/map_off 等字段全是垃圾，
+// 任何工具一秒就能判定它不是 DEX。这里把头部字段写成合法值（header_size=0x70、
+// endian_tag、checksum 等按规范填），只有数据区是随机的——基于 magic 判定的工具
+// 会真的尝试解析，然后才在 data 段失败。
+func fakeDexBody(rnd *rand.Rand, size int, version int) []byte {
+	blob := make([]byte, size)
+	for k := range blob {
+		blob[k] = byte(rnd.Intn(256))
+	}
+	copy(blob, fmt.Sprintf("dex\n%03d\x00", version))
+	if size >= 0x70 {
+		// header_size 固定 0x70；endian_tag 为 DEX 常量 0x12345678。
+		binary.LittleEndian.PutUint32(blob[0x24:], 0x70)
+		binary.LittleEndian.PutUint32(blob[0x28:], 0x12345678)
+		// 把各段大小写成「看起来合理但互相不自洽」的值：让按 magic 判定的
+		// 工具真的走一遍解析路径，而不是靠一个字段就否定它。
+		for _, off := range []int{0x38, 0x40, 0x48, 0x50, 0x58, 0x60} {
+			binary.LittleEndian.PutUint32(blob[off:], uint32(1+rnd.Intn(1<<16)))
+		}
+	}
+	return blob
+}
+
 // ---- A10 垃圾条目注入 ----
+
+// manifestCollision 判断条目名是否会被运行时/工具当成 v1 签名的关键文件。
+//
+// 这类名字一律禁止注入。ZIP 条目名在 Android 的 JarFile/ZipUtils 中是**大小写
+// 不敏感**地比较 `META-INF/MANIFEST.MF`；而 ServiceLoader 等会经 JarFile 读
+// `META-INF/services/*`，从而触发 v1 签名校验。只要注入第二个「看起来像
+// MANIFEST.MF」的条目，校验器就可能读到错误的主属性并抛
+//
+//	java.lang.SecurityException: Invalid signature file digest for Manifest main attributes
+//
+// 实测于 RustDesk 1.5.0（Flutter）：首次 attach 即崩。同理不得注入
+// *.SF / *.RSA / *.DSA / *.EC —— 它们会被当作签名文件解析。
+//
+// 归一化会折叠重复斜杠、消解 '.'/'..' 段并统一大小写，因此
+// `META-INF//MANIFEST.MF`、`META-INF/./MANIFEST.MF`、`meta-inf/MANIFEST.MF`、
+// `META-INF/../META-INF/MANIFEST.MF` 都能被识别出来。
+func manifestCollision(name string) bool {
+	segs := make([]string, 0, 4)
+	for _, s := range strings.Split(name, "/") {
+		switch s {
+		case "", ".":
+			continue
+		case "..":
+			if len(segs) > 0 {
+				segs = segs[:len(segs)-1]
+			}
+		default:
+			segs = append(segs, s)
+		}
+	}
+	norm := strings.ToUpper(strings.Join(segs, "/"))
+	if norm == "META-INF/MANIFEST.MF" {
+		return true
+	}
+	if base, ok := strings.CutPrefix(norm, "META-INF/"); ok && !strings.Contains(base, "/") {
+		for _, ext := range []string{".SF", ".RSA", ".DSA", ".EC"} {
+			if strings.HasSuffix(base, ext) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // junkEntries 注入无意义 ZIP 条目：非 ASCII 顶层文件、随机名深目录、畸形 META-INF。
 type junkEntries struct{}
@@ -222,7 +304,7 @@ func (j *junkEntries) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		used[e.NameString()] = true
 	}
 	add := func(name string, data []byte) bool {
-		if name == "" || used[name] {
+		if name == "" || used[name] || manifestCollision(name) {
 			return false
 		}
 		used[name] = true
@@ -230,16 +312,20 @@ func (j *junkEntries) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		return true
 	}
 
-	// ① 非 ASCII 顶层文件：用易混字符集构造合法但难读的名字
-	axml := minimalAXML()
+	// ① 非 ASCII 顶层文件：用易混字符集构造合法但难读的名字，内容是**可解析的**
+	//    真 AXML（约 400 字节，与参考样本的 388 字节一致）。
+	//
+	// 早期实现只放 8 字节头部：扫描器一次解析失败就把整类丢弃，反而更快定位真文件。
+	// 现在每个垃圾 XML 都能被 aapt/jadx 正常解析，分析者必须逐个读完才知道是空的。
 	topAdded := 0
 	for i := 0; i < opts.JunkTopCount; i++ {
-		if add(confusableName(rnd, 3+i%6)+".xml", axml) {
+		size := 300 + rnd.Intn(200)
+		if add(confusableName(rnd, 3+i%6)+".xml", realisticAXML(rnd, size)) {
 			topAdded++
 		}
 	}
 
-	// ② 随机名深目录条目
+	// ② 随机名深目录条目（内容为顺序字节，像某种格式，比随机数据更耐看且可压缩）
 	dirAdded := 0
 	depth := opts.JunkDirDepth
 	if depth < 1 {
@@ -252,20 +338,41 @@ func (j *junkEntries) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			parts = append(parts, randSeg(rnd, 1+rnd.Intn(8)))
 		}
 		parts = append(parts, randSeg(rnd, 4)+".tmp")
-		if add(joinPath(parts), randBytes(rnd, 16)) {
+		if add(joinPath(parts), sequentialBytes(512+rnd.Intn(2048))) {
 			dirAdded++
 		}
 	}
 
-	// ③ 畸形 META-INF 路径：用前缀、双斜杠、点段等使签名状态判定产生歧义
+	// ③ 同名单目录深层路径：参考样本用 76 层同名目录制造超长路径，
+	//    这类路径会触发解包工具的路径长度/递归问题，而对真实文件毫无影响。
+	//    只在与 ② 同量级的规模下生成（每 10 个深目录配 1 条），避免体积失控。
+	aliasAdded := 0
+	for i := 0; i < opts.JunkDirCount/10; i++ {
+		depth := 60 + rnd.Intn(20)
+		leaf := randSeg(rnd, 3+rnd.Intn(8))
+		p := deepAliasPath(rnd, 2+rnd.Intn(4), depth, leaf)
+		if add(p, sequentialBytes(64<<10)) {
+			aliasAdded++
+		}
+	}
+
+	// ④ 畸形 META-INF 路径：用前缀、双斜杠、点段等使签名状态判定产生歧义。
+	//
+	// 但**绝不注入任何会被当成 MANIFEST.MF / 签名文件的名字**（见 manifestCollision）：
+	// 假 manifest 会让 JarVerifier 读到错误的主属性，运行时报
+	//   java.lang.SecurityException: Invalid signature file digest for Manifest main attributes
+	// ZIP 条目名在 Android 的 JarFile/ZipUtils 里是**大小写不敏感**地比较
+	// `META-INF/MANIFEST.MF`，所以 `meta-inf/MANIFEST.MF` 也算撞名。
+	// 实测于 RustDesk 1.5.0（Flutter）：ServiceLoader 经 JarFile 读
+	// META-INF/services 触发 v1 校验，首次 attach 即崩。
 	metaAdded := 0
 	malformed := []string{
 		"META-INF/",
-		"META-INF//MANIFEST.MF",
-		"META-INF/./MANIFEST.MF",
+		"META-INF//MANIFEST.MFx",
+		"META-INF/./MANIFEST.MFx",
 		"META-INF/../META-INF/x.MF",
 		"META-INF/.hidden",
-		"meta-inf/MANIFEST.MF",
+		"meta-inf/MANIFEST.MFx",
 		"META-INF/sub/",
 	}
 	for i := 0; i < opts.JunkMetaCount; i++ {
@@ -278,10 +385,11 @@ func (j *junkEntries) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		}
 	}
 
-	art.Note("A10 垃圾条目：顶层易混名 %d 条、深目录 %d 条、畸形 META-INF %d 条",
-		topAdded, dirAdded, metaAdded)
+	art.Note("A10 垃圾条目：顶层易混名 %d 条（内容为可解析的真 AXML）、深目录 %d 条、同名深层目录 %d 条、畸形 META-INF %d 条",
+		topAdded, dirAdded, aliasAdded, metaAdded)
 	art.Stat("A10.top", fmt.Sprint(topAdded))
 	art.Stat("A10.dir", fmt.Sprint(dirAdded))
+	art.Stat("A10.alias", fmt.Sprint(aliasAdded))
 	art.Stat("A10.meta", fmt.Sprint(metaAdded))
 	return nil
 }
@@ -317,7 +425,7 @@ func (z *zipPathAttack) Run(_ context.Context, art *pipeline.Artifact, opts *con
 	p1 := 0
 	for i := 0; i < n; i++ {
 		name := prefixes[i%len(prefixes)] + randSeg(rnd, 6)
-		if used[name] {
+		if used[name] || manifestCollision(name) {
 			continue
 		}
 		used[name] = true
@@ -327,11 +435,31 @@ func (z *zipPathAttack) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		p1++
 	}
 
-	// ② 绝对路径条目
+	// ② 绝对路径条目：混入**分隔符变体**，让不同工具的解压/规范化行为分叉
+	//
+	// 参考样本的绝对路径条目并不只是 "/随机名"：它带混合分隔符与转义
+	// （`/AndroidManifest.xml\/\.xml`、`/AndroidManifest.xml/////.9.png`）。
+	// 这些形态专打「按 / 切分目录」与「按 \ 切分」两种实现之间的差异，
+	// 以及「重复斜杠是否折叠」「.9.png 是否按图处理」的判定分歧。
+	forms := []func() string{
+		func() string { return "/" + randSeg(rnd, 8) },
+		func() string {
+			return "/" + randSeg(rnd, 5) + "\\/" + "\\." + randSeg(rnd, 3)
+		},
+		func() string {
+			return "/" + randSeg(rnd, 6) + strings.Repeat("/", 2+rnd.Intn(4)) + ".9.png"
+		},
+		func() string {
+			return "//" + randSeg(rnd, 5) + "/" + randSeg(rnd, 5)
+		},
+		func() string {
+			return "/" + randSeg(rnd, 4) + "/./" + randSeg(rnd, 4) + "/../" + randSeg(rnd, 4)
+		},
+	}
 	p2 := 0
 	for i := 0; i < n; i++ {
-		name := "/" + randSeg(rnd, 8)
-		if used[name] {
+		name := forms[i%len(forms)]()
+		if used[name] || manifestCollision(name) {
 			continue
 		}
 		used[name] = true
@@ -387,16 +515,6 @@ func (z *zipPathAttack) Run(_ context.Context, art *pipeline.Artifact, opts *con
 
 // ---- 辅助 ----
 
-// minimalAXML 返回一个最小的合法 AXML 头部（用于垃圾 xml 文件的内容）。
-func minimalAXML() []byte {
-	// AXML: magic 0x00080003, headerSize 8, chunkSize 8
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint16(b[0:], 0x0003)
-	binary.LittleEndian.PutUint16(b[2:], 0x0008)
-	binary.LittleEndian.PutUint32(b[4:], 8)
-	return b
-}
-
 // confusableName 生成由易混字符组成的文件名。
 //
 // 字符取自切罗基文补充（U+13A0-U+13F5）与提非纳文（U+2D30-U+2D67），
@@ -421,15 +539,6 @@ func randSeg(r *rand.Rand, n int) string {
 		out[i] = alpha[r.Intn(len(alpha))]
 	}
 	return string(out)
-}
-
-// randBytes 生成 n 字节随机数据。
-func randBytes(r *rand.Rand, n int) []byte {
-	out := make([]byte, n)
-	for i := range out {
-		out[i] = byte(r.Intn(256))
-	}
-	return out
 }
 
 // joinPath 用 "/" 连接路径段。

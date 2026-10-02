@@ -152,7 +152,7 @@ func TestArtifactTryHandlers(t *testing.T) {
 	for _, apk := range files {
 		g, assets := apkShellDex(t, apk)
 		total += checkTryHandlers(t, filepath.Base(apk), g)
-		if len(assets) == 0 {
+		if len(assets) == 0 || !hasLoaderClass(g) {
 			continue
 		}
 		env := &loaderEnv{assets: assets, fs: map[string][]byte{}}

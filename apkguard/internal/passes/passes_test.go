@@ -242,9 +242,16 @@ func TestJunkEntries(t *testing.T) {
 	for _, e := range art.Entries() {
 		meta[e.NameString()] = true
 	}
-	for _, want := range []string{"META-INF/", "META-INF//MANIFEST.MF", "META-INF/./MANIFEST.MF"} {
+	for _, want := range []string{"META-INF/", "META-INF//MANIFEST.MFx", "META-INF/./MANIFEST.MFx"} {
 		if !meta[want] {
 			t.Errorf("缺少畸形 META-INF 条目 %q", want)
+		}
+	}
+	// 变异名不得碰 `META-INF/MANIFEST.MF`（大小写不敏感）或签名文件后缀，
+	// 否则 v1 校验会拿到假主属性并抛 Invalid signature file digest。
+	for _, e := range art.Entries() {
+		if manifestCollision(e.NameString()) {
+			t.Errorf("注入了会被当成签名关键文件的条目 %q", e.NameString())
 		}
 	}
 }

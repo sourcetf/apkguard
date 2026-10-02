@@ -114,6 +114,10 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	}
 	var cands []cand
 	seen := map[string]bool{}
+	// existingPkgs 记录全部 DEX 中已存在的包前缀，供包压缩时避让；
+	// keptPkgs 记录「含有保留类」的包——这些包不能压缩（见下）。
+	existingPkgs := map[string]bool{}
+	keptPkgs := map[string]bool{}
 	// 先登记全部 DEX 中已存在的类描述符，避免新名与「未参与重命名的类」碰撞
 	for _, u := range units {
 		for i := uint32(0); i < u.file.NType; i++ {
@@ -122,6 +126,9 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 				continue
 			}
 			used[d] = true
+			if isClassDesc(d) {
+				existingPkgs[classPkgOf(d)] = true
+			}
 		}
 	}
 	for _, u := range units {
@@ -138,6 +145,23 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		if err != nil {
 			return fmt.Errorf("%s 生成重命名计划失败: %w", u.entry.NameString(), err)
 		}
+		// 未出现在 plan 里的类定义就是「被保留的类」（内部类、入口类、反射类…）。
+		// 它们留在原包，因此其所在包必须整体保留包名：把可改名类搬离该包会切断
+		// package-private 访问，运行时报
+		//   IllegalAccessError: Illegal class access: 'ac' attempting to access
+		//   'com.termux.app.utils.CrashUtils$1'
+		// （实测于 Termux：$ 内部类因「内外层命名强耦合」被保留，而普通类被压到默认包。）
+		if err := u.file.Classes(func(_ uint32, _ dex.ClassDef, name string) error {
+			if !isClassDesc(name) {
+				return nil
+			}
+			if _, renamed := plan[name]; !renamed {
+				keptPkgs[classPkgOf(name)] = true
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("%s 枚举类定义失败: %w", u.entry.NameString(), err)
+		}
 		for old := range plan {
 			// 只处理类描述符；方法名/字段名留给第二轮
 			if !isClassDesc(old) || seen[old] {
@@ -149,11 +173,47 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	}
 	sort.Slice(cands, func(a, b int) bool { return cands[a].desc < cands[b].desc })
 
-	// 3) 统一分配新名：同一包内的类共享新名序号空间，避免冲突
+	// 3) 统一分配新名：同一包内的类共享新名序号空间，避免冲突。
+	//
+	// -package-shrink 把「每个原包」整体映射到一个无意义短包名（Lpa/、Lpb/…）：
+	//   - 原来同包的类压缩后仍然同包，package-private 访问不被切断；
+	//   - 包名不再泄露模块划分，达到参考样本「类名里读不出结构」的效果。
+	// 不用「统一压成默认包」那种做法：它会把所有类丢进同一个包，看似更彻底，
+	// 却会让 package-private 跨包化——那正是 Termux 上的 IllegalAccessError。
+	// 含保留类的包整体保持原包名（提前让开后由 used 保证不碰撞）。
+	pkgAlias := map[string]string{}
+	if opts.PackageShrink {
+		var pkgs []string
+		assigned := map[string]bool{}
+		for _, c := range cands {
+			if keptPkgs[c.pkg] || assigned[c.pkg] {
+				continue
+			}
+			assigned[c.pkg] = true
+			pkgs = append(pkgs, c.pkg)
+		}
+		sort.Strings(pkgs)
+		for i, p := range pkgs {
+			alias := "Lp" + encodeShortName(i+1) + "/"
+			// 短包名不得与任何现存包（含保留类所在的包）重名。
+			for existingPkgs[alias] {
+				i++
+				alias = "Lp" + encodeShortName(i+1) + "/"
+			}
+			pkgAlias[p] = alias
+			existingPkgs[alias] = true
+		}
+	}
 	for _, c := range cands {
 		for {
 			seq++
-			desc := c.pkg + encodeShortName(seq) + ";"
+			pkg := c.pkg
+			if opts.PackageShrink {
+				if a := pkgAlias[c.pkg]; a != "" {
+					pkg = a
+				}
+			}
+			desc := pkg + encodeShortName(seq) + ";"
 			if used[desc] {
 				continue
 			}
@@ -472,6 +532,29 @@ func passiveClassRefs(art *pipeline.Artifact, files []*dex.File) []string {
 				for _, s := range f.Strings() {
 					add(s)
 				}
+			}
+		case strings.HasPrefix(name, "META-INF/services/"):
+			// ServiceLoader 的两半都要保住，缺一半都会让运行时加载不到实现：
+			//   - 文件**名**是服务接口的类名（ServiceLoader.load(X.class) 会查
+			//     META-INF/services/<X 的运行时类名>），改了接口名就找不到文件；
+			//   - 文件**内容**是各提供者的类名，改了提供者名就实例化不出来。
+			// 这两处引用都只存在于资源里，DEX 中没有对应字符串常量，因此
+			// reflectedClasses 看不见它们。实测 RustDesk 1.5.0（R8 混淆过的
+			// 文件名 j3.t / 内容 f3.a，即 kotlinx 的 MainDispatcherFactory 与
+			// AndroidDispatcherFactory）：改任意一半都会在 UI 首次 attach 时抛
+			//   IllegalStateException: Module with the Main dispatcher is missing.
+			// 文件格式：每行一个全限定类名，'#' 起注释。
+			add(strings.TrimPrefix(name, "META-INF/services/"))
+			for _, line := range strings.Split(string(data), "\n") {
+				if i := strings.IndexByte(line, '#'); i >= 0 {
+					line = line[:i]
+				}
+				add(line)
+			}
+		case strings.HasPrefix(name, "res/"):
+			// res/ 下的非 XML 资源（如 res/raw/*.json、*.txt）同样可能按名字引用类。
+			for _, tok := range classLikeTokens(data) {
+				add(tok)
 			}
 		case strings.HasPrefix(name, "assets/"):
 			for _, tok := range classLikeTokens(data) {

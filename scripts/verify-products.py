@@ -38,6 +38,10 @@ NO_INDEX = 0xFFFFFFFF
 
 FAKE_DEX_RE = re.compile(r"^(CLASSES\.DEX|Classes\.Dex|classes\.DEX)(\.\d+)?$")
 
+# B8 的容器目录：assets/<词>/<8 位十六进制>/... ；诱饵容器为 assets/<词>_<8 位十六进制>.zip
+CONTAINER_DIR_RE = re.compile(r"^assets/[a-z]+/[0-9a-f]{8}/")
+DECOY_ZIP_RE = re.compile(r"^assets/[a-z]+_[0-9a-f]{8}[.]zip$")
+
 # B1 的加密载荷条目名：assets/<伪装词>_<8 位十六进制>.<伪装扩展名>。
 # 扩展名从 .bin/.dat/.res/.pack 里按哈希挑一个（见 internal/pack/pack.go 的
 # assetExts），所以不能只认 .bin。
@@ -147,9 +151,18 @@ class Checker:
                        % info.compress_type)
 
         # ---- B1 DEX 整体加密：明文业务类不在 classes.dex 里，载荷在 assets/ ----
+        #
+        # 注意：启用 B8 后载荷被移进容器目录（assets/<词>/<hex>/...），
+        # 不再匹配顶层载荷命名，因此两种位置都算数。
         if self.want("B1"):
-            self.check(bool(self.payloads), "B1",
-                       "assets/ 下找不到加密载荷（*.bin）")
+            in_container = [n for n in self.names if CONTAINER_DIR_RE.match(n)]
+            found = self.payloads or in_container
+            if self.want("B8"):
+                self.check(bool(in_container), "B1",
+                           "启用 B8 后应在容器目录里找到载荷（assets/<词>/<hex>/）")
+            else:
+                self.check(bool(found), "B1",
+                           "assets/ 下找不到加密载荷（*.bin/*.dat/*.res/*.pack）")
             self.check("Lcom/agtest/MainActivity;" not in self.dex_strs, "B1",
                        "classes.dex 里仍能看到业务类 MainActivity（未被加密载荷替换）")
 
@@ -221,6 +234,51 @@ class Checker:
             n = class_count(self.shell_dex)
             self.check(n >= 50, "A13",
                        "壳 DEX 只有 %d 个类，远低于膨胀后的预期（>=50）" % n)
+
+        # ---- A15 巨型 Manifest 填充 ----
+        #
+        # 判据：Manifest 确实被撑大了，且**仍能被解析**（后者决定装不装得上）。
+        # 只查体积是不够的：填充把真实内容挤没了同样「体积达标」，但应用会装不上。
+        if self.want("A15"):
+            info = zf.getinfo("AndroidManifest.xml")
+            self.check(info.file_size >= 8 << 20, "A15",
+                       "AndroidManifest.xml 只有 %d 字节，未达到填充效果" % info.file_size)
+            # 顶层 XML chunk 的 size 必须等于整个文件长度（填充靠它串起真实内容）
+            head = read_bytes(zf, "AndroidManifest.xml")[:8]
+            if len(head) >= 8:
+                sz = int.from_bytes(head[4:8], "little")
+                self.check(sz == info.file_size, "A15",
+                           "顶层 XML chunk size=%d 应等于文件长度 %d（否则真实内容读不到，应用装不上）"
+                           % (sz, info.file_size))
+            # 真实内容必须还在：字符串池里应能找到 AndroidManifest 必然包含的串。
+            # AXML 的字符串池可能是 UTF-8 也可能是 UTF-16LE（aapt1 时代的产物），
+            # 因此两种编码都要试——只查 UTF-8 会把正常的产物误判成「内容丢失」。
+            raw = read_bytes(zf, "AndroidManifest.xml")
+            needle = b"application"
+            u16 = "application".encode("utf-16-le")
+            self.check(needle in raw or u16 in raw, "A15",
+                       "填充后 Manifest 里找不到真实内容（application 字样，UTF-8/UTF-16 均无）")
+            # 再确认末尾真实内容区存在字符串池 chunk（type=0x0001）——
+            # 这是「真实内容被完整保留」的结构性证据。
+            tail = raw[-65536:]
+            self.check(bytes([1, 0]) in tail, "A15",
+                       "填充后 Manifest 末尾找不到字符串池 chunk（真实内容可能被挤掉）")
+
+        # ---- B8 载荷容器化 ----
+        if self.want("B8"):
+            moved = [n for n in self.names if CONTAINER_DIR_RE.match(n)]
+            self.check(bool(moved), "B8", "载荷未移入容器目录（assets/<词>/<hex>/）")
+            decoys = [n for n in self.names if DECOY_ZIP_RE.match(n)]
+            self.check(bool(decoys), "B8", "找不到诱饵容器（assets/<词>_<hex>.zip）")
+            # 顶层不应再直接暴露载荷（B1 的载荷名形如 assets/<词>_<hex>.<ext>）
+            top = [n for n in self.names if PAYLOAD_RE.match(n)]
+            self.check(not top, "B8",
+                       "顶层 assets 仍直接暴露载荷：%s" % top[:3])
+            if decoys:
+                blob = read_bytes(zf, decoys[0])
+                self.check(blob[:2] == b"PK", "B8", "诱饵容器不是 zip（缺 PK 头）")
+                self.check(b"dummy.installed.check" in blob or b"packageName" in blob, "B8",
+                           "诱饵容器里找不到诱饵配置（packageName）")
 
         # ---- E4 渠道标记 ----
         if self.want("E4"):

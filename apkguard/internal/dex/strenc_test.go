@@ -1,6 +1,7 @@
 package dex
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -20,15 +21,20 @@ func TestEncryptStringRoundTrip(t *testing.T) {
 	}
 	for _, c := range cases {
 		ct := encryptString(c.s, c.key)
-		// 密文只含十六进制字符：这是「可安全放进字符串池」的前提
+		// 密文必须是纯 ASCII 的 Base64：这是「可安全放进 DEX 字符串池」的前提
+		// （池是 MUTF-8 编码的 UTF-16，非 ASCII 可能产生孤立代理码元）。
 		for i := 0; i < len(ct); i++ {
 			ch := ct[i]
-			if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
-				t.Fatalf("%q 的密文含非法字符 %q", c.s, ch)
+			ok := ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' ||
+				ch >= '0' && ch <= '9' || ch == '+' || ch == '/' || ch == '='
+			if !ok {
+				t.Fatalf("%q 的密文含非 Base64 字符 %q", c.s, ch)
 			}
 		}
-		if len(ct) != len(c.s)*2 {
-			t.Fatalf("%q 的密文长度应为 %d，实际 %d", c.s, len(c.s)*2, len(ct))
+		// Base64 是 4/3 膨胀，比十六进制的 2 倍小得多
+		wantLen := (len(c.s) + 2) / 3 * 4
+		if len(ct) != wantLen {
+			t.Fatalf("%q 的密文长度应为 %d（Base64），实际 %d", c.s, wantLen, len(ct))
 		}
 		if got := decryptString(ct, c.key); got != c.s {
 			t.Fatalf("解密结果不符：%q -> %q -> %q", c.s, ct, got)
@@ -38,26 +44,17 @@ func TestEncryptStringRoundTrip(t *testing.T) {
 
 // decryptString 是 encryptString 的逆运算，独立实现以便交叉验证。
 //
-// 它模拟注入到 DEX 中的解密方法的行为：把十六进制字符串按
-// 「高 4 位 + 低 4 位」还原成字节，再与密钥流异或。
+// 它模拟注入到 DEX 中的解密方法的行为：先 Base64 解码，再与密钥流逐字节异或。
+// 刻意不复用 encryptString 的任何内部步骤，避免「用同一份可能出错的代码校验自己」。
 func decryptString(ct string, key byte) string {
-	b := make([]byte, len(ct)/2)
-	for i := range b {
-		hi := hexVal(ct[2*i])
-		lo := hexVal(ct[2*i+1])
-		b[i] = byte(hi<<4|lo) ^ keyStream(key, i)
+	raw, err := base64.StdEncoding.DecodeString(ct)
+	if err != nil {
+		return "!base64-decode-failed"
 	}
-	return string(b)
-}
-
-func hexVal(c byte) int {
-	switch {
-	case c >= '0' && c <= '9':
-		return int(c - '0')
-	case c >= 'a' && c <= 'f':
-		return int(c-'a') + 10
+	for i := range raw {
+		raw[i] ^= keyStream(key, i)
 	}
-	return 0
+	return string(raw)
 }
 
 // TestAsmAssemble 验证汇编器的标签解析与引用回填。

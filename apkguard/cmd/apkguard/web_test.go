@@ -139,11 +139,11 @@ func TestFeaturesEndpointExposesAllFeatures(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
-	if body.Total != 38 {
-		t.Fatalf("功能项总数应为 38，实际 %d", body.Total)
+	if body.Total != 40 {
+		t.Fatalf("功能项总数应为 40，实际 %d", body.Total)
 	}
-	if n := len(allFeatureIDs()); n != 38 {
-		t.Fatalf("分组里的功能项应为 38 个，实际 %d", n)
+	if n := len(allFeatureIDs()); n != 40 {
+		t.Fatalf("分组里的功能项应为 40 个，实际 %d", n)
 	}
 }
 

@@ -1,6 +1,7 @@
 package dex
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -785,6 +786,17 @@ func (in *interp) call(methodIdx uint32, regs []int) (int32, any, error) {
 		return int32(units[i]), nil, nil
 	case "Ljava/lang/Character;->digit(CI)I":
 		return int32(digitOf(rune(in.regs[regs[0]]), int(in.regs[regs[1]]))), nil, nil
+	// A2 的解密器用 android.util.Base64.decode(s, flags) 解码密文
+	case "Landroid/util/Base64;->decode(Ljava/lang/String;I)[B":
+		sv, ok := in.objs[regs[0]].(*fakeStr)
+		if !ok {
+			return 0, nil, errf("Base64.decode 的第一个参数不是 String")
+		}
+		raw, err := base64.StdEncoding.DecodeString(sv.s)
+		if err != nil {
+			return 0, nil, errf("Base64.decode 失败: %v", err)
+		}
+		return 0, &fakeBytes{b: raw}, nil
 	case "Ljava/lang/String;-><init>([BLjava/lang/String;)V":
 		arr, ok := in.objs[regs[1]].(*fakeBytes)
 		if !ok {

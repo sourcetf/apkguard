@@ -94,11 +94,11 @@ type Feature struct {
 var implementedIDs = map[FeatureID]bool{
 	// 阶段2 L1 混淆
 	"A1": true, "A2": true, "A3": true, "A4": true, "A5": true, "A8": true, "A11": true,
-	"A9": true, "A10": true, "A12": true, "A13": true,
+	"A9": true, "A10": true, "A12": true, "A13": true, "A15": true,
 	// 阶段1 签名 / 对齐 / 元数据
 	"A14": true, "E1": true, "E2": true, "E3": true, "E4": true, "E5": true, "E6": true,
 	// 阶段3 L2 一代壳
-	"B1": true, "B2": true, "B3": true, "B4": true,
+	"B1": true, "B2": true, "B3": true, "B4": true, "B8": true,
 	// 阶段2/3 运行时防护
 	"D1": true, "D2": true, "D3": true,
 	// 阶段4 L3 native 防护（已落地的部分）
@@ -175,6 +175,10 @@ func All() []Feature {
 			Desc: "统一 ZIP 条目的时间戳、create_system、flag_bits 等元数据",
 			Note: "零体积成本；消除「被重新打包」的取证痕迹"},
 
+		{ID: "A15", Name: "巨型 Manifest 填充", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
+			Desc: "把 AndroidManifest.xml 膨胀到数百 MB（零填充 + 巨型假 chunk，真实内容置于末尾）",
+			Note: "解压/解析成本剧增；可能被应用商店或加固检测按体积拒绝，默认关闭"},
+
 		// ---- 加壳类 ----
 		{ID: "B1", Name: "DEX 整体加密", Group: GroupPack, Stage: StageL2, Risk: RiskSafe, Default: false,
 			Desc: "将原始 DEX 加密后存入 assets/，壳 DEX 运行时解密并加载",
@@ -197,6 +201,10 @@ func All() []Feature {
 		{ID: "B7", Name: "Dex2C / Java2C", Group: GroupPack, Stage: StageLong, Risk: RiskDangerous, Default: false,
 			Desc: "将 Java 方法编译期翻译为 C，编译成 SO 通过 JNI 注册调用",
 			Note: "需处理多 ABI、JNI 桥接、GC 交互，工程复杂度极高"},
+
+		{ID: "B8", Name: "载荷容器化", Group: GroupPack, Stage: StageL2, Risk: RiskSafe, Default: false,
+			Desc: "把加密载荷移入容器目录树，并植入同构的诱饵容器（高熵 .dat + 假包名配置）",
+			Note: "对抗「按 assets 顶层逐个解密」的自动化脚本；需先启用 B1"},
 
 		// ---- Native 防护类 ----
 		{ID: "C1", Name: "密钥 native 派生", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
@@ -316,6 +324,7 @@ type Options struct {
 
 	// 混淆参数
 	NamePrefix    string `json:"name_prefix"`     // A1 混淆后名称前缀
+	PackageShrink bool   `json:"package_shrink"`  // A1 每个原包整体压成无意义短包名（隐藏包结构）
 	KeepRules     string `json:"keep_rules"`      // A1 保留白名单（每行一条，支持通配）
 	ObfStringMin  int    `json:"obf_string_min"`  // A2 仅加密长度 >= 该值的字符串
 	Seed          string `json:"seed"`            // 随机种子（留空则随机）
@@ -328,9 +337,11 @@ type Options struct {
 	ZipAtkCount   int    `json:"zip_atk_count"`   // A12 每类路径攻击条目数
 	ClassPadCount int    `json:"class_pad_count"` // A13 膨胀类数量
 	StampTime     string `json:"stamp_time"`      // A14 统一时间戳（RFC3339，留空用固定值）
+	ManifestPadMB int    `json:"manifest_pad_mb"` // A15 巨型 Manifest 填充量（MB，0=默认 100）
 
 	// 加壳参数
 	DexKey       string `json:"dex_key"`       // B1 加密密钥（留空自动生成）
+	DecoyPkg     string `json:"decoy_pkg"`     // B8 诱饵配置里的假包名（留空用默认）
 	ShellPkg     string `json:"shell_pkg"`     // B2/B3 壳类所在包名
 	SplitCount   int    `json:"split_count"`   // B4 拆分 DEX 个数（0=按原样）
 	ExtractRatio int    `json:"extract_ratio"` // B5 抽取方法比例（1~100）
@@ -407,6 +418,7 @@ func (o *Options) Validate() error {
 			{"B3", "DEX 整体加密需要 ClassLoader 接管才能加载解密后的 DEX"}},
 		"B3":  {{"B2", "ClassLoader 接管需要壳 Application 提供最早执行时机"}},
 		"B4":  {{"B1", "多 DEX 拆分需要 DEX 加密才能体现防护价值"}},
+		"B8":  {{"B1", "载荷容器化需要先有加密载荷"}},
 		"B5":  {{"B1", "函数抽取需要 DEX 加密作为基础"}},
 		"B6":  {{"B2", "VMP 需要壳 Application"}, {"B3", "VMP 需要 ClassLoader 接管"}},
 		"B7":  {{"B2", "Dex2C 需要壳 Application"}, {"B3", "Dex2C 需要 ClassLoader 接管"}},
@@ -461,6 +473,9 @@ func (o *Options) Validate() error {
 	}
 	if o.ExtractRatio < 0 || o.ExtractRatio > 100 {
 		errs = append(errs, "B5 抽取比例须在 0~100 之间")
+	}
+	if o.ManifestPadMB < 0 || o.ManifestPadMB > 4096 {
+		errs = append(errs, "A15 填充量须在 0~4096 MB 之间")
 	}
 	if o.FakeDexCount < 0 || o.JunkTopCount < 0 || o.JunkDirCount < 0 || o.ClassPadCount < 0 {
 		errs = append(errs, "数量类参数不能为负")

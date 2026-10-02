@@ -58,17 +58,29 @@ case "$(uname -s)" in
 esac
 if "$LOCAL_BIN" -list >/dev/null 2>&1; then ok "-list 可执行"; else bad "-list 失败"; fi
 n="$("$LOCAL_BIN" -list | python3 "$ROOT/scripts/count-features.py")"
-[ "$n" -eq 38 ] && ok "功能项 38 个" || bad "功能项数量为 $n（应为 38）"
+[ "$n" -eq 40 ] && ok "功能项 40 个" || bad "功能项数量为 $n（应为 40）"
 
 printf 'x' > /tmp/ag-fake.apk
-if "$LOCAL_BIN" -in /tmp/ag-fake.apk -enable A6 2>&1 | grep -q "A6"; then
-  ok "未实现的功能项被正确拒绝"; else bad "启用未实现的 A6 没有报错"; fi
-if "$LOCAL_BIN" -in /tmp/ag-fake.apk -enable E1 2>&1 | grep -q "密钥库"; then
-  ok "缺密钥库时正确报错"; else bad "缺密钥库未报错"; fi
+# 注意：本脚本开了 pipefail，而这两条命令**预期会非零退出**（报错即成功）。
+# 直接 `cmd | grep -q X` 会因为管道里前半段非零而让整个 if 判假，
+# 于是「确实报了错」反而被记成失败。必须先取输出再匹配。
+out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable A6 2>&1 || true)"
+case "$out" in
+  *A6*) ok "未实现的功能项被正确拒绝" ;;
+  *)    bad "启用未实现的 A6 没有报错" ;;
+esac
+out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable E1 2>&1 || true)"
+case "$out" in
+  *密钥库*) ok "缺密钥库时正确报错" ;;
+  *)        bad "缺密钥库未报错" ;;
+esac
 rm -f /tmp/ag-fake.apk
 
 if [ -n "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}" ]; then
   step "端到端（构建测试 APK → 加固 → 校验 → 产物级守卫）"
+  # 日志目录必须先建：重定向到不存在的目录会让 e2e 直接失败，
+  # 而且失败信息只会落在「见 tmpwork/...」这句里，看不出真实原因。
+  mkdir -p "$ROOT/tmpwork"
   if bash "$ROOT/scripts/e2e.sh" >"$ROOT/tmpwork/ci-local-e2e.log" 2>&1; then
     ok "端到端通过（日志 tmpwork/ci-local-e2e.log）"
   else

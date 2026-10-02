@@ -96,6 +96,7 @@
         <label class="row"><span>类膨胀数</span><input type="number" id="class_pad_count" placeholder="100（A13）"></label>
         <label class="row"><span>伪 DEX 块</span><input type="number" id="fake_dex_count" placeholder="1（A9）"></label>
         <label class="row"><span>时间戳</span><input type="text" id="stamp_time" placeholder="2024-01-01T00:00:00Z（A14）"></label>
+        <label class="row"><span>Manifest 填充</span><input type="number" id="manifest_pad_mb" placeholder="0=默认100MB（A15，危险区）"></label>
       </details>
     </div>
     <div class="card">
@@ -171,7 +172,7 @@ function collect() {
     name_prefix: val('name_prefix'), keep_rules: val('keep_rules'),
     obf_string_min: num('obf_string_min'), split_count: num('split_count'),
     class_pad_count: num('class_pad_count'), fake_dex_count: num('fake_dex_count'),
-    stamp_time: val('stamp_time')};
+    stamp_time: val('stamp_time'), manifest_pad_mb: num('manifest_pad_mb')};
 }
 function status(html) { document.getElementById('status').innerHTML = html; }
 async function run() {

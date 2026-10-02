@@ -913,10 +913,10 @@ func emitInjectedClassData(spec *ClassSpec, pl *plan, code map[*CodeBlob]uint32)
 			return nil, fmt.Errorf("dex: 注入方法 %s.%s 未登记", spec.Name, m.Name)
 		}
 		acc := m.Access
-		// <init> 必须带 ACC_CONSTRUCTOR（0x10000）：ART 会检查这一位，
-		// 缺了会报 "<init> didn't have expected constructor access flag"。
-		// 在生成入口统一补上，比要求每个调用方自己记得更可靠。
-		if m.Name == "<init>" {
+		// <init> 与 <clinit> 都必须带 ACC_CONSTRUCTOR（0x10000）：ART 会检查
+		// 这一位，缺了会报 "<name> didn't have expected constructor access flag"。
+		// 两个名字都补上，比要求每个调用方自己记得更可靠。
+		if m.Name == "<init>" || m.Name == "<clinit>" {
 			acc |= accConstructor
 		}
 		e := me{idx: i, acc: acc}

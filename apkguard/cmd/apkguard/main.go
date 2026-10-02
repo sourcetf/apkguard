@@ -55,6 +55,7 @@ type cliConfig struct {
 
 	// 功能项参数
 	namePrefix    string
+	packageShrink bool
 	keepRules     string
 	obfStringMin  int
 	seed          string
@@ -67,8 +68,10 @@ type cliConfig struct {
 	zipAtkCount   int
 	classPadCount int
 	stampTime     string
+	manifestPadMB int
 
 	dexKey       string
+	decoyPkg     string
 	shellPkg     string
 	splitCount   int
 	extractRatio int
@@ -105,6 +108,7 @@ func run() error {
 	flag.StringVar(&c.addr, "addr", "127.0.0.1:8787", "Web UI 监听地址")
 
 	flag.StringVar(&c.namePrefix, "name-prefix", "", "A1 混淆后名称前缀")
+	flag.BoolVar(&c.packageShrink, "package-shrink", false, "A1 把每个原包整体映射为无意义短包名（隐藏包结构线索，保持同包 package-private 访问）")
 	flag.StringVar(&c.keepRules, "keep-rules", "", "A1 保留白名单文件（每行一条，支持 * 通配）")
 	flag.IntVar(&c.obfStringMin, "obf-string-min", 0, "A2 仅加密长度不小于该值的字符串")
 	flag.StringVar(&c.seed, "seed", "", "随机种子（留空则每次随机）")
@@ -117,8 +121,10 @@ func run() error {
 	flag.IntVar(&c.zipAtkCount, "zip-atk-count", 10, "A12 每类路径攻击条目数")
 	flag.IntVar(&c.classPadCount, "class-pad-count", 100, "A13 膨胀类数量")
 	flag.StringVar(&c.stampTime, "stamp-time", "", "A14 统一时间戳（RFC3339，留空用固定值）")
+	flag.IntVar(&c.manifestPadMB, "manifest-pad-mb", 0, "A15 巨型 Manifest 填充量（MB，0=用默认 100）")
 
 	flag.StringVar(&c.dexKey, "dex-key", "", "B1 加密密钥（留空自动生成）")
+	flag.StringVar(&c.decoyPkg, "decoy-pkg", "", "B8 诱饵配置里的假包名（留空用默认 dummy.installed.check）")
 	flag.StringVar(&c.shellPkg, "shell-pkg", "com.apkguard.shell", "B2/B3 壳类所在包名")
 	flag.IntVar(&c.splitCount, "split-count", 0, "B4 拆分 DEX 个数（0=按原样）")
 	flag.IntVar(&c.extractRatio, "extract-ratio", 0, "B5 抽取方法比例（1~100）")
@@ -346,6 +352,7 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		MaxSDK:  c.maxSDK,
 
 		NamePrefix:    c.namePrefix,
+		PackageShrink: c.packageShrink,
 		ObfStringMin:  c.obfStringMin,
 		Seed:          c.seed,
 		FakeDexCount:  c.fakeDexCount,
@@ -357,8 +364,10 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		ZipAtkCount:   c.zipAtkCount,
 		ClassPadCount: c.classPadCount,
 		StampTime:     c.stampTime,
+		ManifestPadMB: c.manifestPadMB,
 
 		DexKey:       c.dexKey,
+		DecoyPkg:     c.decoyPkg,
 		ShellPkg:     c.shellPkg,
 		SplitCount:   c.splitCount,
 		ExtractRatio: c.extractRatio,
