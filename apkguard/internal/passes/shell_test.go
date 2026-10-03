@@ -276,40 +276,34 @@ func TestAppReplaceAloneKeepsOriginalDex(t *testing.T) {
 	}
 }
 
-// TestShellChainSkipsWithoutPayloads 验证启用 B3 但未启用 B1 时
-// B3 不报错、只记录降级说明（因为没有载荷可加载）。
-func TestShellChainSkipsWithoutPayloads(t *testing.T) {
+// TestShellChainRejectsB3WithoutB1 验证「启用 B3 但未启用 B1」被明确拒绝。
+//
+// 这条组合曾经被当成「安全跳过」并写进测试：B3 只记一行说明就返回。但 B2 当时
+// 仍会引用 Loader 类，而那个类从未被注入——产物引用未定义的类，应用一启动
+// NoClassDefFoundError，工具却报成功。因此正确行为是**报错**，而不是跳过。
+func TestShellChainRejectsB3WithoutB1(t *testing.T) {
 	art := loadSample(t)
 	opts := &config.Options{Enabled: map[config.FeatureID]bool{"B2": true, "B3": true}}
 	ctx := context.Background()
 	if err := (&appReplace{}).Run(ctx, art, opts); err != nil {
 		t.Fatalf("B2 执行失败: %v", err)
 	}
-	if err := (&classLoader{}).Run(ctx, art, opts); err != nil {
-		t.Fatalf("B3 在无载荷时应安全跳过，实际报错: %v", err)
-	}
-	// 壳 DEX 应仍只有 App 类，没有 Loader。
+	// 壳不得引用 Loader（没有 B1 就没有 Loader 类体）。
 	info, _ := art.Get(sharedKeyShell).(*shellInfo)
-	e := pipeline.Find(art, info.EntryName)
-	data, err := e.Data()
-	if err != nil {
-		t.Fatalf("读取壳 DEX 失败: %v", err)
+	if info == nil {
+		t.Fatal("未找到壳信息")
 	}
-	g, err := dex.Parse(data)
-	if err != nil {
-		t.Fatalf("解析壳 DEX 失败: %v", err)
+	if info.LoaderClass != "" {
+		t.Fatalf("未启用 B1 时壳不应引用 Loader，实际 %q", info.LoaderClass)
 	}
-	found := false
-	if err := g.Classes(func(_ uint32, _ dex.ClassDef, name string) error {
-		if name == info.LoaderClass {
-			found = true
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("遍历类失败: %v", err)
+	// B3 必须报错，而不是静默跳过。
+	err := (&classLoader{}).Run(ctx, art, opts)
+	if err == nil {
+		t.Fatal("未启用 B1 时 B3 应报错（否则产物会引用未定义的 Loader 类）")
 	}
-	if found {
-		t.Fatal("无载荷时不应注入 Loader 类")
+	// 错误信息要指出缺的是 B1。
+	if !strings.Contains(err.Error(), "B1") {
+		t.Fatalf("错误信息应指出缺少 B1，实际: %v", err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"apkguard/internal/axml"
@@ -103,8 +104,13 @@ func (a *appReplace) Run(_ context.Context, art *pipeline.Artifact, opts *config
 	}
 	// Loader 非空表示壳还要负责解密载荷与接管 ClassLoader。
 	// 这里只填类名：Loader 的类体由 B3 注入，B2 只生成对它的调用。
+	//
+	// **必须同时要求 B1**：没有加密载荷时 B3 会提前返回、不注入 Loader 类体
+	// （它只负责「解密载荷并接管 ClassLoader」这件事，无载荷就无事可做）。
+	// 若这里只看 B3，壳会生成对 Loader.a 的调用，而那个类从未被定义，
+	// 应用启动即 NoClassDefFoundError。deps 表也已声明 B3→B1，这里是第二道防线。
 	loaderClass := ""
-	if opts.IsEnabled("B3") {
+	if opts.IsEnabled("B3") && opts.IsEnabled("B1") {
 		loaderClass = "L" + pkgSlash + "/Loader;"
 		sh.LoaderClass = loaderClass
 	}
@@ -341,8 +347,18 @@ func (classLoader) Out() pipeline.Level  { return pipeline.LevelZip }
 
 func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *config.Options) error {
 	info, _ := art.Get(sharedKeyShell).(*shellInfo)
-	if info == nil || info.LoaderClass == "" {
+	if info == nil {
 		return fmt.Errorf("B3 需要 B2 先注入壳 DEX（未找到壳信息）")
+	}
+	// B3 的职责是「解密载荷并接管 ClassLoader」。没有 B1 就没有载荷，
+	// 而壳（B2）此时**不会**引用 Loader——产物里既没有 Loader 类体、也没有
+	// 对它的调用。所以这不是「安全跳过」，而是「启用了一个无事可做的功能项」，
+	// 必须显式报错（配置层 Validate 已拦，这里是 API 直调时的第二道防线）。
+	if !opts.IsEnabled("B1") {
+		return fmt.Errorf("B3 需要 B1（DEX 整体加密）才有载荷可加载；未启用 B1 时壳不会注入 Loader 类体")
+	}
+	if info.LoaderClass == "" {
+		return fmt.Errorf("B3 需要 B2 把壳接到 Loader（LoaderClass 为空）")
 	}
 	payloads := payloadsOf(art)
 	if payloads == nil || len(payloads.Items) == 0 {
@@ -351,9 +367,7 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		if soLibsOf(art) != nil {
 			return fmt.Errorf("C2 移除了原生库，但 B3 没有可加载的 DEX 载荷：请同时启用 B1（C2 依赖 B1/B2/B3）")
 		}
-		// 未启用 B1 时没有密文载荷可加载：壳退化为纯 Application 代理。
-		art.Note("B3 ClassLoader 接管：未启用 B1（无加密载荷），壳仅做 Application 代理")
-		return nil
+		return fmt.Errorf("B3 已启用但没有任何加密载荷：请检查 B1 是否真的产生了载荷")
 	}
 
 	entry := pipeline.Find(art, info.EntryName)
@@ -943,14 +957,25 @@ func (si *selfIntegrity) Run(_ context.Context, art *pipeline.Artifact, opts *co
 	if checkClassOf(info, "C6") == "" {
 		return fmt.Errorf("C6 需要与 C1 同时启用（两者共用同一份原生库与桥接类）")
 	}
-	libs, err := native.Prebuilt()
-	if err != nil {
-		return err
+	// 统计**实际注入的**守卫库数，而不是 native.Prebuilt() 的全部 ABI。
+	//
+	// C1 只会往「原 APK 覆盖的 ABI」注入 libapkguard.so（避免给只支持 arm64
+	// 的应用注入 32 位库、让系统误判它支持 armv7 而放行到不兼容设备）。
+	// 此前这里用 len(native.Prebuilt())（恒为 3）报「覆盖 3 个 ABI」，
+	// 而实际可能只注入了 1 个——交付报告会夸大自校验的覆盖面。
+	//
+	// 直接读 C1 记下的注入数，而不是按文件名数条目：C7 会把守卫库改名
+	// （libapkguard.so → 用户指定的假名），按原名数会得到 0。
+	guard := 0
+	if v := art.Stats["C1.libs"]; v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			guard = n
+		}
 	}
-	art.Note("C6 完整性自校验：壳启动时调用 %s.intact()，校验自身 .text 与 .rodata 的 SHA-256（覆盖 %d 个 ABI 的原生库）",
-		dex.NativeBridgeJavaName, len(libs))
+	art.Note("C6 完整性自校验：壳启动时调用 %s.intact()，校验自身 .text 与 .rodata 的 SHA-256（产物内含 %d 个 ABI 的守卫库）",
+		dex.NativeBridgeJavaName, guard)
 	art.Stat("C6.bridge", dex.NativeBridgeJavaName)
-	art.Stat("C6.libs", fmt.Sprint(len(libs)))
+	art.Stat("C6.libs", fmt.Sprint(guard))
 	return nil
 }
 

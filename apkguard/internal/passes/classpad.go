@@ -36,7 +36,10 @@ func (classPad) Out() pipeline.Level  { return pipeline.LevelZip }
 func (c *classPad) Run(_ context.Context, art *pipeline.Artifact, opts *config.Options) error {
 	total := opts.ClassPadCount
 	if total <= 0 {
-		return nil // 未指定数量时不做任何事（由 UI 侧给出默认值）
+		// CLI 与 Web 都会给出非零默认值，但库/API 调用方可能给 0。
+		// 静默返回会让「启用了 A13 却什么都没发生」无从察觉，故留一行 Note。
+		art.Note("A13 类膨胀：未指定 -class-pad-count（或为 0），本次不注入任何膨胀类")
+		return nil
 	}
 
 	entries := pipeline.FindAll(art, isDexEntry)

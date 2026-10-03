@@ -42,11 +42,11 @@ func Registry() *pipeline.Registry {
 	r.Register(&nopFill{})
 	// A19 只往字符串池追加垃圾串、不触碰指令流，放在混淆段末尾即可。
 	r.Register(&strJunk{})
-	// A6（控制流混淆）**不注册**：实现与单元测试已就位（internal/dex/cff.go），
-	// 但在三个真实应用上实测会破坏产物（ART 报
-	//   VerifyError: ... wide register v7 has type Low-half Constant/Conflict），
-	// 关掉即恢复正常。安全地改写方法体需要寄存器类型/活跃性分析，属后续工作；
-	// 在那之前按项目原则「启用未实现项必须报错」，不把它暴露给使用方。
+	// 注：A6 已在上方注册（见 r.Register(&controlFlow{})），此处不再重复。
+	// 早期它确实不注册——当时在真实应用上会触发 ART 的宽值类型冲突
+	// （VerifyError: wide register ... Low-half Constant/Conflict）。该缺陷已在
+	// 修掉「32x 格式漏报源寄存器」后消失，三个真实应用（Dhizuku/Termux/RustDesk）
+	// 全选项加固后均可正常运行，见 realworld/实测记录-三应用全选项.md。
 	r.Register(&fakeDex{})
 	r.Register(&junkEntries{})
 	r.Register(&zipPathAttack{})
@@ -162,12 +162,48 @@ func (m *metaUnify) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 		e.VersionMade &^= 0xff00
 		// 清除条目注释，避免泄露打包工具信息。
 		e.Comment = nil
+		// 清除**带时间的**扩展字段记录：0x5455（扩展时间戳，含 mtime/atime/ctime）
+		// 与 0x000a（NTFS 时间）会原样保留原始的打包时刻，覆盖掉上面对
+		// ModTime/ModDate 的统一——留着它们等于统一没做。
+		// 其余记录（对齐、uid/gid 等）不动。
+		e.LocalExtra = stripTimeExtra(e.LocalExtra)
+		e.CentralExtra = stripTimeExtra(e.CentralExtra)
 	}
 
 	art.Note("A14 元数据统一化：%d 个条目的时间戳统一为 %s",
 		len(art.Entries()), stamp.Format("2006-01-02 15:04:05"))
 	art.Stat("A14.entries", fmt.Sprint(len(art.Entries())))
 	return nil
+}
+
+// stripTimeExtra 移除扩展字段里「携带时间戳」的记录（0x5455 / 0x000a）。
+//
+// ZIP 的扩展时间戳（Extended Timestamp，ID 0x5455）与 NTFS（ID 0x000a）
+// 记录里存着原始打包时刻，且**独立于**中央目录的 DOS 时间字段。A14 若只改
+// DOS 时间，这些记录仍会暴露真实时间，统一就形同虚设。
+func stripTimeExtra(extra []byte) []byte {
+	if len(extra) == 0 {
+		return extra
+	}
+	out := make([]byte, 0, len(extra))
+	p := 0
+	for p+4 <= len(extra) {
+		id := binary.LittleEndian.Uint16(extra[p:])
+		n := int(binary.LittleEndian.Uint16(extra[p+2:]))
+		if p+4+n > len(extra) {
+			// 声明长度超出剩余字节：残尾，原样保留（交给 sanitizeExtra 处理）。
+			out = append(out, extra[p:]...)
+			break
+		}
+		if id != 0x5455 && id != 0x000a {
+			out = append(out, extra[p:p+4+n]...)
+		}
+		p += 4 + n
+	}
+	if p < len(extra) && len(out) == 0 {
+		return extra
+	}
+	return out
 }
 
 // ---- A9 伪 DEX magic 填充块 ----

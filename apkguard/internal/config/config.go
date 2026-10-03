@@ -151,7 +151,7 @@ func All() []Feature {
 			Note: "可能破坏依赖资源名的第三方 SDK 与热修复框架"},
 		{ID: "A6", Name: "控制流混淆", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
 			Desc: "基本块平坦化、虚假分支（不透明谓词）、指令替换",
-			Note: "实现已就位但暂未开放：改写方法体需要寄存器类型/活跃性分析，当前形态在真实应用上会触发 ART 的宽值类型冲突（详见 realworld 实测记录）"},
+			Note: "仅做可证明安全的两类改写：恒真不透明谓词与不可达前向跳转块；不做基本块平坦化。改寄存器此前会触发 ART 宽值类型冲突，已修为「只选未被任何指令引用的寄存器」并计入宽值相邻格，三个真实应用实测正常"},
 		{ID: "A7", Name: "反射化调用", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
 			Desc: "将敏感 API 调用改为 Class.forName + getMethod + invoke",
 			Note: "性能下降明显，且是逆向者的强信号"},
@@ -174,8 +174,8 @@ func All() []Feature {
 			Desc: "生成默认包类、超长类名路径（30+ 层）、类数量膨胀",
 			Note: "显著增大体积；注入空类会被识破，需生成真实类"},
 		{ID: "A14", Name: "时间戳与元数据统一化", Group: GroupObf, Stage: StageSign, Risk: RiskSafe, Default: true,
-			Desc: "统一 ZIP 条目的时间戳、create_system、flag_bits 等元数据",
-			Note: "零体积成本；消除「被重新打包」的取证痕迹"},
+			Desc: "统一 ZIP 条目的时间戳与 create_system，并清除条目注释与时间类扩展字段",
+			Note: "零体积成本；消除「被重新打包」的取证痕迹。刻意不改 flag_bits——UTF-8 名称位（bit 11）必须保留，否则非 ASCII 条目名会被读方按 CP437 解码"},
 
 		{ID: "A15", Name: "巨型 Manifest 填充", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
 			Desc: "把 AndroidManifest.xml 膨胀到数百 MB（零填充 + 巨型假 chunk，真实内容置于末尾）",
@@ -490,7 +490,13 @@ func (o *Options) Validate() error {
 	deps := map[FeatureID][]dep{
 		"B1": {{"B2", "DEX 整体加密需要壳 Application 才能解密加载"},
 			{"B3", "DEX 整体加密需要 ClassLoader 接管才能加载解密后的 DEX"}},
-		"B3": {{"B2", "ClassLoader 接管需要壳 Application 提供最早执行时机"}},
+		// B3 必须同时依赖 B1：没有加密载荷时 B3 会提前返回、**不注入 Loader
+		// 类体**，只在 Note 里说「退化为纯 Application 代理」；但 B2 只要看到
+		// B3 启用就会让壳生成对 Loader.a 的调用。结果产物引用一个从未定义的
+		// Loader 类，应用一启动就 NoClassDefFoundError——而 Validate 与 CLI
+		// 都报成功。把 B1 写进依赖表，从配置层就堵死这个组合。
+		"B3": {{"B1", "ClassLoader 接管需要加密载荷，否则壳不会注入 Loader 类体"},
+			{"B2", "ClassLoader 接管需要壳 Application 提供最早执行时机"}},
 		"B4": {{"B1", "多 DEX 拆分需要 DEX 加密才能体现防护价值"}},
 		"B8": {{"B1", "载荷容器化需要先有加密载荷"}},
 		// C2 把 lib/<abi>/*.so 整体移进 assets，应用再也拿不到这些库，

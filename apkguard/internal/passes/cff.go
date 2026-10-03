@@ -14,9 +14,9 @@ import (
 
 // controlFlow 注入不透明谓词并做等价指令替换。
 //
-// 本 Pass **只定义类型，不在 Registry 中注册**：注册顺序属于 passes.go，
-// 由主会话统一维护。正确的注册位置是 A4（dropDebugInfo）之后、A9（fakeDex）
-// 之前，理由见 docs/方案-A6-控制流混淆.md §3：
+// 注册由 passes.go 统一维护（见其中的 r.Register(&controlFlow{})），
+// 注册位置是 A4（dropDebugInfo）之后、A9（fakeDex）之前，
+// 理由见 docs/方案-A6-控制流混淆.md §3：
 //   - 必须在 A1 之后（减少重复重建、分支分析更稳定）；
 //   - 必须在 A4 之后（A6 会大幅平移指令地址，若 debug_info 还在会指向错位地址）；
 //   - 必须在 B1 之前（B1 之后就没有明文 DEX 可改）；
