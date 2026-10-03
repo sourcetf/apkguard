@@ -99,6 +99,12 @@ jobs:
         working-directory: apkguard
         run: go test ./... -count=1
 
+      # 竞态检测单独一步：E5 批量处理会并发跑流水线，而普通 go test 查不出数据竞争。
+      # ubuntu runner 自带 gcc，-race 可用（本机 Windows 侧没有 cgo 工具链，跑不了）。
+      - name: 单元测试（竞态检测）
+        working-directory: apkguard
+        run: CGO_ENABLED=1 go test -race ./... -count=1
+
       - name: CLI 冒烟测试
         working-directory: apkguard
         run: |

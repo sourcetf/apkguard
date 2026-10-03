@@ -16,6 +16,9 @@ FAIL=0
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 ok()   { printf '    \033[32m✓ %s\033[0m\n' "$1"; }
 bad()  { printf '    \033[31m✗ %s\033[0m\n' "$1"; FAIL=1; }
+# warn：醒目提示但不置 FAIL —— 用于「环境缺失导致某项检查没跑」这类覆盖缺口。
+# 刻意不静默：缺检查项和检查通过必须能区分开。
+warn() { printf '    \033[33m! %s\033[0m\n' "$1"; }
 
 # 选一个**真正可用**的 python：Windows 上 python3 常指向应用商店的空壳
 # （命令存在但执行即失败），因此必须实际跑一次才算数。功能项计数与原生库
@@ -70,6 +73,19 @@ done
 
 step "单元测试"
 (cd "$APP" && go test ./... -count=1) && ok "测试全绿" || bad "测试失败"
+
+step "单元测试（竞态检测）"
+# E5 批量处理会并发跑流水线，普通 go test 查不出数据竞争。-race 需要 cgo + C 编译器；
+# 缺了就**明确跳过并告警**（CI 上一定会跑），不能让它静默消失。
+if command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
+  if (cd "$APP" && CGO_ENABLED=1 go test -race ./... -count=1); then
+    ok "无数据竞争"
+  else
+    bad "竞态检测失败"
+  fi
+else
+  warn "本机没有 C 编译器，-race 未执行（CI 上会跑；这是覆盖缺口，不是通过）"
+fi
 
 step "CLI 冒烟测试"
 BIN="$APP/dist/apkguard-linux-amd64"
