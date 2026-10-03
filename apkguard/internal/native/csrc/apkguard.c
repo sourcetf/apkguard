@@ -573,7 +573,12 @@ static int ag_same4(const uint8_t *a, const uint8_t *b) {
 }
 
 static int ag_zip_data_offset(int fd, const char *want, uint64_t *out) {
-	static uint8_t buf[66000];
+	/*
+	 * 线程局部：D4 的看门狗线程每 3 秒调一次 ag_intact，Java 侧也可能调用
+	 * Native.intact；两者共用同一个 static 缓冲区会互相踩，轻则解析失败降级，
+	 * 重则算出错位的偏移 → 摘要不匹配 → 看门狗把**正常的应用**杀掉。
+	 */
+	static __thread uint8_t buf[66000];
 	uint64_t fsz, tail, start, cd_off, cd_size, pos, end;
 	uint8_t *p = 0;
 	int n, i, want_len = 0;
@@ -757,7 +762,7 @@ static int ag_self_path(char *out, int cap) {
 
 /* ag_hash_region 把文件 [off, off+size) 区间喂给摘要器。 */
 static int ag_hash_region(int fd, ag_sha256 *sh, uint64_t off, uint64_t size) {
-	static uint8_t chunk[8192];
+	uint8_t chunk[8192];
 	uint64_t done = 0;
 	if (ag_seek(fd, (int64_t)off) != 0) {
 		return 0;
