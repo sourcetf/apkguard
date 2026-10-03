@@ -83,14 +83,7 @@ func TestArtifactFieldOps(t *testing.T) {
 		if len(assets) == 0 || !hasLoaderClass(g) {
 			continue
 		}
-		env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
-		restore := installLoaderMocks(env)
-		installActivityThreadMock()
-		fakeCode = map[string]uint32{}
-		registerFakeCode(t, g, allClassNames(t, g)...)
-		for k, h := range crashHandlerDeps() {
-			fakeCalls[k] = h
-		}
+		env, cleanup := prepareShellChain(t, g, apk, assets)
 		if idx, off := findMethod(t, g, "Lcom/apkguard/shell/Loader;", "->"+LoaderEntry+"("); off != 0 {
 			if _, rerr := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); rerr == nil {
 				for name, blob := range env.fs {
@@ -98,11 +91,11 @@ func TestArtifactFieldOps(t *testing.T) {
 						total += checkFieldOps(t, filepath.Base(apk)+" 载荷 "+filepath.Base(name), pg)
 					}
 				}
+			} else {
+				t.Logf("%s 的壳链路未能执行（%v），跳过其载荷扫描", filepath.Base(apk), rerr)
 			}
 		}
-		restore()
-		clearActivityThreadMock()
-		fakeCode = map[string]uint32{}
+		cleanup()
 	}
 	t.Logf("体检了 %d 条字段访问指令", total)
 }

@@ -18,15 +18,10 @@ import (
 func TestRustDeskPayloadHasApplication(t *testing.T) {
 	apk := rustdeskAPK(t)
 	g, assets := apkShellDex(t, apk)
-	env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
-	restore := installLoaderMocks(env)
-	defer restore()
-	installActivityThreadMock()
-	defer clearActivityThreadMock()
-	fakeCode = map[string]uint32{}
-	defer func() { fakeCode = map[string]uint32{} }()
-	registerFakeCode(t, g, allClassNames(t, g)...)
-
+	// 与其它真实产物测试共用同一套替身准备：缺 native 桥接替身时，
+	// 带 C1 的产物会在 Loader 里报「解释器未实现的方法调用」。
+	env, cleanup := prepareShellChain(t, g, apk, assets)
+	defer cleanup()
 	idx, off := findMethod(t, g, "Lcom/apkguard/shell/Loader;", "->"+LoaderEntry+"(")
 	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
 		t.Fatalf("壳链路执行失败: %v", err)

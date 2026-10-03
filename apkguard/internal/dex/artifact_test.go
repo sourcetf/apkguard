@@ -2,6 +2,9 @@ package dex
 
 import (
 	"archive/zip"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/asn1"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -227,6 +230,113 @@ func installNativeKeyMocks(t *testing.T, apk string) {
 			k := native.DeriveKey(digest)
 			return 0, &fakeBytes{b: k[:]}, nil
 		}
+}
+
+// apkSignerDigest 从 APK **自身**的签名证书算出 SHA-256。
+//
+// 这是 C1（密钥 native 派生）的派生输入之一。为什么不继续只读外部
+// signer-sha256.txt：那个文件是 e2e 用 apksigner --print-certs 生成的，
+// 只覆盖 deliver/ 目录；换一个目录、换一次签名，值就对不上，而**用错摘要的
+// 后果是解出垃圾数据**（测试会以很费解的方式失败）。从 APK 自己的
+// META-INF/CERT.RSA 里取证书，任何产物都自洽。
+func apkSignerDigest(t *testing.T, apk string) []byte {
+	t.Helper()
+	zr, err := zip.OpenReader(apk)
+	if err != nil {
+		t.Fatalf("打开 %s 失败: %v", apk, err)
+	}
+	defer zr.Close()
+	var der []byte
+	for _, f := range zr.File {
+		n := strings.ToUpper(f.Name)
+		if strings.HasPrefix(n, "META-INF/") && (strings.HasSuffix(n, ".RSA") || strings.HasSuffix(n, ".DSA") || strings.HasSuffix(n, ".EC")) {
+			rc, err := f.Open()
+			if err != nil {
+				continue
+			}
+			der, _ = io.ReadAll(rc)
+			rc.Close()
+			break
+		}
+	}
+	if len(der) == 0 {
+		return nil
+	}
+	// 解析 PKCS#7：ContentInfo -> [0] SignedData -> [0] certificates。
+	type contentInfo struct {
+		ContentType asn1.ObjectIdentifier
+		Content     asn1.RawValue `asn1:"explicit,optional,tag:0"`
+	}
+	type signedData struct {
+		Version          int
+		DigestAlgorithms asn1.RawValue `asn1:"set"`
+		ContentInfo      asn1.RawValue
+		Certificates     asn1.RawValue `asn1:"optional,tag:0"`
+	}
+	var ci contentInfo
+	if _, err := asn1.Unmarshal(der, &ci); err != nil {
+		return nil
+	}
+	var sd signedData
+	if _, err := asn1.Unmarshal(ci.Content.Bytes, &sd); err != nil {
+		return nil
+	}
+	var first asn1.RawValue
+	if _, err := asn1.Unmarshal(sd.Certificates.Bytes, &first); err != nil {
+		return nil
+	}
+	cert, err := x509.ParseCertificate(first.FullBytes)
+	if err != nil {
+		return nil
+	}
+	sum := sha256.Sum256(cert.Raw)
+	return sum[:]
+}
+
+// prepareShellChain 为「在解释器里跑一遍壳的 Loader」装好全部替身。
+//
+// 为什么需要统一：Loader 会调注入的检测类（D1 签名校验、C1 的 native 桥接…），
+// 这些代码又去调框架 API 与 native 方法。解释器只执行字节码，凡是它不实现的
+// 外部调用都必须先装替身，否则链路会在半途报
+// 「解释器未实现的方法调用 Landroid/content/pm/PackageManager;…」。
+//
+// 此前只有 auditAPK 装了全套替身，另外几个直接调 Loader 的测试没装：在老的
+// 真实应用产物上恰好没触发（那些产物的 C1 接线是断的、密钥被内联了），换成
+// 带 C1 的当前产物就一律失败——CI 上就是这么暴露的。
+//
+// 返回的 cleanup 负责还原全部全局状态。
+func prepareShellChain(t *testing.T, g *File, apk string, assets map[string][]byte) (*loaderEnv, func()) {
+	t.Helper()
+	env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
+	restoreLoader := installLoaderMocks(env)
+	installActivityThreadMock()
+	restoreDebug := installDebugMocks()
+	fakeCode = map[string]uint32{}
+	registerFakeCode(t, g, allClassNames(t, g)...)
+	for k, h := range crashHandlerDeps() {
+		fakeCalls[k] = h
+	}
+	if nativeKeyNeeded(g) {
+		d := apkSignerDigest(t, apk)
+		if d == nil {
+			t.Fatalf("%s 需要 C1 的签名摘要，但既读不到证书（META-INF/*.RSA）也没有外部摘要文件", apk)
+		}
+		fakeCalls[NativeBridgeClass+"->sig(Landroid/content/Context;)[B"] =
+			func(*interp, []int) (int32, any, error) { return 0, &fakeBytes{b: d}, nil }
+		fakeCalls[NativeBridgeClass+"->derive([B)[B"] =
+			func(*interp, []int) (int32, any, error) {
+				k := native.DeriveKey(d)
+				return 0, &fakeBytes{b: k[:]}, nil
+			}
+	}
+	toastLog = &[]string{}
+	return env, func() {
+		restoreLoader()
+		clearActivityThreadMock()
+		restoreDebug()
+		fakeCode = map[string]uint32{}
+		toastLog = nil
+	}
 }
 
 // auditAPK 把交付包里的真实载荷解密出来并检查内容。

@@ -154,14 +154,7 @@ func TestArtifactTryHandlers(t *testing.T) {
 		if len(assets) == 0 || !hasLoaderClass(g) {
 			continue
 		}
-		env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
-		restore := installLoaderMocks(env)
-		installActivityThreadMock()
-		fakeCode = map[string]uint32{}
-		registerFakeCode(t, g, allClassNames(t, g)...)
-		for k, h := range crashHandlerDeps() {
-			fakeCalls[k] = h
-		}
+		env, cleanup := prepareShellChain(t, g, apk, assets)
 		if idx, off := findMethod(t, g, "Lcom/apkguard/shell/Loader;", "->"+LoaderEntry+"("); off != 0 {
 			if _, rerr := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); rerr == nil {
 				for name, blob := range env.fs {
@@ -169,11 +162,13 @@ func TestArtifactTryHandlers(t *testing.T) {
 						total += checkTryHandlers(t, filepath.Base(apk)+" 载荷 "+filepath.Base(name), pg)
 					}
 				}
+			} else {
+				// 不静默：链路跑不起来时载荷就扫不到，而「扫到 0 条」和
+				// 「根本没跑」在结果上无法区分，必须把原因打出来。
+				t.Logf("%s 的壳链路未能执行（%v），跳过其载荷扫描", filepath.Base(apk), rerr)
 			}
 		}
-		restore()
-		clearActivityThreadMock()
-		fakeCode = map[string]uint32{}
+		cleanup()
 	}
 	t.Logf("检查了 %d 个 try_item", total)
 }
@@ -185,14 +180,10 @@ func TestArtifactTryHandlers(t *testing.T) {
 func TestRealWorldPayloadTryHandlers(t *testing.T) {
 	apk, isRealApp := realAppAPK(t)
 	g, assets := apkShellDex(t, apk)
-	env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
-	restore := installLoaderMocks(env)
-	defer restore()
-	installActivityThreadMock()
-	defer clearActivityThreadMock()
-	fakeCode = map[string]uint32{}
-	defer func() { fakeCode = map[string]uint32{} }()
-	registerFakeCode(t, g, allClassNames(t, g)...)
+	// 用统一的准备函数：它会把框架 API 与 native 桥接的替身一并装好。
+	// 缺了后者时，带 C1 的产物会在 Loader 里报「解释器未实现的方法调用」。
+	env, cleanup := prepareShellChain(t, g, apk, assets)
+	defer cleanup()
 	idx, off := findMethod(t, g, "Lcom/apkguard/shell/Loader;", "->"+LoaderEntry+"(")
 	if _, err := runPadMethod(g, idx, off, &fakeObj{desc: descContext}); err != nil {
 		t.Fatalf("壳链路执行失败: %v", err)
