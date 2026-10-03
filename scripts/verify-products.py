@@ -15,6 +15,7 @@
 
 import io
 import re
+import struct
 import sys
 import unicodedata
 import zipfile
@@ -136,6 +137,109 @@ def source_file_indexes(data):
         base = off + i * CLASS_DEF_SIZE + CLASS_DEF_SOURCE_FILE_IDX
         out.append(int.from_bytes(data[base:base + 4], "little"))
     return out
+
+
+# android 框架属性名 -> 资源 ID。Android 解析属性名用的是**资源 ID**，
+# 不是字符串，所以下面这张表用来核对 resource map 是否覆盖到注入的属性。
+ANDROID_ATTR_IDS = {
+    "name": 0x01010003, "label": 0x01010001, "enabled": 0x0101000E,
+    "exported": 0x01010010, "authorities": 0x01010018, "permission": 0x01010006,
+    "process": 0x01010011, "value": 0x01010024, "resource": 0x01010025,
+    "required": 0x0101028E, "targetActivity": 0x01010202,
+    "appComponentFactory": 0x0101057A,
+}
+
+
+def _axml_chunks(data):
+    """遍历 AXML 的子 chunk（跳过 8 字节的 ResXMLTree_header）。"""
+    if len(data) < 8:
+        return
+    top_type, _, top_size = struct.unpack_from("<HHI", data, 0)
+    if top_type != 0x0003:
+        return
+    off = 8
+    end = min(top_size, len(data))
+    while off + 8 <= end:
+        t, _hdr, size = struct.unpack_from("<HHI", data, off)
+        if size < 8 or off + size > end:
+            return
+        yield off, t, size
+        off += size
+
+
+def _axml_strings(data, off, size):
+    hdr = struct.unpack_from("<HHI", data, off)[1]
+    cnt, _sty, flags, strstart, _stystart = struct.unpack_from("<IIIII", data, off + 8)
+    utf8 = bool(flags & (1 << 8))
+    offs = struct.unpack_from("<%dI" % cnt, data, off + hdr)
+    out = []
+    for o in offs:
+        p = off + strstart + o
+        if utf8:
+            n = data[p]
+            if n & 0x80:
+                n = ((n & 0x7F) << 8) | data[p + 1]
+                p += 2
+            else:
+                p += 1
+            out.append(data[p:p + n].decode("utf-8", "replace"))
+        else:
+            n = struct.unpack_from("<H", data, p)[0]
+            p += 2
+            if n & 0x8000:
+                n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", data, p)[0]
+                p += 2
+            out.append(data[p:p + n * 2].decode("utf-16-le", "replace"))
+    return out
+
+
+def axml_attr_resid_problems(raw):
+    """检查 Manifest 里 android 命名空间的框架属性名是否都能解析出资源 ID。
+
+    返回问题描述列表。这是**安装期硬要求**：resource map 是按字符串索引对齐的
+    数组，索引超出长度的属性会被框架当成「未知属性」。曾因此产出装不上的包：
+
+        INSTALL_PARSE_FAILED_MANIFEST_MALFORMED:
+          <meta-data> requires an android:value or android:resource attribute
+
+    诱因是 A18 注入 <meta-data android:value="…"> 时，`value` 是池里的新字符串，
+    落在 resource map 覆盖范围之外。真实应用恰好自己用过 value/required，
+    所以只有 Manifest 属性少的小应用才暴露——产物断言必须独立守住这条。
+    """
+    pool = rmap = None
+    for off, t, size in _axml_chunks(raw):
+        if t == 0x0001 and pool is None:
+            pool = _axml_strings(raw, off, size)
+        elif t == 0x0180:
+            n = (size - 8) // 4
+            rmap = list(struct.unpack_from("<%dI" % n, raw, off + 8))
+    if pool is None:
+        return ["Manifest 里找不到字符串池"]
+    if rmap is None:
+        return ["Manifest 里没有 RES_XML_RESOURCE_MAP（框架无法按资源 ID 解析任何属性）"]
+    problems = []
+    for off, t, size in _axml_chunks(raw):
+        if t != 0x0102:  # RES_XML_START_ELEMENT
+            continue
+        hdr = struct.unpack_from("<HHI", raw, off)[1]
+        a = off + hdr
+        name_i, attr_start, attr_size, cnt = struct.unpack_from("<IHHH", raw, a + 4)
+        elem = pool[name_i] if name_i < len(pool) else "?"
+        for k in range(cnt):
+            p = a + attr_start + k * attr_size
+            _ns, anm = struct.unpack_from("<II", raw, p)
+            if anm >= len(pool):
+                continue
+            an = pool[anm]
+            if an not in ANDROID_ATTR_IDS:
+                continue
+            if anm >= len(rmap):
+                problems.append("<%s> 的属性 %s（字符串索引 %d）超出 resource map 长度 %d："
+                                "框架会把它当成未知属性" % (elem, an, anm, len(rmap)))
+            elif rmap[anm] != ANDROID_ATTR_IDS[an]:
+                problems.append("<%s> 的属性 %s 资源 ID 错误：resource_map[%d]=0x%08x，期望 0x%08x"
+                                % (elem, an, anm, rmap[anm], ANDROID_ATTR_IDS[an]))
+    return problems
 
 
 def manifest_contains(raw, needle):
@@ -309,6 +413,14 @@ class Checker:
                     self.check(False, "A14",
                                "以下条目残留 1980 默认时间戳（签名阶段新增的条目未沿用统一时间）：%s"
                                % names[:6])
+
+        # ---- 无条件：Manifest 的属性必须都能按资源 ID 解析（安装期硬要求）----
+        #
+        # 这一条与具体功能项无关：任何往 Manifest 注入元素的 Pass（A8/A16/A18…）
+        # 都可能因为新属性名没有资源 ID 而产出**装不上**的包，而 apksigner 与
+        # zipalign 都不会报错（它们不解析 Manifest）。所以必须在这里守住。
+        for prob in axml_attr_resid_problems(self.manifest):
+            self.check(False, "ALL", "Manifest 属性资源 ID 异常：" + prob)
 
         # ---- B1 DEX 整体加密：明文业务类不在 classes.dex 里，载荷在 assets/ ----
         #

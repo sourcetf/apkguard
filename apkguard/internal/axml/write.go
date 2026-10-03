@@ -78,6 +78,91 @@ type Edit struct {
 	AddElements []NewElement
 }
 
+// androidAttrResID 是 android 框架属性名到其资源 ID 的映射。
+//
+// **为什么必须维护这张表**：Android 解析属性名用的是**资源 ID**，不是字符串。
+// AXML 里紧跟在字符串池后有一个 RES_XML_RESOURCE_MAP 块，它是按字符串索引
+// 对齐的数组：字符串池第 i 个串的属性资源 ID 就是 map[i]（仅前 len(map) 个）。
+// 框架取属性值走 getAttributeNameResID()，索引超出 map 范围就返回 0，
+// 视作「不是已知的 android 属性」。
+//
+// 后果很具体：A18 往 Manifest 插 `<meta-data android:value="…">`，而 `value`
+// 这个属性名在原本的池里**不存在**，会被追加到池尾（索引 ≥ len(map)）。
+// 若不把它写进 resource map，框架就找不到 android:value，直接拒绝安装：
+//
+//	INSTALL_PARSE_FAILED_MANIFEST_MALFORMED:
+//	  <meta-data> requires an android:value or android:resource attribute
+//
+// 之所以在三个真实应用上没暴露：它们的 Manifest 自己就用了 value/required/
+// enabled，这些名字早已落在 map 覆盖范围内——**Manifest 属性少的小应用才会中招**。
+// 表里的 ID 取自公开 SDK 常量，已逐个用真实 Manifest 的 resource map 核对过。
+var androidAttrResID = map[string]uint32{
+	"name":                0x01010003,
+	"label":               0x01010001,
+	"enabled":             0x0101000e,
+	"exported":            0x01010010,
+	"authorities":         0x01010018,
+	"permission":          0x01010006,
+	"process":             0x01010011,
+	"value":               0x01010024,
+	"resource":            0x01010025,
+	"required":            0x0101028e,
+	"targetActivity":      0x01010202,
+	"appComponentFactory": 0x0101057a,
+}
+
+// origResourceIDs 读取原文件的属性资源 ID 表（下标即字符串索引）。
+func (f *File) origResourceIDs() []uint32 {
+	d := f.data
+	for off := 8; off+8 <= len(d); {
+		typ := binary.LittleEndian.Uint16(d[off:])
+		size := int(binary.LittleEndian.Uint32(d[off+4:]))
+		if size < 8 || off+size > len(d) {
+			break
+		}
+		if typ == TypeXMLResource {
+			n := (size - 8) / 4
+			out := make([]uint32, n)
+			for i := 0; i < n; i++ {
+				out[i] = binary.LittleEndian.Uint32(d[off+8+i*4:])
+			}
+			return out
+		}
+		off += size
+	}
+	return nil
+}
+
+// buildResourceMap 生成新的 RES_XML_RESOURCE_MAP 块。
+//
+// 在原表基础上扩展，使新追加的属性名（索引超出原表长度）也能拿到资源 ID；
+// 中间的空洞填 0（表示「该字符串不是带资源 ID 的属性名」）。
+// 长度不得超过字符串总数，否则框架会判定 resource map 非法。
+func buildResourceMap(orig []uint32, needed map[uint32]uint32, strCount int) ([]byte, error) {
+	n := len(orig)
+	for idx := range needed {
+		if int(idx)+1 > n {
+			n = int(idx) + 1
+		}
+	}
+	if n > strCount {
+		return nil, fmt.Errorf("axml: resource map 长度 %d 超过字符串总数 %d", n, strCount)
+	}
+	blob := make([]byte, 8+4*n)
+	binary.LittleEndian.PutUint16(blob[0:], TypeXMLResource)
+	binary.LittleEndian.PutUint16(blob[2:], 8) // headerSize
+	binary.LittleEndian.PutUint32(blob[4:], uint32(8+4*n))
+	for i := 0; i < len(orig) && i < n; i++ {
+		binary.LittleEndian.PutUint32(blob[8+i*4:], orig[i])
+	}
+	for idx, id := range needed {
+		if int(idx) < n {
+			binary.LittleEndian.PutUint32(blob[8+int(idx)*4:], id)
+		}
+	}
+	return blob, nil
+}
+
 // Rewrite 按 edit 改写二进制 XML，返回新的字节流。
 //
 // 关键设计：**保持原字符串池的索引顺序不变**，只替换文本内容；
@@ -117,6 +202,20 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 		return j
 	}
 
+	// 新追加的**属性名**若属于 android 命名空间，必须在 resource map 里有
+	// 资源 ID，否则框架认不出这个属性（详见 androidAttrResID 的说明）。
+	// 原表覆盖不到的索引记在 needed 里，稍后统一扩展。
+	origIDs := f.origResourceIDs()
+	needed := map[uint32]uint32{}
+	noteAttrName := func(nsIdx, nameIdx uint32) {
+		if nsIdx == noEntry || int(nameIdx) < len(origIDs) {
+			return // 无命名空间，或原表已覆盖（既有属性的 ID 无需动）
+		}
+		if id, ok := androidAttrResID[values[nameIdx]]; ok {
+			needed[nameIdx] = id
+		}
+	}
+
 	// ---- 2) 解析每条属性改写，收集要插入的属性与要改值的属性 ----
 	type insertion struct {
 		off   int // 目标 start element 块在原始数据中的偏移
@@ -138,6 +237,7 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 			nsIdx = intern(av.NS)
 		}
 		nameIdx := intern(av.Name)
+		noteAttrName(nsIdx, nameIdx)
 		valIdx := intern(av.Value)
 
 		if a := el.AttrNS(av.NS, av.Name); a != nil {
@@ -177,7 +277,9 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 				nsIdx = intern(na.NS)
 			}
 			binary.LittleEndian.PutUint32(e[0:], nsIdx)
-			binary.LittleEndian.PutUint32(e[4:], intern(na.Name))
+			naIdx := intern(na.Name)
+			noteAttrName(nsIdx, naIdx)
+			binary.LittleEndian.PutUint32(e[4:], naIdx)
 			switch {
 			case na.strVal != nil:
 				valIdx := intern(*na.strVal)
@@ -223,7 +325,15 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 		insByOff[in.off] = append(insByOff[in.off], in.entry)
 	}
 
-	out := make([]byte, 0, len(f.data)+len(poolBlob))
+	// resource map 块要按 needed 重建（不能原样拷贝——新属性名会没有 ID）。
+	// 原文件若根本没有该块（极少见），就补一个。
+	newRMap, err := buildResourceMap(origIDs, needed, len(values))
+	if err != nil {
+		return nil, err
+	}
+	sawRMap := false
+
+	out := make([]byte, 0, len(f.data)+len(poolBlob)+len(newRMap))
 	out = append(out, f.data[:rootHeaderSize]...)
 	out = append(out, poolBlob...)
 
@@ -235,6 +345,16 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 			break
 		}
 		if typ == TypeStringPool {
+			off += size
+			continue
+		}
+		if typ == TypeXMLResource {
+			// 用重建后的表替换原块（长度可能变长，索引按字符串索引对齐）。
+			out = append(out, newRMap...)
+			sawRMap = true
+			for _, pre := range insertBefore[off] {
+				out = append(out, pre...)
+			}
 			off += size
 			continue
 		}
@@ -262,6 +382,14 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 		}
 		out = append(out, blob...)
 		off += size
+	}
+
+	// 原文件没有 resource map 块时补一个（紧跟在池之后，符合块顺序约定）。
+	if !sawRMap && len(needed) > 0 {
+		rest := append([]byte(nil), out[rootHeaderSize+len(poolBlob):]...)
+		out = out[:rootHeaderSize+len(poolBlob)]
+		out = append(out, newRMap...)
+		out = append(out, rest...)
 	}
 
 	// ---- 6) 修正根块与池块的总长度 ----

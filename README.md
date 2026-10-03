@@ -249,6 +249,13 @@ A5/A11 的**决定性判据**（资源 ID 逐条不变）用 Android 官方 `aap
   2025-11 起对 targetSdk 35 的提交强制检查）；CI 与 `build_native.py --check`
   都会断言这一点。若自行改了 C 代码，记得用 NDK r26+ 重新构建（脚本已带上
   `-Wl,-z,max-page-size=16384`）。
+- **注入 Manifest 属性会自动补资源 ID**：Android 按**资源 ID**（不是字符串）解析属性名，
+  而 AXML 的 `RES_XML_RESOURCE_MAP` 只覆盖字符串池的前若干条。往 Manifest 插
+  `<meta-data android:value="…">` 时 `value` 通常是新字符串、落在覆盖范围之外，
+  框架就认不出该属性，直接拒绝安装（`INSTALL_PARSE_FAILED_MANIFEST_MALFORMED`）。
+  改写器现在会为新追加的 android 属性名补上正确的资源 ID（原文件没有该块时补一个），
+  并有独立单测与产物级断言守住。**Manifest 属性少的小应用最容易中招**——
+  大应用早已用过 `value`/`required`/`enabled`，反而掩盖了这个问题。
 - **执行顺序 = 注册顺序**：不按 Level 排序（那样会把「A14 在 B1 之后」这类跨层约束
   打乱）。Level（`In()`/`Out()`）是一份**被校验的声明**——注册序列上的层次链必须连续，
   不连续时 pipeline 直接报错，绝不静默重排。注释里写明的顺序约束都有对应的可执行断言
