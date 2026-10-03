@@ -19,6 +19,10 @@ var (
 	// ErrBadLayout 表示段的尺寸与偏移自相矛盾（例如 size 为 0 却给了非 0 偏移）。
 	// ART 的校验器同样会拒绝这类文件，因此必须在本地就拦下。
 	ErrBadLayout = errors.New("dex: 段布局非法")
+	// ErrUnsupportedCallSite 表示输入含 call_site_ids / method_handles 段
+	// （或引用它们的 0xfa-0xfe 指令）。本工具重建时会丢弃这两个段且不重排
+	// 其索引，继续会产出结构非法的 DEX，因此显式拒绝而不是静默产出坏文件。
+	ErrUnsupportedCallSite = errors.New("dex: 含 call_site_ids/method_handles，本工具尚不支持重建")
 )
 
 // ---- LEB128 ----

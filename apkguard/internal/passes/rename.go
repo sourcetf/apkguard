@@ -552,10 +552,20 @@ func splitKeepRules(s string) []string {
 	return out
 }
 
-// manifestComponents 从 AndroidManifest.xml 中提取组件类名。
+// manifestComponents 从 AndroidManifest.xml 中提取组件类名（Java 点分名）。
 //
 // 解析失败（例如样本的畸形 Manifest）时返回空列表，不阻断流程——
 // 此时 A1 会退化为「仅依赖内置白名单」，仍然安全（更保守）。
+//
+// **必须把相对名按 manifest 的 package 归一化**：Android 允许组件名写成
+// ".MainActivity"（相对 package）甚至 "MainActivity"（不带点，同样相对），
+// 运行时由 PackageParser.buildClassName 补全。下游（internal/dex 的重命名器）
+// 用 `"L" + strings.ReplaceAll(n, ".", "/") + ";"` 把返回的名字转成描述符，
+// 若这里原样返回 ".MainActivity"，会得到与真实类不匹配的 "L/MainActivity;"，
+// 组件类因此进不了保留集、被 A1 改名，应用启动即 ClassNotFoundException。
+//
+// 除各组件元素的 android:name 外，activity-alias 的 android:targetActivity
+// 也是组件类名（别名真正指向的 Activity），同样必须保留。
 func manifestComponents(art *pipeline.Artifact) []string {
 	e := pipeline.Find(art, "AndroidManifest.xml")
 	if e == nil {
@@ -569,7 +579,66 @@ func manifestComponents(art *pipeline.Artifact) []string {
 	if err != nil {
 		return nil
 	}
-	return f.ComponentClasses()
+
+	pkg := ""
+	if m := f.FindElement("manifest"); m != nil {
+		pkg = strings.TrimSpace(m.AttrString("package"))
+	}
+
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		n := resolveComponentName(pkg, name)
+		if n == "" || seen[n] {
+			return
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	// android:name 覆盖 application 与 activity/service/receiver/provider 等。
+	for _, n := range f.ComponentClasses() {
+		add(n)
+	}
+	// targetActivity 只出现在 <activity-alias> 上，且不在 ComponentClasses 的覆盖内。
+	for _, el := range f.Elements {
+		if el.Name != "activity-alias" {
+			continue
+		}
+		if a := el.Attr("targetActivity"); a != nil {
+			add(a.RawValue)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// resolveComponentName 把 Manifest 中声明的组件名解析为完整 Java 类名。
+//
+// 语义与 AOSP 的 PackageParser.buildClassName 一致：
+//   - ".X"   -> pkg + ".X"
+//   - "X"    -> pkg + "." + X（不含点即视为相对名）
+//   - "a.b.C" -> 原样（绝对名）
+//
+// pkg 为空（Manifest 没有 package 属性）时相对名无法补全，返回空串由调用方丢弃；
+// 此时保留集会退化为「仅内置白名单」，仍比保留一个匹配不上任何类的错误名字更安全。
+func resolveComponentName(pkg, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if strings.HasPrefix(name, ".") {
+		if pkg == "" {
+			return ""
+		}
+		return pkg + name
+	}
+	if !strings.Contains(name, ".") {
+		if pkg == "" {
+			return ""
+		}
+		return pkg + "." + name
+	}
+	return name
 }
 
 // passiveClassRefs 返回「被非 DEX 内容按名字引用」的类（Java 点分名）。

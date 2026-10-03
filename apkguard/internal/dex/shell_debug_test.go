@@ -74,6 +74,16 @@ func crashHandlerDeps() map[string]func(in *interp, regs []int) (int32, any, err
 			}
 			return 0, nil, nil
 		},
+		// ClassLoader 接管失败时注入代码会写 Log.w（非 debug 产物的唯一线索）。
+		// 这里也必须能分派，否则失败路径会以「解释器未实现的方法调用」中止。
+		"Landroid/util/Log;->w(Ljava/lang/String;Ljava/lang/String;)I": func(in *interp, regs []int) (int32, any, error) {
+			tag, _ := in.objs[regs[0]].(*fakeStr)
+			msg, _ := in.objs[regs[1]].(*fakeStr)
+			if tag != nil && msg != nil {
+				logLines = append(logLines, tag.s+"|"+msg.s)
+			}
+			return 0, nil, nil
+		},
 		"Landroid/os/Process;->myPid()I": func(in *interp, regs []int) (int32, any, error) { return 4242, nil, nil },
 		"Landroid/os/Process;->killProcess(I)V": func(in *interp, regs []int) (int32, any, error) {
 			killCalls = append(killCalls, int(in.regs[regs[0]]))

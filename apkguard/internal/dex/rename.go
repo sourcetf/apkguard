@@ -395,6 +395,11 @@ func (r *Renamer) Plan() (map[string]string, error) {
 			}
 		}
 	}
+	// 泛型 Signature 属性里的复合串必须单独登记（见 planSignatureRenames）。
+	// 放在数组展开之后：签名串本身不是类描述符，不应派生数组形式。
+	if err := r.planSignatureRenames(out); err != nil {
+		return nil, err
+	}
 	for k, v := range out {
 		if k == v {
 			delete(out, k)
@@ -428,10 +433,16 @@ func (r *Renamer) LastStats() Stats {
 // planClasses 决定类的重命名，返回「被保留的类描述符 -> 原因」。
 func (r *Renamer) planClasses() map[string]string {
 	reflected := r.reflectedClasses()
+	// hasInner 的键必须是**外层类的完整描述符**（查询处用的是 ci.Desc，
+	// 形如 "Lapp/Outer;"）。这里曾写成 ci.Desc[:i+1]（截到 '$' 且含它），
+	// 得到 "Lapp/Outer$"，与任何 ci.Desc 都不相等，于是 keepReason 里
+	// 「含内部类」这条分支永远不命中：外层类被改名、内部类却因含 '$' 被保留，
+	// 运行期用 outer.getName()+"$Inner" 或 Kotlin/Gson 按名反射嵌套类时，
+	// 拼出来的名字在 DEX 里不存在 → ClassNotFoundException。
 	hasInner := map[string]bool{}
 	for _, ci := range r.infos {
 		if i := strings.Index(ci.Desc, "$"); i > 0 {
-			hasInner[ci.Desc[:i+1]] = true
+			hasInner[ci.Desc[:i]+";"] = true
 		}
 	}
 	extra := map[string]bool{}
@@ -483,7 +494,7 @@ func (r *Renamer) keepReason(ci *ClassInfo, extra, reflected, hasInner map[strin
 		return "注解类（按名称反射读取）"
 	case reflected[ci.Desc]:
 		return "类名出现在字符串常量中（可能被反射）"
-	case r.cfg.ReflectedNames[descToJava(ci.Desc)]:
+	case r.reflectedInOtherDex(ci.Desc):
 		return "类名在其它 DEX 的字符串常量中出现（可能被反射）"
 	case isEntryPoint(ci):
 		return "Android 组件/入口类"
@@ -784,8 +795,10 @@ func (r *Renamer) planFields(kept map[string]string) error {
 				all = false
 				break
 			}
-			// 同 planMethods：可见链里找不到声明的字段引用同样不能改名
-			if !r.resolvesVisibly(rf.class, name, rf.sig) {
+			// 同 planMethods：可见链里找不到声明的字段引用同样不能改名。
+			// 注意这里必须用**字段**解析器：rf.sig 是字段类型（"I" 等），
+			// 误用方法解析器会永远找不到声明，字段改名整体失效。
+			if !r.resolvesVisiblyField(rf.class, name, rf.sig) {
 				all = false
 				break
 			}
@@ -1033,6 +1046,219 @@ func descToJava(desc string) string {
 	return strings.ReplaceAll(body, "/", ".")
 }
 
+// reflectedInOtherDex 判断类名是否以点分或斜杠形式出现在其它 DEX 的字符串
+// 常量中（ReflectedNames 由调用方从各 DEX 的 const-string 汇总）。
+//
+// 同一个类的字符串常量有两种常见写法："com.foo.Bar"（Class.forName / 配置）
+// 与 "com/foo/Bar"（资源名、JNI 注册等）。只查点分名会让斜杠写法得不到保护：
+// 类被改名后，运行期按名反射即 ClassNotFoundException。
+func (r *Renamer) reflectedInOtherDex(desc string) bool {
+	if r.cfg.ReflectedNames[descToJava(desc)] {
+		return true
+	}
+	// 斜杠形式 = 类描述符去掉首尾的 L;。
+	if len(desc) >= 3 && desc[0] == 'L' && desc[len(desc)-1] == ';' {
+		return r.cfg.ReflectedNames[desc[1:len(desc)-1]]
+	}
+	return false
+}
+
+// isPlainClassDesc 判断字符串是否为「不含泛型实参/数组」的普通类描述符。
+func isPlainClassDesc(s string) bool {
+	return len(s) >= 3 && s[0] == 'L' && s[len(s)-1] == ';' &&
+		!strings.ContainsAny(s[1:len(s)-1], "<>[")
+}
+
+// planSignatureRenames 把 dalvik.annotation.Signature 注解里的复合泛型串
+// 改写为「旧串 -> 新串」的精确匹配项，交给重建阶段的字符串值改名通道。
+//
+// 为什么走这条通道：重建时字符串池按**字符串值**替换（见 buildPlan 中
+// opts.Rename 的应用处），而 Signature 的值与类描述符不相等，必须显式把整条
+// 复合串登记为改名项，重建才会替换池里的那一条——不另造池改写通道。
+//
+// 只处理**确实含有待改名描述符**的签名串；没有任何命中的串不会产生条目，
+// 保证产物稳定。
+func (r *Renamer) planSignatureRenames(out map[string]string) error {
+	descs := map[string]string{}
+	for old, nw := range r.classRename {
+		if old != nw && isPlainClassDesc(old) {
+			descs[old] = nw
+		}
+	}
+	// 跨 DEX 引用（定义在别的 DEX、本 DEX 只引用）同样要覆盖。
+	for old, nw := range r.cfg.ClassMap {
+		if old == nw || !isPlainClassDesc(old) {
+			continue
+		}
+		if _, definedHere := r.byDesc[old]; definedHere {
+			continue
+		}
+		if _, exists := descs[old]; !exists {
+			descs[old] = nw
+		}
+	}
+	if len(descs) == 0 {
+		return nil
+	}
+	sigs, err := r.f.signatureStrings()
+	if err != nil {
+		return fmt.Errorf("dex: 扫描泛型签名注解失败: %w", err)
+	}
+	for _, sig := range sigs {
+		nw, changed := rewriteSignatureClasses(sig, descs)
+		if !changed {
+			continue
+		}
+		// 签名串恰好等于某个类描述符时，类改名通道已覆盖它，保持原条目。
+		if _, exists := out[sig]; !exists {
+			out[sig] = nw
+		}
+	}
+	return nil
+}
+
+// scanSigClassType 从 sig[i]（必须是 'L'）开始扫描一个 JVM 签名中的类类型，
+// 返回结束下标（配对 ';' 之后）与首个顶层 '<' 的下标（无类型实参时为 -1）。
+// 找不到配对的 ';' 时 ok 为 false，调用方按普通字符处理。
+func scanSigClassType(sig string, i int) (end, argsStart int, ok bool) {
+	depth := 0
+	argsStart = -1
+	for j := i + 1; j < len(sig); j++ {
+		switch sig[j] {
+		case '<':
+			if depth == 0 && argsStart < 0 {
+				argsStart = j
+			}
+			depth++
+		case '>':
+			if depth == 0 {
+				return 0, -1, false
+			}
+			depth--
+		case ';':
+			if depth == 0 {
+				return j + 1, argsStart, true
+			}
+		}
+	}
+	return 0, -1, false
+}
+
+// erasedClassDesc 返回一个类类型 token 的「擦除后描述符」：丢掉泛型实参，
+// 并把内部类的 '.' 分隔写成 '$'。
+func erasedClassDesc(token string) string {
+	var b strings.Builder
+	b.Grow(len(token))
+	b.WriteByte('L')
+	depth := 0
+	for i := 1; i < len(token)-1; i++ {
+		switch c := token[i]; c {
+		case '<':
+			depth++
+		case '>':
+			depth--
+		case '.':
+			if depth == 0 {
+				b.WriteByte('$')
+			}
+		default:
+			if depth == 0 {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte(';')
+	return b.String()
+}
+
+// hasTopLevelDot 判断类类型 token 的名字中是否存在顶层 '.' 分隔（即内部类的
+// Outer.Inner 写法；类型实参内部的 '.' 不算）。
+func hasTopLevelDot(token string) bool {
+	depth := 0
+	for i := 1; i < len(token)-1; i++ {
+		switch token[i] {
+		case '<':
+			depth++
+		case '>':
+			depth--
+		case '.':
+			if depth == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rewriteSignatureClasses 对一条泛型签名字符串做**描述符级**替换：扫描其中
+// 每个 "L...;" 形式的类型（正确处理泛型实参的 <> 嵌套），把命中 rename 表的
+// 旧描述符换为新描述符，类型实参原样保留。
+//
+// 返回替换后的串与是否发生替换。没有任何命中的串返回原串与 false。
+//
+// 例子（rename: Lcom/foo/Bar;->La/a;）：
+//
+//	Ljava/util/List<Lcom/foo/Bar;>;                   -> Ljava/util/List<La/a;>;
+//	Ljava/util/Map<Ljava/lang/String;Lcom/foo/Bar;>;  -> ...<Ljava/lang/String;La/a;>;
+//	Lcom/foo/Bar<Ljava/lang/String;>;                 -> La/a<Ljava/lang/String;>;
+//
+// 保守之处：内部类写法（Lcom/foo/Outer.Inner;）按**擦除后的完整描述符**
+// （Lcom/foo/Outer$Inner;）查表。只命中外层类时不改写——内部类的名字与
+// 外层强耦合，单独换外层会拼出错误的二进制名。
+func rewriteSignatureClasses(sig string, rename map[string]string) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(sig))
+	changed := false
+	for i := 0; i < len(sig); {
+		if sig[i] != 'L' {
+			b.WriteByte(sig[i])
+			i++
+			continue
+		}
+		end, argsStart, ok := scanSigClassType(sig, i)
+		if !ok {
+			b.WriteByte(sig[i])
+			i++
+			continue
+		}
+		token := sig[i:end]
+		if argsStart < 0 {
+			// 无类型实参：整段就是普通类描述符（可能含内部类的 '.' 分隔）。
+			if nw, hit := rename[erasedClassDesc(token)]; hit {
+				b.WriteString(nw)
+				changed = true
+			} else {
+				b.WriteString(token)
+			}
+			i = end
+			continue
+		}
+		// 有类型实参：擦除实参后按完整描述符比对；实参内部仍需递归替换。
+		nw, hit := rename[erasedClassDesc(token)]
+		if !hit {
+			// 未命中：只消费 'L'，让主循环继续处理实参里的类描述符。
+			b.WriteByte('L')
+			i++
+			continue
+		}
+		if hasTopLevelDot(token) {
+			// 内部类的名字分布在 '.' 两侧，无法只换名字主体：直接换成新
+			// 描述符（类型实参被丢弃）。引擎不会重命名内部类，此分支只在
+			// 调用方通过 ClassMap 显式给出内部类映射时可达。
+			b.WriteString(nw)
+		} else {
+			args, _ := rewriteSignatureClasses(sig[argsStart:end-1], rename)
+			b.WriteString("L")
+			b.WriteString(strings.TrimSuffix(strings.TrimPrefix(nw, "L"), ";"))
+			b.WriteString(args)
+			b.WriteString(";")
+		}
+		changed = true
+		i = end
+	}
+	return b.String(), changed
+}
+
 // hasAnyPrefix 判断 s 是否以任一前缀开头。
 func hasAnyPrefix(s string, prefixes []string) bool {
 	for _, p := range prefixes {
@@ -1155,6 +1381,25 @@ func (t *typeResolver) resolvesVisibly(classDesc, name, proto string) bool {
 // resolvesVisibly 是 Renamer 对 typeResolver 的转发。
 func (r *Renamer) resolvesVisibly(classDesc, name, proto string) bool {
 	return r.res.resolvesVisibly(classDesc, name, proto)
+}
+
+// resolvesVisiblyField 判断「类 classDesc 上的 (name, typ) 字段」能否在本集合
+// 可见的继承链里找到声明。
+//
+// 字段引用必须用**字段**解析器（resolveFieldDecl，按 (name, 字段类型) 在
+// StaticFields/InstanceFields 里找）。此前 planFields 误用了方法解析器
+// resolvesVisibly，把字段类型（"I" 等）当方法原型传进去，按 (name, proto)
+// 在 DirectMethods/VirtualMethods 里查找——字段名永远匹配不到任何方法声明，
+// 于是值键路径下 all 恒为 false，一个字段都改不了，ObfuscateFields 形同虚设。
+// 语义与方法侧一致：可见链里找不到声明就不能改名（声明在框架/未打包库里）。
+func (t *typeResolver) resolvesVisiblyField(classDesc, name, typ string) bool {
+	_, _, ok := t.resolveFieldDecl(classDesc, name, typ)
+	return ok
+}
+
+// resolvesVisiblyField 是 Renamer 对 typeResolver 的转发。
+func (r *Renamer) resolvesVisiblyField(classDesc, name, typ string) bool {
+	return r.res.resolvesVisiblyField(classDesc, name, typ)
 }
 
 // resolveMethodDecl 是 Renamer 对 typeResolver 的转发。

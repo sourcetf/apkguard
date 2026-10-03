@@ -169,11 +169,42 @@ var fakeClasses = map[string]*fakeCls{}
 // 解释器必须能进入该方法体，因此需要这份索引。
 var fakeCode = map[string]uint32{}
 
+// regKind 标记寄存器槽位的值类型。
+//
+// 宽值（long/double）在 DEX 里占**两个**相邻寄存器（低半 r、高半 r+1）。
+// 只存 int32 无法表达「相邻格属于同一个值」，也就无法验证 A6 的宽值保护：
+// 把宽值高半当空闲寄存器写坏会 VerifyError，而解释器此前根本跑不了宽值指令，
+// 构造不出这种冲突。因此显式记录每个槽位的类型。
+type regKind uint8
+
+const (
+	regUnknown  regKind = iota // 未定义（校验器可匹配任意类型）
+	regInt                     // int/float 等单槽值
+	regObj                     // 对象引用
+	regWideLow                 // long/double 低半
+	regWideHigh                // long/double 高半
+)
+
+func (k regKind) String() string {
+	switch k {
+	case regInt:
+		return "int"
+	case regObj:
+		return "object"
+	case regWideLow:
+		return "wide-low"
+	case regWideHigh:
+		return "wide-high"
+	}
+	return "unknown"
+}
+
 // interp 是一个极简解释器实例。
 type interp struct {
 	f     *File
 	regs  []int32
 	objs  []any
+	kinds []regKind
 	insns []uint16
 	// calls 记录发生过的调用，形如 "Ljava/lang/String;->length()I"。
 	calls []string
@@ -185,6 +216,7 @@ func newInterp(f *File, ci *CodeItemFull) *interp {
 		f:     f,
 		regs:  make([]int32, ci.Registers),
 		objs:  make([]any, ci.Registers),
+		kinds: make([]regKind, ci.Registers),
 		insns: ci.Insns,
 	}
 }
@@ -217,8 +249,59 @@ func (in *interp) setObj(reg uint16, o any)   { in.setObjAt(int(reg), o) }
 
 // setIntAt / setObjAt 接受已经算好的 int 下标：指令里的寄存器号宽度不一，
 // 用 uint16 入口 + int 入口覆盖两种来源。
-func (in *interp) setIntAt(reg int, v int32) { in.regs[reg] = v; in.objs[reg] = nil }
-func (in *interp) setObjAt(reg int, o any)   { in.objs[reg] = o; in.regs[reg] = 0 }
+//
+// 两者都维护 kinds：写入会覆盖槽位类型；若覆盖的是某个宽值的低半或高半，
+// 该宽值的另一半随之失效（校验器视角是类型冲突，动态执行时在后续读取暴露）。
+func (in *interp) setIntAt(reg int, v int32) {
+	if in.kinds[reg] == regWideLow && reg+1 < len(in.kinds) {
+		in.kinds[reg+1] = regUnknown
+	}
+	in.regs[reg] = v
+	in.objs[reg] = nil
+	in.kinds[reg] = regInt
+}
+func (in *interp) setObjAt(reg int, o any) {
+	if in.kinds[reg] == regWideLow && reg+1 < len(in.kinds) {
+		in.kinds[reg+1] = regUnknown
+	}
+	in.objs[reg] = o
+	in.regs[reg] = 0
+	in.kinds[reg] = regObj
+}
+
+// setWideAt 写入一个 64 位宽值：低半在 r、高半在 r+1，两格都打上类型标记。
+func (in *interp) setWideAt(reg int, v int64) error {
+	if reg < 0 || reg+1 >= len(in.regs) {
+		return errf("宽值寄存器越界 v%d（registers=%d）", reg, len(in.regs))
+	}
+	lo := int32(uint32(v))
+	hi := int32(uint32(v >> 32))
+	in.regs[reg] = lo
+	in.objs[reg] = nil
+	in.kinds[reg] = regWideLow
+	in.regs[reg+1] = hi
+	in.objs[reg+1] = nil
+	in.kinds[reg+1] = regWideHigh
+	return nil
+}
+
+// wideValue 读取一个 64 位宽值，并校验低/高半的类型标记。
+//
+// 这是 A6 宽值保护的观察点：谓词寄存器若选错、写坏了某个宽值的高半，
+// 这里会以「宽值类型冲突」失败，而不是把两个半字拼出一个看似合理的值。
+func (in *interp) wideValue(reg int) (int64, error) {
+	if reg < 0 || reg+1 >= len(in.regs) {
+		return 0, errf("宽值寄存器越界 v%d（registers=%d）", reg, len(in.regs))
+	}
+	if in.kinds[reg] != regWideLow || in.kinds[reg+1] != regWideHigh {
+		return 0, errf("宽值类型冲突：读取 v%d（long 低半）时 v%d=%s、v%d=%s；"+
+			"高半被当作普通寄存器写坏（A6 谓词选到了宽值的相邻格）",
+			reg, reg, in.kinds[reg], reg+1, in.kinds[reg+1])
+	}
+	lo := int64(uint32(in.regs[reg]))
+	hi := int64(uint32(in.regs[reg+1]))
+	return hi<<32 | lo, nil
+}
 
 // isNull 判断寄存器是否为 null 引用。
 //
@@ -262,6 +345,36 @@ func (in *interp) Run() (any, error) {
 				in.setIntAt(dst, in.regs[src])
 			}
 			pc++
+		case 0x04: // move-wide vA, vB（12x）
+			dst, src := int(w0>>8&0xf), int(w0>>12&0xf)
+			v, err := in.wideValue(src)
+			if err != nil {
+				return nil, err
+			}
+			if err := in.setWideAt(dst, v); err != nil {
+				return nil, err
+			}
+			pc++
+		case 0x05: // move-wide/from16 vAA, vBBBB（22x）
+			dst, src := int(w0>>8), int(in.insns[pc+1])
+			v, err := in.wideValue(src)
+			if err != nil {
+				return nil, err
+			}
+			if err := in.setWideAt(dst, v); err != nil {
+				return nil, err
+			}
+			pc += 2
+		case 0x06: // move-wide/16 vAAAA, vBBBB（32x）
+			dst, src := int(in.insns[pc+1]), int(in.insns[pc+2])
+			v, err := in.wideValue(src)
+			if err != nil {
+				return nil, err
+			}
+			if err := in.setWideAt(dst, v); err != nil {
+				return nil, err
+			}
+			pc += 3
 		case 0x07: // move-object vA, vB
 			dst, src := int(w0>>8&0xf), int(w0>>12&0xf)
 			in.setObjAt(dst, in.objs[src])
@@ -270,6 +383,12 @@ func (in *interp) Run() (any, error) {
 			return nil, nil
 		case 0x0f: // return vAA（返回 int）
 			return in.regs[w0>>8], nil
+		case 0x10: // return-wide vAA（返回 long/double）
+			v, err := in.wideValue(int(w0 >> 8))
+			if err != nil {
+				return nil, err
+			}
+			return v, nil
 		case 0x11: // return-object vAA
 			return in.objs[w0>>8], nil
 		case 0x12: // const/4 vA, #+B
@@ -285,6 +404,29 @@ func (in *interp) Run() (any, error) {
 			// 常量清零（const 与 const/4、const/16 必须同样处理）。
 			in.setInt(w0>>8, int32(v))
 			pc += 3
+		case 0x16: // const-wide/16 vAA, #+BBBB
+			if err := in.setWideAt(int(w0>>8), int64(int16(in.insns[pc+1]))); err != nil {
+				return nil, err
+			}
+			pc += 2
+		case 0x17: // const-wide/32 vAA, #+BBBBBBBB
+			v := int64(int32(uint32(in.insns[pc+1]) | uint32(in.insns[pc+2])<<16))
+			if err := in.setWideAt(int(w0>>8), v); err != nil {
+				return nil, err
+			}
+			pc += 3
+		case 0x18: // const-wide vAA, #+BBBBBBBBBBBBBBBB（51l）
+			u := uint64(in.insns[pc+1]) | uint64(in.insns[pc+2])<<16 |
+				uint64(in.insns[pc+3])<<32 | uint64(in.insns[pc+4])<<48
+			if err := in.setWideAt(int(w0>>8), int64(u)); err != nil {
+				return nil, err
+			}
+			pc += 5
+		case 0x19: // const-wide/high16 vAA, #+BBBB000000000000
+			if err := in.setWideAt(int(w0>>8), int64(int16(in.insns[pc+1]))<<48); err != nil {
+				return nil, err
+			}
+			pc += 2
 		case 0x1a: // const-string vAA, string@BBBB
 			s, err := in.f.String(uint32(in.insns[pc+1]))
 			if err != nil {

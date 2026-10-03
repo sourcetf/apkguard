@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"sort"
+	"strings"
 )
 
 // RefKind 表示注入代码中的符号引用类型。
@@ -159,6 +160,142 @@ var dataSectionOrder = []uint16{
 	0x2005, // encoded_array_item
 	0x2000, // class_data_item
 	0x2004, // annotation_item
+}
+
+// unsupportedSectionNames 是「重建不保留」的 DEX 段（map_list 类型码 -> 名称）。
+//
+// dataSectionOrder 只列了 10 个段，call_site_ids（0x0007）与 method_handles
+// （0x0008）都不在其中，map_list 也不登记它们。而 0xfa-0xfe 指令的索引正指向
+// 这两段：任何含 invoke-custom / const-method-handle 的输入 DEX 经任一改写
+// （A2/A3/A4/A6…）重建后，段消失、指令索引悬空，ART 结构校验必然拒绝加载。
+//
+// 正确保留需要一并重排这两段的内部索引（call_site_id 指向 method_handle 与
+// 字符串/类型，method_handle 又指向成员），工作量大且难以验证；按项目原则
+// 「宁可失败也不静默产出坏文件」，这里改为显式拒绝。
+var unsupportedSectionNames = map[uint16]string{
+	0x0007: "call_site_ids",
+	0x0008: "method_handles",
+}
+
+// unsupportedInsnNames 是依赖上述两段的指令（0xfa-0xfe）。
+//
+// 0xfc/0xfd（invoke-custom）引用 call_site_ids；0xfe（const-method-handle）
+// 引用 method_handles。0xfa/0xfb（invoke-polymorphic）本身只引用
+// method_ids + proto_ids，但本工具对这三条指令的改写/校验路径并不完整
+// （见 cff.go 的保守跳过），一并拒绝更符合「宁可失败」。
+var unsupportedInsnNames = map[byte]string{
+	0xfa: "invoke-polymorphic",
+	0xfb: "invoke-polymorphic/range",
+	0xfc: "invoke-custom",
+	0xfd: "invoke-custom/range",
+	0xfe: "const-method-handle",
+}
+
+// checkRebuildSupported 在重建前拒绝本工具无法安全处理的输入。
+//
+// 命中条件（任一）：map_list 里存在非空 count 的 call_site_ids/method_handles
+// 段；或任一方法体里出现 0xfa-0xfe 指令。命中即返回明确错误，绝不静默继续。
+func checkRebuildSupported(f *File) error {
+	if secs := unsupportedSectionsInMap(f); len(secs) > 0 {
+		return fmt.Errorf("%w：输入含 %s 段。invoke-custom/const-method-handle 的"+
+			"索引指向这些段，重建会丢弃段且不重排其索引，继续会产出结构非法的 DEX"+
+			"（ART 结构校验将拒绝加载）；请先用 d8/apktool 等重新编译以消除这些指令",
+			ErrUnsupportedCallSite, strings.Join(secs, "、"))
+	}
+	op, where, err := findUnsupportedCallSiteInsn(f)
+	if err != nil {
+		return err
+	}
+	if where != "" {
+		return fmt.Errorf("%w：%s 中出现指令 0x%02x（%s）。这类指令依赖 "+
+			"call_site_ids/method_handles 段，重建会丢弃段且不重排其索引，"+
+			"继续会产出结构非法的 DEX",
+			ErrUnsupportedCallSite, where, op, unsupportedInsnNames[op])
+	}
+	return nil
+}
+
+// unsupportedSectionsInMap 返回 map_list 中非空 count 的不支持段名称（已排序）。
+func unsupportedSectionsInMap(f *File) []string {
+	d := f.data
+	if len(d) < offMapList+4 {
+		return nil
+	}
+	mapOff := binary.LittleEndian.Uint32(d[offMapList:])
+	if mapOff == 0 || int(mapOff)+4 > len(d) {
+		return nil
+	}
+	n := binary.LittleEndian.Uint32(d[mapOff:])
+	if int(mapOff)+4+int(n)*12 > len(d) {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for i := uint32(0); i < n; i++ {
+		base := int(mapOff) + 4 + 12*int(i)
+		name, ok := unsupportedSectionNames[binary.LittleEndian.Uint16(d[base:])]
+		if !ok || seen[name] || binary.LittleEndian.Uint32(d[base+4:]) == 0 {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// findUnsupportedCallSiteInsn 扫描全部方法体，返回首个 0xfa-0xfe 指令的
+// 操作码与所在方法描述。找不到返回 ("", "")。
+func findUnsupportedCallSiteInsn(f *File) (byte, string, error) {
+	var foundOp byte
+	var foundWhere string
+	err := f.AllMethods(func(_, methodDesc string, m EncodedMethod) error {
+		if foundWhere != "" || m.CodeOff == 0 {
+			return nil
+		}
+		ci, err := f.CodeInsns(m.CodeOff)
+		if err != nil {
+			return nil // 无法解析的方法体会在后续重建步骤里报错，这里不重复报
+		}
+		words := make([]uint16, ci.InsnsSize)
+		for i := range words {
+			words[i] = binary.LittleEndian.Uint16(f.data[ci.InsnsOff+2*i:])
+		}
+		// 与 remapCode 相同：payload 是内联伪指令，必须整体跳过，
+		// 否则其中的数据字节会被误当成操作码（假阳性）。
+		payloadAt := map[int]bool{}
+		for pos := 0; pos < len(words); {
+			if payloadAt[pos] {
+				w, ok, perr := payloadWidth(words, pos)
+				if perr != nil || !ok {
+					break
+				}
+				pos += w
+				continue
+			}
+			op := byte(words[pos] & 0xff)
+			if name, ok := unsupportedInsnNames[op]; ok {
+				foundOp, foundWhere = op, name+"（"+methodDesc+"）"
+				return nil
+			}
+			w, werr := insnWidth(words, pos)
+			if werr != nil {
+				break
+			}
+			if offWord, ok := branchInsns[op]; ok && pos+offWord+1 < len(words) {
+				rel := int32(uint32(words[pos+offWord]) | uint32(words[pos+offWord+1])<<16)
+				if t := pos + int(rel); t >= 0 && t < len(words) {
+					payloadAt[t] = true
+				}
+			}
+			pos += w
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	return foundOp, foundWhere, nil
 }
 
 // place 把一个条目追加到对应 section 的缓冲区，返回其绝对偏移。
@@ -719,6 +856,18 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 	//   "unexpected static field initial value type: 'L' vs 'I'"
 	// （真实案例：RustDesk 加固后 16 个分片中的 d1.dex 被整体拒绝，
 	//   其内所有类都无法解析，表现为 NoClassDefFoundError。）
+	//
+	// valuesMap 按**内容**去重 encoded_array_item。
+	//
+	// 真实 DEX 里多个类经常共享同一个 static_values（典型是「全是默认值」
+	// 的类，dx/d8 会让它们的 class_def.static_values_off 指向同一项）。原实现
+	// 对每个 valuesOff != 0 的类各 place 一份，共享被逐类复制——termux 实测
+	// +27 KB。与 debugMap / tlCache / cdMap 同一思路加缓存。
+	//
+	// 键用拼装后的字节而不是旧偏移：A1 会改变 field_idx 排序，两个共享同一旧
+	// 数组的类若静态字段集合不同，拼出的 blob 也可能不同；按键值去重只在
+	// 内容完全相同时复用，绝不会让两个类指向错误的数组。
+	valuesMap := map[string]uint32{}
 	for i := range pl.classes {
 		c := &pl.classes[i]
 		if c.old == noOld || c.valuesOff == 0 {
@@ -795,7 +944,12 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 				"dex: 类 %s（old=%d）的 static_values 拼装后不合法：%s（共 %d 字节）",
 				fullyQualifiedName(pl, c.classIdx), c.old, why, len(blob))
 		}
+		if off, ok := valuesMap[string(blob)]; ok {
+			c.valuesNew = off
+			continue
+		}
 		c.valuesNew = b.place(0x2005, blob, 1)
+		valuesMap[string(blob)] = c.valuesNew
 	}
 
 	// ---- 6) class_data ----

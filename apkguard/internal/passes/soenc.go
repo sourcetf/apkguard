@@ -21,6 +21,10 @@ import (
 // 「IV ‖ 密文」）加密后存进 assets/；壳（B3 的 Loader）在 attachBaseContext
 // 里把它们解密落地到应用私有目录，并把该目录并入库搜索路径。
 //
+// 完整性：启用 -payload-mac 时，库载荷追加与 B1 **同规格**的
+// encrypt-then-MAC（复用 pack.MAC/MacKey/域分离常量，绑定原始库名），
+// 壳侧在解密前先校验（loader.go 的库循环复用同一个 v()）。
+//
 // 之所以选「整文件加密」而不是「段加密」：整文件不改动 ELF 一个字节，
 // 16KB 页对齐、DT_NEEDED、.init_array、重定位表全部原样保留，不存在
 // 「重新链接」风险；而 .text 段加密与 JNI_OnLoad 的执行时序矛盾，必须
@@ -49,7 +53,7 @@ type soItem struct {
 	Entry string
 	// Asset 是加密载荷在 APK 中的条目名。
 	Asset string
-	// Size 是载荷字节数（含前置 IV）。
+	// Size 是载荷字节数（含前置 IV；启用 -payload-mac 时还含尾部 32 字节 tag）。
 	Size int
 	// Plain 是原始 .so 字节数，用于报告。
 	Plain int
@@ -67,6 +71,15 @@ type shellSOLibs struct {
 	// 若 C1 据此判定「APK 没有原生库」就会给全部 ABI 注入 libapkguard.so，
 	// 让只支持 arm64 的应用被装到 32 位设备上。
 	Abis []string
+	// MAC 表示本批库载荷尾部带 HMAC-SHA256 标签（对应 -payload-mac），
+	// 壳在解密前必须先校验。
+	//
+	// 与 B1 的 shellPayloads.MAC 同源：两者都取自 opts.PayloadMAC，
+	// 且 C2 依赖 B1/B2/B3（config.Validate 强制）。壳侧实际读取的是 B3
+	// 传给 dex.LoaderSpec 的那一个开关（同为 opts.PayloadMAC），因此
+	// 不存在「打包侧带了 tag、壳侧却不校验」的错配窗口。这里记录一份
+	// 仅供报告与测试断言，不新增第二个开关。
+	MAC bool
 }
 
 // soLibsOf 读取 C2 写入的原生库清单；未启用 C2 时返回 nil。
@@ -254,6 +267,15 @@ func (e *encryptNativeLibs) Run(_ context.Context, art *pipeline.Artifact, opts 
 		if err != nil {
 			return fmt.Errorf("加密 %s 失败: %w", t.entry.NameString(), err)
 		}
+		if opts.PayloadMAC {
+			// 与 B1 完全同规格的 encrypt-then-MAC：tag = HMAC-SHA256(macKey,
+			// 原始库名 ‖ IV‖密文)，追加在密文尾部。
+			//
+			// 绑定**原始库名**（t.name，如 "libfoo.so"）而不是 assets 条目名：
+			// 与 B1 绑定原始 DEX 名同理，改名后的合法产物在校验侧仍能对上，
+			// 且不同库的载荷无法互换。
+			blob = append(blob, pack.MAC(blob, key, t.name)...)
+		}
 		// 与 B1 一致：密文熵值接近 8，必须 Stored（Deflate 无收益且徒增运行时开销）。
 		pipeline.Add(art, zipx.NewStored(asset, blob))
 		items = append(items, soItem{
@@ -274,11 +296,21 @@ func (e *encryptNativeLibs) Run(_ context.Context, art *pipeline.Artifact, opts 
 		return fmt.Errorf("应移除 %d 个明文 .so，实际移除 %d 个", len(items), n)
 	}
 
-	art.Put(sharedKeySOLibs, &shellSOLibs{Key: key, Items: items, Abis: abis})
+	art.Put(sharedKeySOLibs, &shellSOLibs{Key: key, Items: items, Abis: abis, MAC: opts.PayloadMAC})
 
-	art.Note("C2 SO 加壳：%d 个原生库（ABI：%s）已从 lib/ 移除并加密存入 assets（%d → %d 字节）；"+
-		"壳将在启动时解密到私有目录，并把该目录并入库搜索路径；原始 ABI 集合已记录供 C1 使用",
-		len(items), strings.Join(abis, "、"), plainTotal, blobTotal)
+	if opts.PayloadMAC {
+		art.Note("C2 SO 加壳：%d 个原生库（ABI：%s）已从 lib/ 移除并加密存入 assets（%d → %d 字节）；"+
+			"每个载荷尾部附 32 字节 HMAC-SHA256（encrypt-then-MAC，绑定原始库名），壳解密前先校验；"+
+			"壳将在启动时解密到私有目录，并把该目录并入库搜索路径；原始 ABI 集合已记录供 C1 使用",
+			len(items), strings.Join(abis, "、"), plainTotal, blobTotal)
+		art.Stat("C2.mac", "1")
+		art.Stat("C2.mac_bytes", fmt.Sprint(pack.TagSize*len(items)))
+	} else {
+		art.Note("C2 SO 加壳：%d 个原生库（ABI：%s）已从 lib/ 移除并加密存入 assets（%d → %d 字节）；"+
+			"壳将在启动时解密到私有目录，并把该目录并入库搜索路径；原始 ABI 集合已记录供 C1 使用",
+			len(items), strings.Join(abis, "、"), plainTotal, blobTotal)
+		art.Stat("C2.mac", "0")
+	}
 	art.Stat("C2.libs", fmt.Sprint(len(items)))
 	art.Stat("C2.abis", strings.Join(abis, ","))
 	art.Stat("C2.plain", fmt.Sprint(plainTotal))

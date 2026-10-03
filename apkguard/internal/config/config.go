@@ -225,8 +225,8 @@ func All() []Feature {
 
 		// ---- Native 防护类 ----
 		{ID: "C1", Name: "密钥 native 派生", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
-			Desc: "密钥由 native 结合设备指纹、APK 签名、编译期随机种子派生，不以明文存在于 Java 层",
-			Note: "修复样本密钥硬编码的致命缺陷"},
+			Desc: "载荷密钥由 native 库结合本 APK 的签名证书摘要派生（SHA-256(库内种子 ‖ 证书摘要)），不以明文存在于 Java/DEX 层",
+			Note: "真实边界：种子是 .so 内的固定常量（仅异或掩码存放，属混淆而非随机，也不含设备指纹），提取 .so 即可获得；密钥混入证书摘要，换签名重打包后解不开。设备绑定（让密钥随设备变化）是 D5 的职责"},
 		{ID: "C2", Name: "SO 加壳", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
 			Desc: "原生库整体加密存入 assets，壳启动时解密到应用私有目录，并把该目录并入类加载器的库搜索路径",
 			Note: "检测到 native 自加载框架（Flutter/RN/Unity）会整体跳过并给出提示——这类框架用 android_dlopen_ext 从 APK 按偏移加载，移走 lib/ 会让应用启动即崩；C2 开启时 lib/ 下不再有明文 .so"},
@@ -382,11 +382,14 @@ type Options struct {
 	// 加壳参数
 	DexKey   string `json:"dex_key"`   // B1 加密密钥（留空自动生成）
 	DecoyPkg string `json:"decoy_pkg"` // B8 诱饵配置里的假包名（留空用默认）
-	// PayloadMAC 让 B1 在密文后附加 HMAC-SHA256，壳在解密前先校验。
+	// PayloadMAC 让 B1 的 DEX 载荷与 C2 的原生库载荷都在密文后附加
+	// HMAC-SHA256（encrypt-then-MAC，分别绑定原始 DEX 名与原始库名），
+	// 壳在解密前先校验。
 	//
 	// 默认关闭：完整性目前由 APK 签名（E1）与运行时签名校验（D1）保证，
 	// 载荷自带 MAC 属于纵深防御——即使攻击者绕过 D1，也无法在不知道
-	// 密钥的情况下改出「能通过校验」的载荷。代价是壳侧多一次 HMAC 与一小段字节码。
+	// 密钥的情况下改出「能通过校验」的载荷。代价是壳侧对每份载荷多一次
+	// HMAC 与一小段字节码（库载荷每份多 32 字节）。
 	PayloadMAC bool `json:"payload_mac"`
 	// SOEncrypt 把 APK 里的原生库整体加密存进 assets，壳在启动时解密到应用
 	// 私有目录，并把该目录作为 ClassLoader 的库搜索路径。

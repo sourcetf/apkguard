@@ -537,6 +537,73 @@ func collectArrayStrings(p int, d []byte, out map[uint32]bool) error {
 	return nil
 }
 
+// signatureAnnotationDesc 是 Java 泛型签名的系统注解类型描述符。
+const signatureAnnotationDesc = "Ldalvik/annotation/Signature;"
+
+// signatureStrings 返回本 DEX 中全部 dalvik.annotation.Signature 注解携带的
+// 签名字符串（类、字段、方法、参数注解都在 walkAllAnnotations 的遍历范围内）。
+//
+// 用途：Signature 的值是**复合串**（如 "Ljava/util/List<Lcom/foo/Bar;>;"），
+// 与类描述符 "Lcom/foo/Bar;" 不相等，因此按字符串值精确匹配的类改名不会波及它。
+// 不改写的话，类改名后泛型签名仍指向旧类名：ART 不校验 Signature，不会崩，
+// 但 getGenericSuperclass()、Gson/Retrofit 一类按泛型反射的代码会拿到
+// 不存在的类名。
+func (f *File) signatureStrings() ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	err := f.walkAllAnnotations(func(p int, d []byte) error {
+		typeIdx, np, err := ULEB128(d, p)
+		if err != nil {
+			return err
+		}
+		size, np2, err := ULEB128(d, np)
+		if err != nil {
+			return err
+		}
+		td, err := f.Type(typeIdx)
+		if err != nil {
+			return err
+		}
+		if td != signatureAnnotationDesc {
+			return nil
+		}
+		q := np2
+		for i := uint32(0); i < size; i++ {
+			nameIdx, nq, err := ULEB128(d, q)
+			if err != nil {
+				return err
+			}
+			name, err := f.String(nameIdx)
+			if err != nil {
+				return err
+			}
+			vals := map[uint32]bool{}
+			q, err = walkValue(nq, d, vals)
+			if err != nil {
+				return err
+			}
+			if name != "value" {
+				continue
+			}
+			for idx := range vals {
+				s, err := f.String(idx)
+				if err != nil {
+					return err
+				}
+				if !seen[s] {
+					seen[s] = true
+					out = append(out, s)
+				}
+			}
+		}
+		return nil
+	}, func(p int, d []byte) error { return nil })
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // walkValue 递归遍历一个 encoded_value，返回新的偏移。
 func walkValue(p int, d []byte, out map[uint32]bool) (int, error) {
 	if p >= len(d) {

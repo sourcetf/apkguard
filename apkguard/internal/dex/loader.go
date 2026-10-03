@@ -41,9 +41,15 @@ type LoaderSpec struct {
 	// 附带的安全性质：重打包必然更换签名证书，派生出的密钥随之不同，
 	// 密文载荷在密码学层面无法解开——不存在「跳过检测」的绕过路径。
 	NativeKey string
-	// MAC 为 true 时，每份载荷在解密前先用 HMAC-SHA256 校验完整性
-	// （encrypt-then-MAC，见 pack.MAC）。为 false 时不生成任何 MAC 指令，
-	// 产物与旧格式完全一致。
+	// MAC 为 true 时，每份载荷（含 LibItems 里的原生库载荷）在解密前
+	// 先用 HMAC-SHA256 校验完整性（encrypt-then-MAC，见 pack.MAC）。
+	// 为 false 时不生成任何 MAC 指令，产物与旧格式完全一致。
+	//
+	// 库载荷与 DEX 载荷**共用这一个开关**，不另设第二个标志：打包侧 B1 与
+	// C2 都只由 -payload-mac（config.Options.PayloadMAC）决定是否追加 tag，
+	// 而 C2 依赖 B1/B2/B3（config.Validate 强制），因此合法配置下两者的
+	// tag 状态必然一致。库载荷的 MAC 输入绑定原始库名（LoaderLibItem.Name），
+	// 与 DEX 载荷绑定原始 DEX 名同理，使不同库的载荷无法互换。
 	MAC bool
 	// LibItems 是 C2（SO 加壳）留下的原生库载荷：壳在构造 DexClassLoader
 	// 之前把它们解密落地到私有目录，并把该目录并入库搜索路径。
@@ -70,6 +76,9 @@ type LoaderLibItem struct {
 	//
 	// 必须是原始文件名：System.loadLibrary 经 ClassLoader.findLibrary 在
 	// 库搜索路径里按 "lib<name>.so" 查找，改名会导致找不到。
+	//
+	// 启用 MAC（LoaderSpec.MAC）时它同时是 HMAC 的绑定输入，必须与打包侧
+	// C2 用来计算 tag 的原始库名逐字节一致（见 passes/soenc.go）。
 	Name string
 	// Abi 是原始 ABI 目录名，仅用于报告与排障。
 	Abi string
@@ -152,6 +161,12 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 		for _, it := range ls.Items {
 			if it.Name == "" {
 				return Addition{}, fmt.Errorf("dex: Loader 启用了 MAC 但载荷 %s 缺少原始 DEX 名（无法绑定校验）", it.Asset)
+			}
+		}
+		// 库载荷同理：原始库名既是落地文件名，也是 MAC 的绑定输入。
+		for _, it := range ls.LibItems {
+			if it.Name == "" {
+				return Addition{}, fmt.Errorf("dex: Loader 启用了 MAC 但库载荷 %s 缺少原始库名（无法绑定校验）", it.Asset)
 			}
 		}
 	}
@@ -486,6 +501,10 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 	// 寄存器复用：DEX 循环结束后 rIn(3)/rBlob(4)/rDex(5)/rFile(6) 都已无用。
 	// rIn 改存 libDir(File)、rBlob 改存 libPath(String)，避免顶高寄存器总数
 	// （invoke 的 35c 只编码 v0..v15，一旦超过就无法传参）。
+	//
+	// 载荷 MAC 启用时（ls.MAC），每份库载荷在解密前先调用 v() 校验 HMAC，
+	// 失败与 DEX 载荷走同一条硬终止路径（mac_fail → System.exit(1)）；
+	// 关闭时该分支不生成任何指令，产物与旧版逐字节一致。
 	if len(ls.LibItems) > 0 {
 		const (
 			rLibDir  = rIn
@@ -525,9 +544,26 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 				return nil, err
 			}
 			a.MoveResultObject(rLibBlob)
-			// so = c(blob, key, 0)：复用 DEX 的解密实现（同样是 IV‖AES-CBC）。
-			// .so 载荷不带 MAC，drop 传 0。
-			a.Const4(rT2, 0)
+			// 启用 MAC 时先校验再解密：与 DEX 载荷走同一条路径、同一个 v()，
+			// 绑定的是**原始库名**（it.Name）。顺序不可颠倒——先解密再比对
+			// 会从填充是否合法的差异里泄漏填充 oracle。
+			if ls.MAC {
+				a.ConstString(rT3, it.Name)
+				if err := a.InvokeStatic([]int{rLibBlob, rKey, rT3}, macM); err != nil {
+					return nil, err
+				}
+				a.MoveResult(rT2)
+				a.IfEqz(rT2, "mac_fail")
+			}
+			// so = c(blob, key, drop)：复用 DEX 的解密实现（同样是 IV‖AES-CBC）。
+			// 启用 MAC 时 blob 尾部有 32 字节 tag，drop 必须为 tagLen，否则 tag
+			// 会被当成 CBC 密文，填充校验必然失败；未启用时 drop 传 0，语义与
+			// 旧版逐字节一致。
+			if ls.MAC {
+				a.Const16(rT2, int16(tagLen))
+			} else {
+				a.Const4(rT2, 0)
+			}
 			if err := a.InvokeStatic([]int{rLibBlob, rKey, rT2}, decM); err != nil {
 				return nil, err
 			}
@@ -1223,13 +1259,31 @@ func loaderInstallCode(self string) (*CodeBlob, error) {
 	if err := a.IfEq(rT0, rCl, "swap_ok"); err != nil {
 		return nil, err
 	}
+	// 失败路径（1/0）必须留下 logcat 线索。
+	//
+	// 非 debug 产物此前对返回值不作任何处理也不记录：Android 9+ 的隐藏 API
+	// 限制一旦把字段挡掉，现象就是「载荷解密成功、随后 Activity 找不到类」，
+	// 而 logcat 毫无线索，只能靠猜。这里在**失败路径**打印 Log.w（成功不打，
+	// 避免正式产物产生噪声）；debug 模式下另有 Toast（见 loaderEntryCode）。
+	logW := MethodSpec{Class: descLog, Name: "w",
+		Proto: ProtoSpec{Ret: "I", Params: []string{descStringType, descStringType}}}
 	a.IfEqz(rT0, "swap_hidden")
+	a.ConstString(rT0, loaderLogTag)
+	a.ConstString(rT1, loaderSwapStaleMsg)
+	if err := a.InvokeStatic([]int{rT0, rT1}, logW); err != nil {
+		return nil, err
+	}
 	a.Const4(rT0, 0)
 	a.Return(rT0)
 	a.Label("swap_ok")
 	a.Const4(rT0, 2)
 	a.Return(rT0)
 	a.Label("swap_hidden")
+	a.ConstString(rT0, loaderLogTag)
+	a.ConstString(rT1, loaderSwapHiddenMsg)
+	if err := a.InvokeStatic([]int{rT0, rT1}, logW); err != nil {
+		return nil, err
+	}
 	a.Const4(rT0, 1)
 	a.Return(rT0)
 
@@ -1242,6 +1296,23 @@ func loaderInstallCode(self string) (*CodeBlob, error) {
 
 // activityThreadClass 是被反射接管的框架类名。
 const activityThreadClass = "android.app.ActivityThread"
+
+// loaderLogTag 是 ClassLoader 接管失败时写入 logcat 的标签。
+//
+// 非 debug 产物里这是唯一的现场线索：Android 9+ 的隐藏 API 限制会让
+// mClassLoader 的替换静默失效（字段被 getDeclaredFields 过滤、或写入不生效），
+// 现象是「载荷解密成功、随后 Activity ClassNotFoundException」而 logcat
+// 毫无痕迹。成功路径不打印，避免正式产物产生噪声。
+const loaderLogTag = "APKGUARD"
+
+const (
+	// loaderSwapHiddenMsg 对应回读为 null：字段被隐藏 API 过滤或根本不存在。
+	loaderSwapHiddenMsg = "ClassLoader 接管失败：mClassLoader 被隐藏 API 过滤或未找到" +
+		"（Android 9+ 非 SDK 接口限制），Activity 将由旧加载器加载并抛 ClassNotFoundException"
+	// loaderSwapStaleMsg 对应回读值非空但与写入值不一致（如 final 字段、写入被回滚）。
+	loaderSwapStaleMsg = "ClassLoader 接管失败：mClassLoader 字段可见但写入未生效" +
+		"（回读值不一致），ClassLoader 未被替换"
+)
 
 // ---- 取字段：g(Object, String) -> Object ----
 //

@@ -12,7 +12,8 @@ export PATH=$SDK/platform-tools:$PATH
 ADB="adb -s emulator-5554"
 PKG=com.termux
 ACT=.app.TermuxActivity
-APK=$OUT/termux-NODETECT-emu.apk
+# 默认用 NODETECT 产物；可用 TERMUX_APK 指定别的（例如 PORTABLE）。
+APK=${TERMUX_APK:-$OUT/termux-NODETECT-emu.apk}
 
 $ADB root >/dev/null 2>&1; sleep 2; $ADB wait-for-device
 
@@ -83,7 +84,8 @@ $ADB shell am start -n "$PKG/$ACT" >/dev/null 2>&1
 sleep 8
 # 只挑守卫库（APK 的 lib/<abi>/ 下那一份）：C6/D4 校验的是它。
 # 业务库经 C2 解密后落在 app_aglib/ 并被 mmap 进来，篡改它不会触发看门狗。
-lib=$($ADB shell "grep -oE '/[^ ]*\.so' /proc/\$(pidof $PKG)/maps 2>/dev/null | grep -F '$LIBNAME' | head -1" | tr -d '')
+lib=$($ADB shell "grep -oE '/[^ ]*\.so' /proc/\$(pidof $PKG)/maps 2>/dev/null | grep -F '$LIBNAME' | head -1" | tr -d '
+')
 echo "  守卫库（$LIBNAME）: $lib"
 if [ -n "$lib" ] && [ -n "$TOFF" ]; then
   $ADB logcat -b events -c

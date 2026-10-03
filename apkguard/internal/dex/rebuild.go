@@ -289,6 +289,11 @@ type RebuildStats struct {
 
 // RebuildWithStats 与 Rebuild 相同，但额外返回量化统计。
 func RebuildWithStats(f *File, opts RebuildOptions) ([]byte, RebuildStats, error) {
+	// 先拒绝本工具无法安全重建的输入（call_site_ids / method_handles 段与
+	// 0xfa-0xfe 指令）。宁可失败，也不静默产出结构非法的 DEX。
+	if err := checkRebuildSupported(f); err != nil {
+		return nil, RebuildStats{}, err
+	}
 	pl, err := buildPlan(f, opts)
 	if err != nil {
 		return nil, RebuildStats{}, err

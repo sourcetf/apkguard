@@ -143,7 +143,7 @@ func run() error {
 
 	flag.StringVar(&c.dexKey, "dex-key", "", "B1 加密密钥（留空自动生成）")
 	flag.StringVar(&c.decoyPkg, "decoy-pkg", "", "B8 诱饵配置里的假包名（留空用默认 dummy.installed.check）")
-	flag.BoolVar(&c.payloadMAC, "payload-mac", false, "B1 密文附加 HMAC-SHA256，壳解密前先校验（纵深防御）")
+	flag.BoolVar(&c.payloadMAC, "payload-mac", false, "B1 的 DEX 载荷与 C2 的原生库载荷都附加 HMAC-SHA256，壳解密前先校验（纵深防御）")
 	flag.BoolVar(&c.soEncrypt, "so-encrypt", false, "C2 原生库整体加密存 assets，启动时解密到私有目录再加载")
 	flag.StringVar(&c.shellPkg, "shell-pkg", "com.apkguard.shell", "B2/B3 壳类所在包名")
 	flag.IntVar(&c.splitCount, "split-count", 0, "B4 拆分 DEX 个数（0=按原样）")
