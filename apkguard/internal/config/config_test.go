@@ -224,3 +224,46 @@ func TestValidateKeystoreOnlyWhenSigning(t *testing.T) {
 		t.Fatal("默认配置启用了签名，缺少密钥库时应报错")
 	}
 }
+
+// TestValidateC1SignatureDependencyIsConditional 验证 C1 对 E1 的依赖是**条件式**的。
+//
+// C1（密钥 native 派生）需要「本 APK 的签名证书摘要」作为派生输入，摘要有两个
+// 来源：E1 签名时从密钥库读，或用 -sig-hash 直接给出。因此「C1 必须启用 E1」
+// 只在没有 -sig-hash 时成立——否则会把「先加固、后由发布流水线签名」这种正常
+// 用法挡在门外。曾经这条依赖被无条件写死在 deps 表里。
+func TestValidateC1SignatureDependencyIsConditional(t *testing.T) {
+	base := func() *Options {
+		o := &Options{In: "a.apk"}
+		o.SetEnabled("B2", true)
+		o.SetEnabled("C1", true)
+		// E1 默认是开启的，这里显式关掉，才能走到「没有签名来源」的分支。
+		o.SetEnabled("E1", false)
+		return o
+	}
+
+	// 既没有 E1、也没有 -sig-hash：必须报错，且指出两种补救方式。
+	o := base()
+	err := o.Validate()
+	if err == nil {
+		t.Fatal("C1 在既无 E1 又无 -sig-hash 时应报错（否则运行时算不出与加密一致的密钥）")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "E1") || !strings.Contains(msg, "sig-hash") {
+		t.Errorf("错误信息应同时给出 E1 与 -sig-hash 两条出路，实际: %v", err)
+	}
+
+	// 给出 -sig-hash：应当放行（不再要求 E1）。
+	o = base()
+	o.SigHashes = []string{strings.Repeat("ab", 32)}
+	if err := o.Validate(); err != nil {
+		t.Errorf("给了 -sig-hash 时不应再要求 E1，实际: %v", err)
+	}
+
+	// 启用 E1（并给密钥库）：也应放行。
+	o = base()
+	o.SetEnabled("E1", true)
+	o.KS = "k.jks"
+	if err := o.Validate(); err != nil {
+		t.Errorf("启用 E1 并给了密钥库时应放行，实际: %v", err)
+	}
+}

@@ -511,9 +511,10 @@ func (o *Options) Validate() error {
 		"D1": {{"B2", "签名校验需要壳 Application 提供启动时机"}},
 		"D2": {{"B2", "Root 检测需要壳 Application 提供启动时机"}},
 		"D3": {{"B2", "模拟器检测需要壳 Application 提供启动时机"}},
-		// C1 要往壳 DEX 注入 native 桥接类；密钥派生依赖签名证书，
-		// 因此还必须有签名（否则运行时算不出与加密一致的密钥）。
-		"C1": {{"B2", "密钥 native 派生需要壳 Application 挂载桥接类"}, {"E1", "派生输入包含签名证书摘要，需要启用签名"}},
+		// C1 要往壳 DEX 注入 native 桥接类；密钥派生依赖签名证书摘要。
+		// 摘要有两个来源：E1 签名时读密钥库，或用 -sig-hash 显式给出。
+		// 只有前者才需要 E1 —— 这条依赖是**条件式**的，见下面 conditionalDeps。
+		"C1": {{"B2", "密钥 native 派生需要壳 Application 挂载桥接类"}},
 		"C7": {{"C1", "原生库伪装作用于 C1/C4/C5/C6 注入的那一份守卫库"}},
 		"C4": {{"B2", "反调试需要壳 Application 提供启动时机"}, {"C1", "反调试与密钥派生共用同一份原生库与桥接类"}},
 		"C5": {{"B2", "反注入需要壳 Application 提供启动时机"}, {"C1", "反注入与密钥派生共用同一份原生库与桥接类"}},
@@ -537,6 +538,18 @@ func (o *Options) Validate() error {
 					id, nameOf(id), d.need, nameOf(d.need), d.why))
 			}
 		}
+	}
+
+	// 条件式依赖：只在满足条件时才要求。
+	//
+	// C1（密钥 native 派生）需要「本 APK 的签名证书摘要」作为派生输入。摘要有两个
+	// 来源：E1 签名时从密钥库读，或用 -sig-hash 直接给出。因此「C1 必须启用 E1」
+	// 只在**没有** -sig-hash 时成立；否则会把「加固与签名分离」（先加固、后由
+	// 发布流水线签名）这种正常用法挡在门外。
+	if o.IsEnabled("C1") && len(o.SigHashes) == 0 && !o.IsEnabled("E1") {
+		errs = append(errs, fmt.Sprintf(
+			"C1（%s）已启用，但没有可用的签名证书摘要：请启用 E1（%s）并提供 -ks，或用 -sig-hash 显式给出证书的 SHA-256",
+			nameOf("C1"), nameOf("E1")))
 	}
 
 	// 未实现的功能项不允许启用。

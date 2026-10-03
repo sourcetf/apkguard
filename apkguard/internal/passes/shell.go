@@ -167,6 +167,12 @@ func (a *appReplace) Run(_ context.Context, art *pipeline.Artifact, opts *config
 	// 只有主 DEX 不存在（B1 已把原始 DEX 全部移走）或并库失败（索引超界等）
 	// 时才新建一个 DEX。
 	var shellDex []byte
+	// shellOnlyLen 是**纯壳 DEX** 的字节数（只含壳类，不含业务类）。
+	//
+	// 曾经直接用 len(shellDex) 报 B2.shell_bytes：并库成功时那是整份
+	// classes.dex（含全部业务类），失败时才是纯壳——同一个键在不同配置下
+	// 含义不同，报告与产物断言都无法依赖它。
+	var shellOnlyLen int
 	name := ""
 	merged := false
 	if main := pipeline.Find(art, "classes.dex"); main != nil {
@@ -193,8 +199,17 @@ func (a *appReplace) Run(_ context.Context, art *pipeline.Artifact, opts *config
 		if err := dex.Verify(shellDex); err != nil {
 			return fmt.Errorf("壳 DEX 校验失败: %w", err)
 		}
+		shellOnlyLen = len(shellDex)
 		name = nextDexName(art)
 		pipeline.Add(art, zipx.NewStored(name, shellDex))
+	} else {
+		// 并库成功：单独构建一份纯壳 DEX 只为报告用的大小（壳类只有十几个，
+		// 构建开销可忽略）。这样 B2.shell_bytes 在任何配置下含义一致。
+		if pure, perr := dex.Build(add); perr == nil {
+			shellOnlyLen = len(pure)
+		} else {
+			shellOnlyLen = -1
+		}
 	}
 
 	// 改写 Manifest 的 android:name。
@@ -251,11 +266,15 @@ func (a *appReplace) Run(_ context.Context, art *pipeline.Artifact, opts *config
 		NativeKey:    sh.NativeKey,
 	})
 
-	art.Note("B2 Application 替换：壳类 %s 已注入 %s（%d 字节），Manifest android:name 由 %q 改为壳类",
-		ShellJavaNameOf(sh.Class), name, len(shellDex), origRaw)
+	art.Note("B2 Application 替换：壳类 %s 已注入 %s（纯壳 %d 字节，写入的 DEX 共 %d 字节），Manifest android:name 由 %q 改为壳类",
+		ShellJavaNameOf(sh.Class), name, shellOnlyLen, len(shellDex), origRaw)
 	art.Stat("B2.shell_class", ShellJavaNameOf(sh.Class))
 	art.Stat("B2.dex_entry", name)
-	art.Stat("B2.shell_bytes", fmt.Sprint(len(shellDex)))
+	// shell_bytes 恒为**纯壳 DEX** 的大小（不含业务类）；entry_bytes 才是写入
+	// 那个条目的总长度。两者在并库成功时相差很大，必须分开报。
+	art.Stat("B2.shell_bytes", fmt.Sprint(shellOnlyLen))
+	art.Stat("B2.entry_bytes", fmt.Sprint(len(shellDex)))
+	art.Stat("B2.merged", fmt.Sprint(merged))
 	art.Stat("B2.orig_app", origName)
 	return nil
 }

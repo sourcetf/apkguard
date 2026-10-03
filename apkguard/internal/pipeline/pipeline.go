@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
 	"time"
 
 	"apkguard/internal/config"
@@ -17,8 +16,14 @@ import (
 
 // Level 表示一次产物所处的抽象层次。
 //
-// 不同功能项操作的对象不同：有的只改 ZIP 结构，有的改 DEX，有的改 Manifest。
-// 用 Level 表达「产物形态」，Pass 声明自己能处理的输入形态与产出的形态。
+// Level 表达「产物形态」：Pass 声明自己能处理的输入形态与产出的形态。
+//
+// **它不决定执行顺序**：顺序由注册顺序决定（见 passes.go 里逐条写明的顺序约束），
+// 因为真正要守的约束是「A14 必须在 B1/B8 之后」这类**跨层**关系，而按 Level
+// 排序反而会把它们打乱（LevelZip 的全部 Pass 会一起排在 LevelDex 之前）。
+// Level 在这里的角色是「被校验的声明」：注册序列上的层次链必须连续
+// （前一个 Pass 的 Out 等于后一个的 In，且起点为 LevelZip），否则 pipeline 直接
+// 报错——这样 Level 写错时会立刻暴露，而不是悄悄把某个 Pass 挪到别处执行。
 type Level int
 
 // 各处理层次。
@@ -177,9 +182,17 @@ func (p *Pipeline) Run(ctx context.Context, opts *config.Options) (*Result, erro
 
 	res := &Result{Skipped: map[config.FeatureID]string{}}
 
-	// 按层次排序，同层保持注册顺序（稳定排序）
+	// 执行顺序 = 注册顺序。
+	//
+	// 这里**不再**按 Level 排序：所有 Pass 的 In/Out 目前都是 LevelZip，排序是
+	// 空操作，却会给人一种「层次会自动排好序」的错觉——一旦有人给某个 Pass
+	// 单独改成 LevelDex，它会被静默移到所有 ZIP 层之后，而真正的顺序约束
+	// （A14 在 B1 之后、B4 在 B1 之前…）并不体现在 Level 上。
+	// 改为校验层次链连续：声明与顺序不一致时直接报错，绝不静默重排。
 	order := append([]Pass(nil), p.reg.passes...)
-	sort.SliceStable(order, func(i, j int) bool { return order[i].In() < order[j].In() })
+	if err := CheckLevelChain(order); err != nil {
+		return nil, err
+	}
 
 	for _, ps := range order {
 		id := ps.ID()
@@ -212,6 +225,29 @@ func (p *Pipeline) Run(ctx context.Context, opts *config.Options) (*Result, erro
 	res.Stats = art.Stats
 	res.Duration = time.Since(start)
 	return res, nil
+}
+
+// CheckLevelChain 校验注册序列上的层次链是连续的。
+//
+// 规则：起点必须是 LevelZip（未加工的条目集合），且每个 Pass 的 Out 必须等于
+// 下一个 Pass 的 In。全部声明 LevelZip 时天然成立；一旦有人给某个 Pass 声明了
+// 别的层次，就必须同时把相邻 Pass 的 In/Out 一起改对，否则这里会报错。
+func CheckLevelChain(order []Pass) error {
+	if len(order) == 0 {
+		return nil
+	}
+	if got := order[0].In(); got != LevelZip {
+		return fmt.Errorf("pipeline: 首个 Pass %s 的输入层次应为 %s，实际 %s",
+			order[0].ID(), LevelZip, got)
+	}
+	for i := 0; i+1 < len(order); i++ {
+		if out, in := order[i].Out(), order[i+1].In(); out != in {
+			return fmt.Errorf("pipeline: 层次链断裂——%s 输出 %s，但下一个 %s 需要 %s；"+
+				"注册顺序与 In/Out 声明不一致（顺序约束见 passes.go 的注释）",
+				order[i].ID(), out, order[i+1].ID(), in)
+		}
+	}
+	return nil
 }
 
 func nameOf(id config.FeatureID) string {
