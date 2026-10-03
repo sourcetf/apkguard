@@ -150,6 +150,58 @@ func TestEnabledIDs(t *testing.T) {
 	}
 }
 
+// TestValidateRejectsLibOptionsWithoutC7 验证 C7 相关选项不会被静默忽略。
+//
+// 历史缺陷：-lib-strip-sections 与单独使用的 -lib-name 都到不了
+// passes/libdisguise.go 的拒绝分支——C7 未启用时该 pass 根本不执行，
+// 用户以为拿到了额外防护，实际什么都没做。
+func TestValidateRejectsLibOptionsWithoutC7(t *testing.T) {
+	// 削节头：无论如何都应被拒（能力已废弃）。
+	o := &Options{Enabled: map[FeatureID]bool{"E1": false}, In: "a.apk", LibStripSections: true}
+	err := o.Validate()
+	if err == nil || !strings.Contains(err.Error(), "lib-strip-sections") {
+		t.Fatalf("LibStripSections=true 应被拒绝并说明原因，实际: %v", err)
+	}
+
+	// 单独指定假库名但未启用 C7：必须提示启用 C7。
+	o2 := &Options{Enabled: map[FeatureID]bool{"E1": false}, In: "a.apk", LibFakeName: "libsqlite3x.so"}
+	err = o2.Validate()
+	if err == nil || !strings.Contains(err.Error(), "C7") {
+		t.Fatalf("LibFakeName 非空但未启用 C7 应报错并提示 C7，实际: %v", err)
+	}
+
+	// 补齐 C7 及其依赖（C1→B2,E1）后应通过。
+	o3 := &Options{
+		Enabled: map[FeatureID]bool{"E1": true, "B2": true, "C1": true, "C7": true},
+		In:      "a.apk", KS: "k.jks", LibFakeName: "libsqlite3x.so",
+	}
+	if err := o3.Validate(); err != nil {
+		t.Fatalf("启用 C7 并满足依赖后不应报错: %v", err)
+	}
+}
+
+// TestValidateRejectsExtractRatio 验证 B5 的死开关被显式拒绝。
+func TestValidateRejectsExtractRatio(t *testing.T) {
+	o := &Options{Enabled: map[FeatureID]bool{"E1": false}, In: "a.apk", ExtractRatio: 50}
+	err := o.Validate()
+	if err == nil || !strings.Contains(err.Error(), "B5") {
+		t.Fatalf("ExtractRatio=50 应因 B5 未实现被拒绝，实际: %v", err)
+	}
+}
+
+// TestManifestPadMBUpperBound 验证 A15 填充量上限收紧到 4095（4096MB 会使 uint32 溢出）。
+func TestManifestPadMBUpperBound(t *testing.T) {
+	base := func(mb int) *Options {
+		return &Options{Enabled: map[FeatureID]bool{"E1": false}, In: "a.apk", ManifestPadMB: mb}
+	}
+	if err := base(4096).Validate(); err == nil || !strings.Contains(err.Error(), "4095") {
+		t.Fatalf("ManifestPadMB=4096 应被拒绝（uint32 溢出），实际: %v", err)
+	}
+	if err := base(4095).Validate(); err != nil {
+		t.Fatalf("ManifestPadMB=4095 应通过: %v", err)
+	}
+}
+
 // TestValidateKeystoreOnlyWhenSigning 验证密钥库只在启用签名时才必需。
 //
 // 未启用 E1 时产物本就是未签名 APK，「必须指定密钥库」会把

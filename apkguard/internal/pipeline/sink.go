@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"apkguard/internal/axml"
 	"apkguard/internal/config"
@@ -50,12 +51,24 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 	}
 
 	// ---- E2: zipalign ----
+	//
+	// 用 WriteChecked 而非 Write：生产路径的条目数/字段长度可能触及 ZIP 上限，
+	// 静默回绕会产出不可解析的坏包，必须把错误向上返回。
+	// 这里记录实际使用的对齐参数并交给签名阶段，避免 v1 重写时又按默认值
+	// 强制对齐（那样 E2 关闭时产物仍会被对齐）。
 	var raw []byte
+	var alignOpts zipx.AlignOptions
 	if opts.IsEnabled("E2") {
-		raw = zipx.Write(art.Archive, zipx.DefaultAlign())
-		art.Note("E2 zipalign：按 4 字节（.so 4096 字节）对齐重写归档")
+		alignOpts = zipx.DefaultAlign()
 	} else {
-		raw = zipx.Write(art.Archive, zipx.AlignOptions{Align: 1, SoAlign: 1})
+		alignOpts = zipx.AlignOptions{Align: 1, SoAlign: 1}
+	}
+	raw, err := zipx.WriteChecked(art.Archive, alignOpts)
+	if err != nil {
+		return nil, fmt.Errorf("重写归档失败: %w", err)
+	}
+	if opts.IsEnabled("E2") {
+		art.Note("E2 zipalign：按 4 字节（.so 16384 字节）对齐重写归档")
 	}
 
 	// ---- E1: 签名 ----
@@ -100,6 +113,18 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 		return nil, fmt.Errorf("v3 签名区间非法：minSdk=%d 大于 maxSdk=%d", minSDK, maxSDK)
 	}
 
+	// 签名阶段会新增 MANIFEST.MF / CERT.SF / CERT.RSA 三个条目，它们晚于
+	// A14 元数据统一化。启用 A14 时把同一个统一时间戳一并交给签名器，否则
+	// 这三个条目会退回 ZIP 的 1980 默认值，在产物里留下一枚独有的重打包
+	// 指纹；A14 未启用时则不干预，保持与既有条目各自的原始时间无关。
+	var stamp time.Time
+	if opts.IsEnabled("A14") {
+		stamp, err = opts.UnifiedStamp()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	sr, err := sign.Sign(clean, ks, sign.Options{
 		V1:     !opts.NoV1,
 		V2:     !opts.NoV2,
@@ -107,6 +132,8 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 		V4:     opts.V4,
 		MinSDK: minSDK,
 		MaxSDK: maxSDK,
+		Stamp:  stamp,
+		Align:  alignOpts,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("签名失败: %w", err)

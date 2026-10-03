@@ -269,7 +269,11 @@ func TestPackNoMACCompatDisabled(t *testing.T) {
 		t.Fatal("未启用 MAC 时清单/载荷不应标记 MAC")
 	}
 	// 与 pack.Make 的旧格式产物逐字节比对。
-	want, err := pack.Make([]pack.Dex{{Name: "classes.dex", Data: real}}, pack.Key("k"), "s")
+	k, err := pack.Key("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := pack.Make([]pack.Dex{{Name: "classes.dex", Data: real}}, k, "s")
 	if err != nil {
 		t.Fatal(err)
 	}

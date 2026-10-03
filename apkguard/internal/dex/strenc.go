@@ -635,7 +635,10 @@ func (b *builder) encryptCodeItem(pl *plan, src []byte) (blob []byte, skip map[i
 		return nil, nil, false, nil
 	}
 
-	insns, m, fresh := l.Encode()
+	insns, m, fresh, err := l.EncodeChecked()
+	if err != nil {
+		return nil, nil, false, err
+	}
 	skip = fresh
 
 	ci.Insns = insns
@@ -647,7 +650,11 @@ func (b *builder) encryptCodeItem(pl *plan, src []byte) (blob []byte, skip map[i
 	// 还会重算 handler_off（异常处理器列表内的字节偏移）——后者必须重算，
 	// 否则地址编码长度变化会让偏移失效，ART 判 "Bogus handler offset" 并
 	// 丢弃整个 DEX。
-	return ci.Encode(func(old uint32) uint32 { return FixAddr(m, old) }), skip, true, nil
+	code, err := ci.EncodeChecked(func(old uint32) uint32 { return FixAddr(m, old) })
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return code, skip, true, nil
 }
 
 // sameWords 判断两个字序列是否完全相同。

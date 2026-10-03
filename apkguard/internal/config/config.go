@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // FeatureID 是功能项的唯一标识，形如 "A1"、"B3"。
@@ -80,7 +81,7 @@ type Feature struct {
 	Note    string    `json:"note"`
 	// Implemented 表示该功能项**已有实际实现**。
 	//
-	// 设计文档罗列了 38 项能力，但并非全部落地。这个字段的作用是让
+	// 设计文档共罗列 46 项能力，但并非全部落地。这个字段的作用是让
 	// 「启用了一个还没实现的功能项」变成显式错误，而不是静默地什么都不做——
 	// 后者会让使用方以为自己拿到了 Root 检测、反调试等防护，实际却完全没有。
 	Implemented bool `json:"implemented"`
@@ -416,6 +417,28 @@ type Options struct {
 	Jobs     int      `json:"jobs"`     // E5 并发数（0=CPU 核数）
 }
 
+// DefaultStamp 是 A14 未指定 -stamp-time 时使用的固定时间戳。
+//
+// 它必须是**全局唯一**的时间来源：A14 统一元数据之后，E1 签名还会往里
+// 追加 MANIFEST.MF / CERT.SF / CERT.RSA 三个条目，这三个条目若用各自
+// 的默认值（1980-01-01），产物就会出现「唯独签名文件是 1980」这一枚
+// 重打包指纹——恰好与 A14 的目的相反。因此签名侧必须能拿到同一个时间。
+var DefaultStamp = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// UnifiedStamp 返回 A14 元数据统一化使用的时间戳。
+//
+// StampTime 非空时按 RFC3339 解析；否则退回 DefaultStamp。
+func (o *Options) UnifiedStamp() (time.Time, error) {
+	if o.StampTime == "" {
+		return DefaultStamp, nil
+	}
+	t, err := time.Parse(time.RFC3339, o.StampTime)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("时间戳格式非法（应为 RFC3339）: %w", err)
+	}
+	return t, nil
+}
+
 // IsEnabled 判断某功能项是否启用；未显式设置时取默认值。
 func (o *Options) IsEnabled(id FeatureID) bool {
 	if o.Enabled == nil {
@@ -512,7 +535,7 @@ func (o *Options) Validate() error {
 
 	// 未实现的功能项不允许启用。
 	//
-	// 这是最重要的一条校验：设计文档罗列的 38 项能力并非全部落地，
+	// 这是最重要的一条校验：设计文档罗列的 46 项能力并非全部落地，
 	// 而「启用后什么都不做」是最危险的失败模式——使用方会以为自己拿到了
 	// Root 检测、反调试、签名校验等防护，实际产物里一个都没有。
 	// 宁可让命令失败，也不能静默地产出一个防护与预期不符的 APK。
@@ -528,6 +551,27 @@ func (o *Options) Validate() error {
 			strings.Join(unimplemented, "、")))
 	}
 
+	// 已废弃 / 尚未实现的能力：必须显式拒绝，绝不能静默忽略。
+	//
+	//   - LibStripSections：实测 Android 动态链接器会校验 ELF 节头表，
+	//     清零会让 dlopen 直接失败；见 passes/libdisguise.go 的说明。
+	//   - LibFakeName：只有 C7 才能消费它，单独设置会「开关打开了但什么都没发生」。
+	//   - ExtractRatio：B5（函数抽取）未实现，且不属于已实现集合；单独设置同样静默无效。
+	if o.LibStripSections {
+		errs = append(errs,
+			"-lib-strip-sections 已废弃：Android 的动态链接器会校验 ELF 节头表"+
+				"（实测清零 e_shentsize/e_shstrndx 会让 dlopen 直接失败），且 C6 的完整性校验"+
+				"依赖节名定位 .text/.rodata。该选项不再提供，请只用 -lib-name 做改名伪装")
+	}
+	if o.LibFakeName != "" && !o.IsEnabled("C7") {
+		errs = append(errs,
+			"已指定 -lib-name，但未启用 C7（原生库伪装）：请用 -enable C7 启用后再指定假库名，"+
+				"否则改名不会发生")
+	}
+	if o.ExtractRatio != 0 {
+		errs = append(errs, "B5（函数抽取）尚未实现，-extract-ratio 不可用")
+	}
+
 	// 参数范围
 	if o.ObfStringMin < 0 {
 		errs = append(errs, "A2 最小加密长度不能为负")
@@ -535,8 +579,9 @@ func (o *Options) Validate() error {
 	if o.ExtractRatio < 0 || o.ExtractRatio > 100 {
 		errs = append(errs, "B5 抽取比例须在 0~100 之间")
 	}
-	if o.ManifestPadMB < 0 || o.ManifestPadMB > 4096 {
-		errs = append(errs, "A15 填充量须在 0~4096 MB 之间")
+	// 上限取 4095：4096<<20 == 2^32，会让填充量的字节运算在 uint32 上回绕为 0。
+	if o.ManifestPadMB < 0 || o.ManifestPadMB > 4095 {
+		errs = append(errs, "A15 填充量须在 0~4095 MB 之间（4096MB 会使 uint32 字节数溢出）")
 	}
 	if o.FakeDexCount < 0 || o.JunkTopCount < 0 || o.JunkDirCount < 0 || o.ClassPadCount < 0 {
 		errs = append(errs, "数量类参数不能为负")

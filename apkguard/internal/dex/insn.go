@@ -140,6 +140,21 @@ func ParseCodeItemBytes(d []byte) (*CodeItemFull, error) {
 			ci.Handlers = append(ci.Handlers, h)
 		}
 	}
+	// 结构校验：try_item.handler_off 必须等于某个处理器在列表中的起始字节偏移。
+	// 不这样做的话，畸形输入会一路走到 CodeItemFull.Encode 才发现映射缺失，
+	// 早期实现甚至在那里 panic。这里提前拒绝，使所有解析入口都返回 error。
+	if len(ci.Tries) > 0 && len(ci.HandlerOffs) == len(ci.Handlers) {
+		valid := make(map[uint16]bool, len(ci.HandlerOffs))
+		for _, o := range ci.HandlerOffs {
+			valid[o] = true
+		}
+		for _, t := range ci.Tries {
+			if !valid[t.HandlerOff] {
+				return nil, fmt.Errorf("%w: try_item.handler_off=%d 未指向任何处理器起点（共 %d 个）",
+					ErrBadLayout, t.HandlerOff, len(ci.HandlerOffs))
+			}
+		}
+	}
 	return ci, nil
 }
 
@@ -147,7 +162,23 @@ func ParseCodeItemBytes(d []byte) (*CodeItemFull, error) {
 //
 // 传入的 addrFix 用于修正 try 与 catch handler 中的代码偏移；
 // 为 nil 时按原值输出。
+//
+// 这是历史签名（无 error）。对畸形输入不会 panic，但由于调用方无法接收错误，
+// 它只能采取退化行为；需要错误语义的调用方请用 EncodeChecked。
 func (ci *CodeItemFull) Encode(addrFix func(old uint32) uint32) []byte {
+	out, _ := ci.encode(addrFix, false)
+	return out
+}
+
+// EncodeChecked 与 Encode 相同，但对结构损坏的输入返回 error（不 panic、
+// 也不静默沿用旧值）。ParseCodeItemBytes 已在解析阶段拒绝非法的
+// try_item.handler_off，因此正常流程不会触发这里；它用于手工构造的
+// CodeItemFull 或将来新增的入口。
+func (ci *CodeItemFull) EncodeChecked(addrFix func(old uint32) uint32) ([]byte, error) {
+	return ci.encode(addrFix, true)
+}
+
+func (ci *CodeItemFull) encode(addrFix func(old uint32) uint32, strict bool) ([]byte, error) {
 	fix := func(v uint32) uint32 {
 		if addrFix == nil {
 			return v
@@ -165,7 +196,7 @@ func (ci *CodeItemFull) Encode(addrFix func(old uint32) uint32) []byte {
 		binary.LittleEndian.PutUint16(out[16+2*i:], w)
 	}
 	if len(ci.Tries) == 0 {
-		return out
+		return out, nil
 	}
 	// tries 前需 4 字节对齐
 	if len(ci.Insns)&1 != 0 {
@@ -221,7 +252,12 @@ func (ci *CodeItemFull) Encode(addrFix func(old uint32) uint32) []byte {
 		} else if len(ci.HandlerOffs) == len(ci.Handlers) {
 			// 记了旧偏移却查不到，说明上游把 handler 结构改坏了——
 			// 绝不能静默沿用旧值，那会产出被 ART 丢弃的非法 DEX。
-			panic(fmt.Sprintf("dex: try_item.handler_off=%d 不在处理器起始偏移中（code_item 结构已损坏）", ho))
+			if strict {
+				return nil, fmt.Errorf(
+					"dex: try_item.handler_off=%d 不在处理器起始偏移中（code_item 结构已损坏）", ho)
+			}
+			// 非严格路径（历史 Encode 签名，调用方无法接收 error）：不 panic，
+			// 保留旧值；此类输入本应已被 ParseCodeItemBytes 拒绝。
 		}
 		var b [8]byte
 		binary.LittleEndian.PutUint32(b[0:], s)
@@ -230,7 +266,7 @@ func (ci *CodeItemFull) Encode(addrFix func(old uint32) uint32) []byte {
 		out = append(out, b[:]...)
 	}
 	out = append(out, newHandlers...)
-	return out
+	return out, nil
 }
 
 // encodeHandlerList 编码 encoded_catch_handler_list，并返回每个处理器
@@ -642,16 +678,28 @@ func fillArrayPayload(data []byte) []uint16 {
 // 「构造 byte[] 并调用还原方法」的指令序列，同时在流末尾追加 payload。
 //
 // 目标寄存器 vX 先当数组、随后被结果覆盖，因此不需要额外的临时寄存器。
-// 各指令的字偏移如下（fresh 位置即其中已写成最终索引的字）：
+// 长度 ≤ 0x7fff 时用 const/16（21s，2 字）承载，各指令的字偏移如下
+// （fresh 位置即其中已写成最终索引的字）：
 //
 //	0..1  const/16           vX, n            （21s，2 字）
 //	2..3  new-array          vX, vX, [B       （22c，2 字）type 索引 @3
-//	4..6  fill-array-data    vX, :payload     （31t，3 字）偏移 @5-6
+//	4..6  fill-array-data    vX, :payload     （31t，3 字）偏移 @5-6，基准 4
 //	7..9  invoke-static/range {vX}, helper    （3rc，3 字）method 索引 @8
 //	10    move-result-object vX               （11x，1 字）
 //
+// 长度 > 0x7fff 时必须改用 const（0x14，31i，3 字）。绝不能用 const/16：
+// uint16(n) 会被解释成负数（如 40000 → -25536），真机 new-array 抛
+// NegativeArraySizeException，而本地结构校验完全看不出来。多出的 1 个字
+// 使后续所有项内偏移 +1：
+//
+//	0..2  const              vX, n            （31i，3 字）
+//	3..4  new-array          vX, vX, [B       （22c，2 字）type 索引 @4
+//	5..7  fill-array-data    vX, :payload     （31t，3 字）偏移 @6-7，基准 5
+//	8..10 invoke-static/range {vX}, helper    （3rc，3 字）method 索引 @9
+//	11    move-result-object vX               （11x，1 字）
+//
 // 返回 false 表示该寄存器编号无法用 new-array 的 4 位字段编码（> v15），
-// 此时不做任何修改。
+// 或长度超出 31i 的承载范围；此时不做任何修改。
 func (l *InsnList) ReplaceWithArrayData(i int, data []byte, byteArrayTypeIdx, helperIdx uint32) bool {
 	if i < 0 || i >= len(l.items) || !l.ItemIsInsn(i) {
 		return false
@@ -673,6 +721,24 @@ func (l *InsnList) ReplaceWithArrayData(i int, data []byte, byteArrayTypeIdx, he
 		words: fillArrayPayload(data), kind: itemFillArrayData, old: payloadOld,
 	})
 
+	if n > 0x7fff {
+		// const vX, #n（0x14，31i，3 字）；n ≤ 0x7fffffff 保证是有符号 32 位正数。
+		l.Replace(i, []uint16{
+			0x14 | uint16(reg)<<8, uint16(n), uint16(n >> 16), // const vX, n
+			0x23 | uint16(reg)<<8 | uint16(reg)<<12, uint16(byteArrayTypeIdx), // new-array
+			0x26 | uint16(reg)<<8, 0, 0, // fill-array-data
+			0x77 | uint16(1)<<8, uint16(helperIdx), uint16(reg), // invoke-static/range
+			0x0c | uint16(reg)<<8, // move-result-object
+		},
+			4, // new-array 的 type 索引（22c 的 word1）
+			9, // invoke-static/range 的 method 索引（3rc 的 word1）
+		)
+		l.branches = append(l.branches, branchRef{
+			item: i, word: 6, base: 5, target: payloadOld, form: form31t,
+		})
+		return true
+	}
+
 	l.Replace(i, []uint16{
 		0x13 | uint16(reg)<<8, uint16(n), // const/16 vX, n
 		0x23 | uint16(reg)<<8 | uint16(reg)<<12, uint16(byteArrayTypeIdx), // new-array vX, vX, [B
@@ -693,7 +759,22 @@ func (l *InsnList) ReplaceWithArrayData(i int, data []byte, byteArrayTypeIdx, he
 //
 // 返回的新指令流、旧字偏移 → 新字偏移的映射（用于修正异常表），
 // 以及全部「已写成最终索引、不可再映射」的绝对字位置（供 remapCode 跳过）。
+//
+// 历史签名（无 error）：对无法编码的分支偏移采取退化行为。需要错误语义的
+// 调用方请用 EncodeChecked。
 func (l *InsnList) Encode() ([]uint16, map[int]int, map[int]bool) {
+	out, m, f, _ := l.encode(false)
+	return out, m, f
+}
+
+// EncodeChecked 与 Encode 相同，但当某个分支的相对偏移无法用其格式编码
+// （20t/22t 超出 int16 范围）时返回 error，而不是静默截断——截断会产出
+// 「跳错位置」的字节码，ART 判 invalid branch target 并拒绝整个类。
+func (l *InsnList) EncodeChecked() ([]uint16, map[int]int, map[int]bool, error) {
+	return l.encode(true)
+}
+
+func (l *InsnList) encode(strict bool) ([]uint16, map[int]int, map[int]bool, error) {
 	// ---- 0) 布局迭代：必要时把 goto 加宽 ----
 	//
 	// goto 是格式 10t，相对偏移只有 **8 位**（-128..127）。A2/A3 改写会插入
@@ -804,6 +885,21 @@ func (l *InsnList) Encode() ([]uint16, map[int]int, map[int]bool) {
 		case form10t:
 			out[it.new] = uint16(it.words[0]&0xff) | uint16(byte(int8(rel)))<<8
 		case form20t, form22t:
+			if rel < -32768 || rel > 32767 {
+				if strict {
+					return nil, nil, nil, fmt.Errorf(
+						"dex: 分支（项 %d，格式 %d）相对偏移 %d 超出 16 位范围，无法编码",
+						b.item, b.form, rel)
+				}
+				// 非严格路径：夹到范围内（历史行为）。此类越界在真实样本中
+				// 意味着改写规模已超出 16 位分支的承载能力，调用方应改用
+				// EncodeChecked 以失败代替静默错位。
+				if rel > 32767 {
+					rel = 32767
+				} else {
+					rel = -32768
+				}
+			}
 			out[pos] = uint16(int16(rel))
 		case form30t, form31t:
 			out[pos] = uint16(rel & 0xffff)
@@ -820,7 +916,7 @@ func (l *InsnList) Encode() ([]uint16, map[int]int, map[int]bool) {
 			out[pos+1] = uint16(uint32(int32(rel)) >> 16)
 		}
 	}
-	return out, old2new, fresh
+	return out, old2new, fresh, nil
 }
 
 // FixAddr 依据 old2new 映射修正一个代码偏移（用于异常表）。
@@ -829,6 +925,46 @@ func FixAddr(old2new map[int]int, old uint32) uint32 {
 		return uint32(v)
 	}
 	return old
+}
+
+// translateSkip 把 skip 里的绝对字位置从「本 InsnList 解析前的坐标」换算到
+// 「Encode 之后的坐标」。
+//
+// 为什么需要：skip 记录的是「已写成最终索引、不可再映射」的字位置，由上游改写
+// 步骤（A2/A3）按其产物坐标系给出。后续步骤会插入/替换指令、整体平移布局，
+// 若直接把上游的绝对位置与自身的 skip 求并集，就会把不同坐标系的位置混在一起：
+// remapCode 要么跳过错误的字（漏映射，留下旧索引），要么漏跳正确的字（二次映射，
+// 把已是最终值的索引按旧表再映射一次 → 常见「method 索引越界 N/M」）。
+//
+// 换算方式与 widenConstStrings 一致：按「项内相对偏移」处理——找到包含该字的项，
+// 用其最终起点还原。oldLens 必须是**解析后、任何替换之前**各项的字长。
+// 仅对「本步未改动其内部布局」的项成立；上游 skip 恰好落在本步会改写的项上时
+// 换算不可靠，调用方需保证不会发生（A3 已跳过 A2 的加密序列）。
+func (l *InsnList) translateSkip(skip map[int]bool, oldLens []int) map[int]bool {
+	if len(skip) == 0 {
+		return nil
+	}
+	out := make(map[int]bool, len(skip))
+	for p := range skip {
+		np := p
+		// 只遍历「解析时已存在」的项：oldLens 在替换/追加 payload 之前记录，
+		// 其长度小于当前 l.items（A3 会在末尾追加 payload），越界访问会 panic。
+		// 上游 skip 只可能落在这些原始项内；找不到时保持原值。
+		n := len(oldLens)
+		if len(l.items) < n {
+			n = len(l.items)
+		}
+		for i := 0; i < n; i++ {
+			it := l.items[i]
+			ol := oldLens[i]
+			if p >= it.old && p < it.old+ol {
+				np = it.new + (p - it.old)
+				break
+			}
+		}
+		out[np] = true
+	}
+	return out
 }
 
 // widenBranch 把一个 10t 分支（goto）加宽为 goto/16 或 goto/32。

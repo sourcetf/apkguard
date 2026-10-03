@@ -221,8 +221,15 @@ func TestRebuildConstantArrayKeepsPool(t *testing.T) {
 
 // TestRebuildConstantArrayComposesWithEncrypt 验证 A2 与 A3 可同时启用且互不破坏。
 //
-// 这是最容易出错的地方：两个 Pass 都会改写 const-string，
-// 若 skip 位置登记错位，最终字节码会指向错误的索引。
+// 这是最容易出错的地方：两个 Pass 都会改写 const-string，若 skip 位置登记错位，
+// 最终字节码会指向错误的索引。
+//
+// 参数要点：A2 的 MinLen 必须小于等于 A3 的 MinLen，这样 A2 先把长串改成
+// 「密文 jumbo + 解密调用」，A3 仍会扫描同一批 const-string（若 isStringDecrypt
+// 判据依赖旧方法表就会误判，把 A2 的密文 jumbo 当成普通串再数组化，且用旧池
+// 下标解出错误明文）。旧测试用两者同为 MinLen:4 并只断言「能解析」，恰好掩盖了
+// 这一点：产物能解析，但方法体引用/内容已经错乱。这里改为断言 A3 不得重复处理
+// A2 已加密的常量（arrayized==0），并核对解密序列确实引用正确的方法描述符。
 func TestRebuildConstantArrayComposesWithEncrypt(t *testing.T) {
 	data := sampleDex(t)
 	f, err := Parse(data)
@@ -233,15 +240,23 @@ func TestRebuildConstantArrayComposesWithEncrypt(t *testing.T) {
 		Class: "Lapkguard/Dec;", MethodName: "a", Key: [32]byte{0x5a},
 		MinLen: 4, InjectClass: true,
 	}
+	// A3 的 MinLen 设为 1，让它去处理 A2 未加密的短常量：这样 A3 确实改变
+	// 指令布局（而不是被 A2 处理完后无事可做），才会暴露 skip 坐标系混用的缺陷。
 	ca := &ConstantArray{
-		Class: "Lapkguard/Arr;", MethodName: "b", MinLen: 4, InjectClass: true,
+		Class: "Lapkguard/Arr;", MethodName: "b", MinLen: 1, InjectClass: true,
 	}
-	out, _, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se, ConstantArray: ca})
+	out, st, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se, ConstantArray: ca})
 	if err != nil {
 		t.Fatalf("A2+A3 同时启用时重建失败: %v", err)
 	}
 	if err := Verify(out); err != nil {
 		t.Fatalf("重建后校验失败: %v", err)
+	}
+	if st.StringsEncrypted == 0 {
+		t.Fatal("A2 未加密任何字符串，参数无效")
+	}
+	if st.StringsArrayized == 0 {
+		t.Fatal("A3 未数组化任何字符串，未能触发布局变化，测试无效")
 	}
 	g, err := Parse(out)
 	if err != nil {
@@ -250,32 +265,67 @@ func TestRebuildConstantArrayComposesWithEncrypt(t *testing.T) {
 	if g.NClass != f.NClass+2 {
 		t.Fatalf("应注入 2 个类（解密器 + 还原器）: %d -> %d", f.NClass, g.NClass)
 	}
-	// 两个注入类的方法体都必须可解析
-	n := 0
-	g.walkAllCode(func(codeOff uint32) error {
-		if _, err := g.ParseCodeItem(codeOff); err != nil {
-			t.Fatalf("@%d 解析失败: %v", codeOff, err)
-		}
-		n++
-		return nil
-	})
-	// 全部指令流必须可被解析为合法指令（能发现 skip 错位导致的索引污染）
-	m := 0
+	decIdx := methodIDIndex(t, g, "Lapkguard/Dec;", "a", "(Ljava/lang/String;)Ljava/lang/String;")
+	arrIdx := methodIDIndex(t, g, "Lapkguard/Arr;", "b", "([B)Ljava/lang/String;")
+	decRefs, arrRefs := 0, 0
 	err = g.walkAllCode(func(codeOff uint32) error {
 		ci, err := g.ParseCodeItem(codeOff)
 		if err != nil {
 			return err
 		}
-		if _, err := ParseInsns(ci.Insns); err != nil {
+		l, err := ParseInsns(ci.Insns)
+		if err != nil {
 			return err
 		}
-		m++
+		for i := 0; i < l.ItemCount(); i++ {
+			if !l.ItemIsInsn(i) {
+				continue
+			}
+			w := l.ItemWords(i)
+			op := byte(w[0] & 0xff)
+			switch op {
+			case 0x1b: // const-string/jumbo：A2 序列的头
+				if i+2 >= l.ItemCount() {
+					continue
+				}
+				inv, res := l.ItemWords(i+1), l.ItemWords(i+2)
+				if byte(inv[0]&0xff) == 0x77 && byte(res[0]&0xff) == 0x0c &&
+					int(inv[0]>>8) == 1 && int(inv[2]) == int(w[0]>>8) && int(res[0]>>8) == int(w[0]>>8) {
+					// A2 的解密序列：方法索引必须是最终解密方法（skip 坐标错了会指向别人）
+					if int(inv[1]) != int(decIdx) {
+						t.Errorf("@%d jumbo@%d 的解密调用方法索引应为 %d，实际 %d（skip 坐标错位）",
+							codeOff, l.ItemOldOffset(i), decIdx, inv[1])
+					}
+					decRefs++
+				}
+			case 0x23: // new-array：A3 序列的结构标志
+				if i+2 >= l.ItemCount() {
+					continue
+				}
+				fa, inv := l.ItemWords(i+1), l.ItemWords(i+2)
+				if byte(fa[0]&0xff) == 0x26 && byte(inv[0]&0xff) == 0x77 {
+					// A3 的还原调用：方法索引必须是最终还原方法。
+					if int(inv[1]) != int(arrIdx) {
+						t.Errorf("@%d new-array@%d 的还原调用方法索引应为 %d，实际 %d",
+							codeOff, l.ItemOldOffset(i), arrIdx, inv[1])
+					}
+					arrRefs++
+				}
+			}
+		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("指令流校验失败: %v", err)
+		t.Fatalf("遍历失败: %v", err)
 	}
-	t.Logf("A2+A3 组合：%d 个方法体、%d 条指令流全部合法；类 %d->%d", n, m, f.NClass, g.NClass)
+	if decRefs == 0 {
+		t.Fatal("产物中没有任何对解密方法的引用，A2 解密序列丢失")
+	}
+	if arrRefs == 0 {
+		t.Fatal("产物中没有任何对还原方法的引用，A3 序列丢失")
+	}
+	t.Logf("A2+A3 组合：加密 %d、数组化 %d、解密引用 %d、还原引用 %d；类 %d->%d",
+		st.StringsEncrypted, st.StringsArrayized, decRefs, arrRefs, f.NClass, g.NClass)
 }
 
 // TestStringUsageCoversDebugInfo 验证调试信息中的字符串被纳入用途统计。

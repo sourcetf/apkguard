@@ -65,6 +65,10 @@ type File struct {
 	// 因此需要精确的结束位置——不能靠「下一个字符串的起始」推断，
 	// 因为字符串之间可能存在对齐填充。
 	poolStrEnd []int
+	// poolStyles 是原池的 style（富文本样式）数据；无 style 时为 nil。
+	//
+	// 重建池时必须原样保留，否则富文本样式会被静默丢弃（真实产物已因此损坏）。
+	poolStyles *Styles
 
 	// Elements 是全部起始元素（按出现顺序）。
 	Elements []*Element
@@ -161,10 +165,15 @@ func (f *File) parseStringPool(off, hs, size int) error {
 		return fmt.Errorf("axml: 字符串池头部越界")
 	}
 	count := int(binary.LittleEndian.Uint32(d[off+8:]))
+	styleCount := int(binary.LittleEndian.Uint32(d[off+12:]))
 	flags := binary.LittleEndian.Uint32(d[off+16:])
 	stringsStart := int(binary.LittleEndian.Uint32(d[off+20:]))
+	stylesStart := int(binary.LittleEndian.Uint32(d[off+24:]))
 	if count < 0 || count > 1<<20 {
 		return fmt.Errorf("axml: 字符串数量异常 %d", count)
+	}
+	if styleCount < 0 || styleCount > 1<<20 || styleCount > count {
+		return fmt.Errorf("axml: style 数量异常 %d（字符串 %d）", styleCount, count)
 	}
 	base := off + stringsStart
 	if base > off+size {
@@ -176,6 +185,30 @@ func (f *File) parseStringPool(off, hs, size int) error {
 	f.poolUTF8 = flags&utf8Flag != 0
 	f.poolStrOff = make([]int, count)
 	f.poolStrEnd = make([]int, count)
+
+	// style 偏移数组紧跟在字符串偏移数组之后，仅当 styleCount > 0 时存在；
+	// style 数据区位于 stylesStart 起、直到池块末尾。二者都必须原样保留，
+	// 否则富文本样式会被静默丢弃。
+	if styleCount > 0 {
+		styleArrEnd := off + 28 + count*4 + styleCount*4
+		if styleArrEnd > off+size {
+			return fmt.Errorf("axml: style 偏移数组越界")
+		}
+		if stylesStart <= 0 || off+stylesStart < styleArrEnd || off+stylesStart > off+size {
+			return fmt.Errorf("axml: stylesStart 非法 %d", stylesStart)
+		}
+		offs := make([]uint32, styleCount)
+		for i := range offs {
+			offs[i] = binary.LittleEndian.Uint32(d[off+28+count*4+4*i:])
+		}
+		sdata := d[off+stylesStart : off+size]
+		for i, o := range offs {
+			if o != noEntry && int(o) >= len(sdata) {
+				return fmt.Errorf("axml: 第 %d 个 style 偏移越界 %d", i, o)
+			}
+		}
+		f.poolStyles = &Styles{Count: styleCount, Offsets: offs, Data: sdata}
+	}
 
 	p := base
 	for i := 0; i < count; i++ {
@@ -225,7 +258,13 @@ func utf8Len(d []byte, p int) (uint32, int, error) {
 }
 
 // utf16Len 读取 UTF-16 字符串池中的变长长度字段。
-func utf16Len(d []byte, p int) (uint16, int) {
+//
+// 返回 uint32 而不是 uint16：长格式的首字只承载真实长度的**高 15 位**，
+// 低 16 位在次字里，因此真实长度可达 0x7fffffff。早期实现只返回次字
+// （`Uint16(d[p+2:])`），把任何码元数 > 65535 的字符串长度截断成低 16 位，
+// 后续读取就会截短字符串并让池内所有后续偏移错位。这里与
+// internal/arsc 的 utf16PoolLen 保持同一算法。
+func utf16Len(d []byte, p int) (uint32, int) {
 	if p+2 > len(d) {
 		return 0, p
 	}
@@ -234,9 +273,10 @@ func utf16Len(d []byte, p int) (uint16, int) {
 		if p+4 > len(d) {
 			return 0, p
 		}
-		return binary.LittleEndian.Uint16(d[p+2:]), p + 4
+		lo := binary.LittleEndian.Uint16(d[p+2:])
+		return uint32(v&0x7fff)<<16 | uint32(lo), p + 4
 	}
-	return v, p + 2
+	return uint32(v), p + 2
 }
 
 // parseStartElement 解析一个 RES_XML_START_ELEMENT_TYPE 块。

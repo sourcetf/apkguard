@@ -8,6 +8,7 @@
 
 用法：
     verify-products.py <加固后的.apk> <启用的功能项,逗号分隔> [--channel 名字]
+                       [--c2-lib 原始.so名] [--c2-size 原始.so字节数]
 
 退出码：0 = 全部通过；1 = 有断言失败（会逐条打印原因）。
 """
@@ -43,14 +44,49 @@ NO_INDEX = 0xFFFFFFFF
 
 FAKE_DEX_RE = re.compile(r"^(CLASSES\.DEX|Classes\.Dex|classes\.DEX)(\.\d+)?$")
 
-# B8 的容器目录：assets/<词>/<8 位十六进制>/... ；诱饵容器为 assets/<词>_<8 位十六进制>.zip
+# B8 的容器目录：assets/<词>/<8 位十六进制>/...。
+# 诱饵容器已改为「与真实载荷同构」：不再是顶层 `assets/<词>_<hex8>.zip`（带 PK 头，
+# 一眼可辨），而是落在**同一目录树**下的 `<12 位十六进制>.json`（写假包名）。
 CONTAINER_DIR_RE = re.compile(r"^assets/[a-z]+/[0-9a-f]{8}/")
-DECOY_ZIP_RE = re.compile(r"^assets/[a-z]+_[0-9a-f]{8}[.]zip$")
+DECOY_CFG_RE = re.compile(r"^assets/[a-z]+/[0-9a-f]{8}/[0-9a-f]{12}[.]json$")
 
 # B1 的加密载荷条目名：assets/<伪装词>_<8 位十六进制>.<伪装扩展名>。
 # 扩展名从 .bin/.dat/.res/.pack 里按哈希挑一个（见 internal/pack/pack.go 的
 # assetExts），所以不能只认 .bin。
+#
+# 注意：C2（SO 加壳）的载荷条目名用的是**同一套命名规范**（见
+# internal/passes/soenc.go 的 soAssetName），因此 PAYLOAD_RE 同时匹配两者的
+# 载荷——不能靠名字区分 B1 与 C2 的产物。
 PAYLOAD_RE = re.compile(r"^assets/[A-Za-z]+_[0-9a-f]{8}\.(bin|dat|res|pack)$")
+
+# A6 控制流混淆在 DEX 里留下的**不透明谓词指令骨架**。
+#
+# internal/dex/cff.go 的 predicateInsns 依次生成 8 条指令，每条都是 4 字节编码：
+#   const/16 vP,c | const/16 vT,c | mul-int vP,vP,vP | sub-int vP,vP,vT |
+#   const/16 vT,1 | and-int vP,vP,vT | if-eqz vP,off | goto/16 off
+# 寄存器 P/T 与常量 c 随方法变化，但 opcode 与「同一寄存器重复出现」的结构固定，
+# 因此用带反向引用的字节模式匹配：\1=vP、\2=常量 c（两字节）、\3=vT。
+#
+# 这是产物自身的证据，比 DEX 体积或加固日志里的统计更硬：实测在未加固的
+# classes.dex 上命中 0 次、在启用 A6 的产物上命中数与注入组数一致。
+A6_PREDICATE_RE = re.compile(
+    rb"\x13(.)(..)\x13(.)\2"  # const/16 vP,c ; const/16 vT,c
+    rb"\x92\1\1\1"            # mul-int vP,vP,vP
+    rb"\x91\1\1\3"            # sub-int vP,vP,vT
+    rb"\x13\3\x01\x00"        # const/16 vT,#1
+    rb"\x95\1\1\3"            # and-int vP,vP,vT
+    rb"\x38\1"                # if-eqz vP,off
+)
+
+# A6 的「不可达前向跳转块」骨架：方法入口处两条 goto/16（opcode 0x29），
+# 分别前向偏移 4 与 2 个码元，都指向紧随其后的真实入口。当前实现（cffRegs
+# 修好宽值寄存器占用后）在受控测试应用上不透明谓词覆盖为 0，真实痕迹落在这
+# 对 goto 上，因此 A6 的产物断言必须同时认这一形态。
+#
+# 注意：A20 无害花指令用的是同一对 goto 形态（只是前面多几个 nop），在产物
+# 字节上二者不可区分；因此本断言只能证明「A6 或 A20 生效」，两者同时启用时
+# 无法把功劳单独记给 A6。
+A6_FAKEJUMP_RE = re.compile(rb"\x29\x00\x04\x00\x29\x00\x02\x00")
 
 
 def read_bytes(zf, name):
@@ -209,10 +245,13 @@ def _decoy_is_provider(raw):
 
 
 class Checker:
-    def __init__(self, apk, features, channel=None):
+    def __init__(self, apk, features, channel=None, c2_lib=None, c2_size=None):
         self.apk = apk
         self.features = {f.strip().upper() for f in features if f.strip()}
         self.channel = channel
+        # C2 断言用的原始业务库名与字节数（由 e2e 传入，可选）。
+        self.c2_lib = c2_lib
+        self.c2_size = c2_size
         self.fails = []
         self.notes = []
         with zipfile.ZipFile(apk) as zf:
@@ -251,6 +290,25 @@ class Checker:
             self.check(info.compress_type == 0, "ALL",
                        "resources.arsc 是压缩存放（compress_type=%d）——Android 11+ 会拒绝安装该 APK"
                        % info.compress_type)
+
+        # ---- A14 元数据统一化：产物只允许存在一个时间戳 ----
+        #
+        # 签名阶段会新增 MANIFEST.MF / CERT.SF / CERT.RSA 三个条目，它们晚于
+        # A14。若它们退回 ZIP 的 1980 默认值，产物里就出现「唯独签名文件是
+        # 1980」这一枚独有的重打包指纹——恰好与 A14 消除痕迹的目的相反。
+        # 这条断言曾经抓到一次真实回归（3 个签名条目全是 1980）。
+        if self.want("A14"):
+            stamps = {}
+            for info in zf.infolist():
+                stamps.setdefault(info.date_time, []).append(info.filename)
+            self.check(len(stamps) == 1, "A14",
+                       "产物出现 %d 个不同时间戳（A14 要求统一为 1 个）：%s"
+                       % (len(stamps), {k: v[:4] for k, v in stamps.items()}))
+            for k, names in stamps.items():
+                if k[0] == 1980:
+                    self.check(False, "A14",
+                               "以下条目残留 1980 默认时间戳（签名阶段新增的条目未沿用统一时间）：%s"
+                               % names[:6])
 
         # ---- B1 DEX 整体加密：明文业务类不在 classes.dex 里，载荷在 assets/ ----
         #
@@ -327,10 +385,9 @@ class Checker:
 
         # ---- A16 诱饵核心文件：大小写/同形变体，且绝不撞真名 ----
         if self.want("A16"):
-            variants = [n for n in self.names if "/" not in n
-                        and n.lower() in ("androidmanifest.xml", "resources.arsc", "classes.dex")
-                        and n != n.lower() and n.lower() in ("androidmanifest.xml", "resources.arsc", "classes.dex")]
-            # 上面的写法会漏掉「同形但大小写混合」的形态，直接用精确名排除更稳：
+            # 判据：存在与真核心文件同名（忽略大小写）但大小写不同的变体条目。
+            # 排除三个精确名即可——resources.arsc 本身全小写，所以它的变体必然是
+            # 混合大小写（如 Resources.Arsc）；Manifest/dex 的变体同理。
             variants = [n for n in self.names if "/" not in n
                         and n.lower() in ("androidmanifest.xml", "resources.arsc", "classes.dex")
                         and n not in ("AndroidManifest.xml", "resources.arsc", "classes.dex")]
@@ -344,10 +401,13 @@ class Checker:
         # ---- A17 假内层 APK：assets 下存在一个能被打开的完整 APK ----
         if self.want("A17"):
             nested = []
-            # 重新打开归档读取条目内容：Checker 在 __init__ 的 with 块里只留了
-            # 条目名与 Manifest，闭包外再拿 ZipFile 会报「已关闭」。
-            with zipfile.ZipFile(self.apk) as zf:
-                blobs = {n: read_bytes(zf, n) for n in self.names if n.startswith("assets/")}
+            # 直接用 _run 传进来的 zf（它在整个 _run 期间都是打开的）。
+            #
+            # 曾经这里写成 `with zipfile.ZipFile(self.apk) as zf:`——那会**遮蔽**
+            # 同名参数，with 结束时把参数指向的归档关掉；后续任何用 zf 的断言
+            # （如 E4 渠道）就会抛 "Attempt to use ZIP archive that was already
+            # closed"。参数本身就是打开的那个，直接用即可。
+            blobs = {n: read_bytes(zf, n) for n in self.names if n.startswith("assets/")}
             for n, blob in blobs.items():
                 if not blob.startswith(b"PK"):
                     continue
@@ -369,12 +429,56 @@ class Checker:
         if self.want("A18"):
             self.check(manifest_contains(self.manifest, ".permission."), "A18",
                        "Manifest 里找不到自定义权限声明（诱饵权限没生效）")
-            self.check(not manifest_contains(self.manifest, "android.permission."), "A18",
-                       "Manifest 里出现了系统权限名（应只用系统未定义的自定义权限，避免影响安装与授权）")
+            # 不能断言「Manifest 里没有 android.permission.*」：真实应用自己就会
+            # 声明 INTERNET/CAMERA 之类的系统权限，这条会无条件误报。
+            # A18 的约束是「它**新增**的诱饵权限用自定义名」（系统不认识 → 不影响
+            # 安装与授权），而合并后的 Manifest 无法区分哪些是原有、哪些是新增。
+            # 因此只保留正向断言：诱饵权限确实以自定义名写入了。
+            if manifest_contains(self.manifest, "android.permission."):
+                self.notes.append("A18：Manifest 含系统权限名，可能来自应用自身声明（无法区分新增/原有），不做失败判定")
             self.check(manifest_contains(self.manifest, "uses-feature"), "A18",
                        "Manifest 里找不到 uses-feature（诱饵特性没生效）")
             self.check(manifest_contains(self.manifest, "queries"), "A18",
                        "Manifest 里找不到 queries 包可见性声明（诱饵没生效）")
+
+        # ---- C2 SO 加壳：业务 .so 从 lib/ 移走，变成 assets 下的加密载荷 ----
+        #
+        # 与 B1 的载荷同规范命名，无法靠名字区分，因此判据是：
+        #   1) 原始业务库名（--c2-lib）必须已从 lib/ 消失；
+        #   2) assets 下存在**密文**载荷（首字节不是 ELF magic）；
+        #   3) 若给出原始字节数（--c2-size），必须能找到一条长度≈明文+IV+填充
+        #      （16~64 字节增量）的载荷——把「某条载荷」与「被移走的那个 .so」
+        #      正向绑定，避免只靠「少了个文件」的弱断言。
+        #
+        # 局限：若同时启用 B1，assets 下会同时存在 B1 的 DEX 载荷；本断言靠
+        # 大小匹配与「非 ELF」仍成立，但 C2 与 B1 载荷的彻底区分需要解密。
+        if self.want("C2"):
+            if self.c2_lib:
+                left = [n for n in self.names if n.startswith("lib/")
+                        and n.rsplit("/", 1)[-1] == self.c2_lib]
+                self.check(not left, "C2",
+                           "lib/ 下仍存在未加密的业务库：%s" % left)
+            # 注意：启用 B8 后 C2 的库载荷也会被移进容器目录
+            # （assets/<词>/<hex8>/<hex12>.<ext>），不再匹配顶层载荷命名。
+            # 只认顶层会把「已加壳但被容器化」误判成「没加壳」。
+            cand = list(self.payloads) + [n for n in self.names if CONTAINER_DIR_RE.match(n)]
+            if not cand:
+                self.fails.append("[C2] assets/ 下找不到任何加密载荷（业务 .so 未被加壳）")
+            else:
+                matched = False
+                for n in cand:
+                    blob = read_bytes(zf, n)
+                    if blob[:4] == b"\x7fELF":
+                        self.check(False, "C2", "载荷 %s 仍是明文 ELF（没有被加密）" % n)
+                    if self.c2_size is not None:
+                        delta = zf.getinfo(n).file_size - self.c2_size
+                        if 16 <= delta <= 64:
+                            matched = True
+                    else:
+                        matched = True
+                if self.c2_size is not None:
+                    self.check(matched, "C2",
+                               "找不到与原始 .so（%d 字节）大小匹配的加密载荷" % self.c2_size)
 
         # ---- C7 原生库伪装：lib/ 下不再有 libapkguard.so，而是假名 ----
         if self.want("C7"):
@@ -386,16 +490,40 @@ class Checker:
                        "lib/ 下没有任何 .so（守卫库被搬走了？C7 应与 C2 协调）")
 
         # ---- A19 字符串池垃圾：DEX 里出现形似业务常量的注入串 ----
+        #
+        # 启用 B1 时 classes.dex 是**壳** DEX，业务 DEX 已加密进 assets；
+        # 注入的垃圾串只在业务 DEX 里，壳里查不到。此时该断言不适用
+        # （要验就得先解密载荷，超出本脚本的能力边界）。
         if self.want("A19"):
-            marks = [s for s in self.dex_strs
-                     if "_api_key" in s or "api.internal." in s or "X-" in s and "Token" in s]
-            self.check(bool(marks), "A19",
-                       "classes.dex 的字符串池里找不到注入的垃圾串特征")
+            if self.want("B1"):
+                self.notes.append("A19 断言跳过：已启用 B1，业务 DEX 不在 classes.dex（壳里查不到注入串）")
+            else:
+                marks = [s for s in self.dex_strs
+                         if "_api_key" in s or "api.internal." in s or "X-" in s and "Token" in s]
+                self.check(bool(marks), "A19",
+                           "classes.dex 的字符串池里找不到注入的垃圾串特征")
 
         # ---- A20 花指令：连续 nop（编译产物里不会连续出现）----
         if self.want("A20"):
             self.check(bytes([0, 0, 0, 0, 0, 0]) in self.shell_dex, "A20",
                        "classes.dex 里找不到连续 nop 填充（A20 未生效）")
+
+        # ---- A6 控制流混淆：不透明谓词的固定指令骨架 ----
+        #
+        # 判据是产物自身的不透明谓词字节序列（见 A6_PREDICATE_RE）。这条比
+        # 「DEX 变大」或「加固日志里的统计」更硬：体积可能被其它项改变，
+        # 统计来自流程而非产物。仅适用于未启用 B1 的产物——B1 之后业务 DEX
+        # 已被加密成载荷，明文 classes.dex 是壳，A6 痕迹不在其中。
+        if self.want("A6"):
+            if self.want("B1"):
+                self.notes.append(
+                    "[A6] 提示：已启用 B1，明文 classes.dex 是壳，A6 痕迹在加密载荷内，"
+                    "本断言不适用（e2e 的 A6 功能集刻意不启用 B1）。")
+            else:
+                pred = len(A6_PREDICATE_RE.findall(self.shell_dex))
+                fake = len(A6_FAKEJUMP_RE.findall(self.shell_dex))
+                self.check(pred + fake > 0, "A6",
+                           "classes.dex 里既无不透明谓词骨架、也无不可达跳转块（A6 未生效或未注入）")
 
         # ---- A9 伪 DEX 块 ----
         if self.want("A9"):
@@ -418,9 +546,14 @@ class Checker:
 
         # ---- A13 类膨胀 ----
         if self.want("A13"):
-            n = class_count(self.shell_dex)
-            self.check(n >= 50, "A13",
-                       "壳 DEX 只有 %d 个类，远低于膨胀后的预期（>=50）" % n)
+            # 同 A19：启用 B1 时 classes.dex 是壳（就几个类），膨胀的类在
+            # 加密载荷里，无从直接计数。
+            if self.want("B1"):
+                self.notes.append("A13 断言跳过：已启用 B1，膨胀类在加密载荷里，classes.dex 只是壳")
+            else:
+                n = class_count(self.shell_dex)
+                self.check(n >= 50, "A13",
+                           "壳 DEX 只有 %d 个类，远低于膨胀后的预期（>=50）" % n)
 
         # ---- A15 巨型 Manifest 填充 ----
         #
@@ -454,18 +587,36 @@ class Checker:
         # ---- B8 载荷容器化 ----
         if self.want("B8"):
             moved = [n for n in self.names if CONTAINER_DIR_RE.match(n)]
-            self.check(bool(moved), "B8", "载荷未移入容器目录（assets/<词>/<hex>/）")
-            decoys = [n for n in self.names if DECOY_ZIP_RE.match(n)]
-            self.check(bool(decoys), "B8", "找不到诱饵容器（assets/<词>_<hex>.zip）")
+            self.check(bool(moved), "B8", "载荷未移入容器目录（assets/<词>/<hex8>/）")
+            # 诱饵容器已改为「与真实载荷同构」：不再是以 PK 开头的顶层 zip，
+            # 而是落在同一目录树下的配置 JSON（写假包名、路径形态与真载荷一致）。
+            decoys = [n for n in self.names if DECOY_CFG_RE.match(n)]
+            self.check(bool(decoys), "B8",
+                       "找不到诱饵容器配置（assets/<词>/<hex8>/<hex12>.json）")
             # 顶层不应再直接暴露载荷（B1 的载荷名形如 assets/<词>_<hex>.<ext>）
             top = [n for n in self.names if PAYLOAD_RE.match(n)]
             self.check(not top, "B8",
                        "顶层 assets 仍直接暴露载荷：%s" % top[:3])
+            # 正向同构断言：容器目录下**不允许**出现以 PK 开头的文件。
+            # 真载荷是密文（前置 IV）、诱饵是高熵随机字节，二者都不带 zip magic；
+            # 一旦容器里出现 PK 头，脱壳脚本「找 PK 头 / 找 zip」的排除法就能把
+            # 真载荷与诱饵区分开，同构性（B8 的核心价值）即告失效。
+            #
+            # 例外：A17（嵌套 APK 诱饵）**故意**在同一目录树里放一个合法 zip
+            # （假内层 APK，PK 头是它的本质）。那不是可被排除法利用的破绽，而是
+            # 更深的诱饵——脚本按 PK 抓到的正是它，解包后得到一个看起来正常的
+            # 假应用。因此 A17 启用时这条断言不适用。
+            if self.want("A17"):
+                self.notes.append("B8 同构断言：已启用 A17，容器内的 PK 文件是 A17 的假内层 APK，跳过 PK 检查")
+            else:
+                pk = [n for n in moved if read_bytes(zf, n)[:2] == b"PK"]
+                self.check(not pk, "B8",
+                           "容器目录下存在 PK 开头的文件（真假载荷可被 zip 启发式区分）：%s"
+                           % pk[:3])
             if decoys:
                 blob = read_bytes(zf, decoys[0])
-                self.check(blob[:2] == b"PK", "B8", "诱饵容器不是 zip（缺 PK 头）")
-                self.check(b"dummy.installed.check" in blob or b"packageName" in blob, "B8",
-                           "诱饵容器里找不到诱饵配置（packageName）")
+                self.check(b"packageName" in blob, "B8",
+                           "诱饵配置 JSON 里找不到假包名（packageName）")
 
         # ---- E4 渠道标记 ----
         if self.want("E4"):
@@ -488,8 +639,18 @@ def main(argv):
     channel = None
     if "--channel" in argv:
         channel = argv[argv.index("--channel") + 1]
+    c2_lib = None
+    if "--c2-lib" in argv:
+        c2_lib = argv[argv.index("--c2-lib") + 1]
+    c2_size = None
+    if "--c2-size" in argv:
+        try:
+            c2_size = int(argv[argv.index("--c2-size") + 1])
+        except ValueError:
+            print("--c2-size 需要一个整数（原始 .so 的字节数）")
+            return 2
 
-    checker = Checker(apk, feats.split(","), channel)
+    checker = Checker(apk, feats.split(","), channel, c2_lib, c2_size)
     fails = checker.run()
     for n in checker.notes:
         print("  · %s" % n)

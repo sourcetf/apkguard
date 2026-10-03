@@ -158,8 +158,9 @@ func TestUIPayloadDecodes(t *testing.T) {
 	payload["channels"] = []string{} // 界面在多渠道留空时不发送，这里显式给空数组
 
 	code, resp := postRun(t, payload)
-	if code != http.StatusOK {
-		t.Fatalf("HTTP 码应为 200，实际 %d", code)
+	// 输入不存在属于服务端处理失败（流水线阶段），按约定返回 500。
+	if code != http.StatusInternalServerError {
+		t.Fatalf("HTTP 码应为 500，实际 %d（err=%q）", code, resp.Error)
 	}
 	if strings.Contains(resp.Error, "请求体解析失败") {
 		t.Fatalf("前端形状的请求体解码失败：%s", resp.Error)
@@ -190,8 +191,14 @@ func TestChannelsAsStringIsRejected(t *testing.T) {
 // 走真实的流水线（只启用 E4，不启用签名，因此不需要密钥库）：
 // 多渠道必须产出多个各自独立的 APK，而不是一个文件里写多个渠道。
 func TestRunMultiChannel(t *testing.T) {
-	in := fixtureAPK(t)
 	dir := t.TempDir()
+	// 输出被限制在输入所在目录内，因此先把样本复制进临时目录。
+	in := filepath.Join(dir, "app.apk")
+	if b, err := os.ReadFile(fixtureAPK(t)); err != nil {
+		t.Fatalf("读取样本失败: %v", err)
+	} else if err := os.WriteFile(in, b, 0o644); err != nil {
+		t.Fatalf("写出样本失败: %v", err)
+	}
 	out := filepath.Join(dir, "app-protected.apk")
 
 	payload := uiPayload(t, in, out, []string{"huawei", "xiaomi"}, map[string]bool{"E4": true})

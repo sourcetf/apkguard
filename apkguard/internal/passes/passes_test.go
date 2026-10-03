@@ -91,7 +91,7 @@ func TestMetaUnify(t *testing.T) {
 		}
 	}
 	// 默认时间戳应为 2024-01-01 00:00:00
-	wantT, wantD := toDOSDateTime(defaultStamp)
+	wantT, wantD := zipx.DOSDateTime(config.DefaultStamp)
 	if mt != wantT || md != wantD {
 		t.Fatalf("默认时间戳不符: got(0x%04x,0x%04x) want(0x%04x,0x%04x)", mt, md, wantT, wantD)
 	}
@@ -106,7 +106,7 @@ func TestMetaUnifyCustomStamp(t *testing.T) {
 	if err := p.Run(context.Background(), art, &config.Options{StampTime: "2020-06-15T12:30:00Z"}); err != nil {
 		t.Fatalf("执行失败: %v", err)
 	}
-	wantT, wantD := toDOSDateTime(mustTime(t, "2020-06-15T12:30:00Z"))
+	wantT, wantD := zipx.DOSDateTime(mustTime(t, "2020-06-15T12:30:00Z"))
 	if art.Entries()[0].ModTime != wantT || art.Entries()[0].ModDate != wantD {
 		t.Fatalf("自定义时间戳不符")
 	}

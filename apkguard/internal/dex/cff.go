@@ -145,7 +145,10 @@ func cffRegs(op byte, w []uint16) (regs []int, ok bool) {
 	case op == 0x02, op == 0x05, op == 0x08:
 		return []int{aa(), int(w[1])}, true // 22x move/from16
 	case op == 0x03, op == 0x06, op == 0x09:
-		return []int{aa(), int(w[1])}, true // 32x move/16
+		// 32x 布局：word0 高位保留，word1=AAAA（目标）、word2=BBBB（源），共 3 字。
+		// 旧实现误按 22x 解析（只读 word1），漏掉源寄存器 word2，导致该寄存器
+		// 被误判为空闲、谓词写进原指令的操作数（真机静默改坏活跃值）。
+		return []int{int(w[1]), int(w[2])}, true // 32x move/16
 	case op == 0x20, op == 0x23:
 		return []int{a4(), b4()}, true // 22c
 	case op >= 0x52 && op <= 0x5f:
@@ -531,7 +534,10 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 		if !did {
 			return nil, nil, false, nil
 		}
-		insns, m, fresh := l.Encode()
+		insns, m, fresh, eerr := l.EncodeChecked()
+		if eerr != nil {
+			return nil, nil, false, eerr
+		}
 		ci.Insns = insns
 		return ci.Encode(func(old uint32) uint32 { return FixAddr(m, old) }), fresh, true, nil
 	}
@@ -601,7 +607,10 @@ func (b *builder) controlFlowCodeItem(pl *plan, methodName string, src []byte) (
 		return nil, nil, false, nil
 	}
 
-	insns, m, fresh := l.Encode()
+	insns, m, fresh, eerr := l.EncodeChecked()
+	if eerr != nil {
+		return nil, nil, false, eerr
+	}
 	// 不新增 invoke，outs_size 保持原值；不触碰 Registers，入参编号不变。
 	ci.Insns = insns
 	st.MethodsRewritten++
@@ -669,7 +678,10 @@ func (b *builder) junkFillCodeItem(pl *plan, ci *CodeItemFull, l *InsnList) ([]b
 	st.FakeJumps++
 	st.MethodsRewritten++
 
-	out, m, fresh := l.Encode()
+	out, m, fresh, eerr := l.EncodeChecked()
+	if eerr != nil {
+		return nil, nil, false, eerr
+	}
 	ci.Insns = out
 	return ci.Encode(func(old uint32) uint32 { return FixAddr(m, old) }), fresh, true, nil
 }

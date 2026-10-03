@@ -107,6 +107,14 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		}
 	}
 
+	// -name-prefix 是用户指定的新名前缀。它必须落在合法的 Java 标识符字符集里，
+	// 否则生成的类/成员名在 DEX 里非法（ART 会拒绝整个类）。这里统一规范化：
+	// 只保留 [A-Za-z0-9_$]，且不让数字开头。
+	pfx := sanitizeNamePrefix(opts.NamePrefix)
+	if opts.NamePrefix != "" && pfx != opts.NamePrefix {
+		art.Note("A1 名称前缀 %q 含非法字符，已规范化为 %q", opts.NamePrefix, pfx)
+	}
+
 	// 2) 逐 DEX 决策哪些类可改，并按需分配新名
 	type cand struct {
 		desc string
@@ -194,11 +202,11 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		}
 		sort.Strings(pkgs)
 		for i, p := range pkgs {
-			alias := "Lp" + encodeShortName(i+1) + "/"
+			alias := "L" + pfx + "p" + encodeShortName(i+1) + "/"
 			// 短包名不得与任何现存包（含保留类所在的包）重名。
 			for existingPkgs[alias] {
 				i++
-				alias = "Lp" + encodeShortName(i+1) + "/"
+				alias = "L" + pfx + "p" + encodeShortName(i+1) + "/"
 			}
 			pkgAlias[p] = alias
 			existingPkgs[alias] = true
@@ -213,7 +221,7 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 					pkg = a
 				}
 			}
-			desc := pkg + encodeShortName(seq) + ";"
+			desc := pkg + pfx + encodeShortName(seq) + ";"
 			if used[desc] {
 				continue
 			}
@@ -279,7 +287,15 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			allAccepted[n] = true
 		}
 	}
-	for name := range allAccepted {
+	// **必须按名称排序后再分配序号**：allAccepted 是 map，Go 的 map 迭代顺序
+	// 是随机的，直接 range 会让同一个成员名在两次运行里拿到不同的短名，
+	// 产物 sha256 随之漂移——「同 -seed 可复现」的承诺就此失效。
+	acceptedNames := make([]string, 0, len(allAccepted))
+	for n := range allAccepted {
+		acceptedNames = append(acceptedNames, n)
+	}
+	sort.Strings(acceptedNames)
+	for _, name := range acceptedNames {
 		globally := true
 		declined := false
 		for i := range units {
@@ -302,7 +318,7 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		}
 		for {
 			mseq++
-			nw := encodeShortName(mseq)
+			nw := pfx + encodeShortName(mseq)
 			if usedNames[nw] {
 				continue
 			}
@@ -484,6 +500,26 @@ func looksLikeJavaClass(s string) bool {
 // isClassDesc 判断字符串是否为类描述符（L...;）。
 func isClassDesc(s string) bool {
 	return len(s) > 2 && s[0] == 'L' && s[len(s)-1] == ';' && !strings.Contains(s, "[")
+}
+
+// sanitizeNamePrefix 把用户给的名称前缀规范成合法的 Java 标识符前缀。
+//
+// 只保留 [A-Za-z0-9_$]；首位不允许是数字；首字符 '$' 虽合法但容易被
+// 反编译器当成合成名，保留用户原意不改。全部被滤掉时返回空串（等于不加前缀）。
+func sanitizeNamePrefix(p string) string {
+	var b []byte
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c == '_' || c == '$',
+			c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z':
+			b = append(b, c)
+		case c >= '0' && c <= '9' && len(b) > 0:
+			b = append(b, c)
+		}
+	}
+	return string(b)
 }
 
 // encodeShortName 把序号编码为短名（a、b、…、z、aa、…）。

@@ -2,7 +2,9 @@ package zipx
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
+	"time"
 )
 
 // AlignOptions 控制重写归档时的对齐行为。
@@ -14,19 +16,40 @@ type AlignOptions struct {
 }
 
 // DefaultAlign 返回与 Android zipalign 默认行为一致的对齐参数。
+//
+// SoAlign 取 16384：Android 15 起 16KB 页设备要求未压缩 .so 按 16KB 对齐。
+// 16384 是 4096 的整数倍，因此 `zipalign -c -p 4` 仍然通过，但对 16KB 页
+// 设备（要求 16384）也能满足。
 func DefaultAlign() AlignOptions {
-	return AlignOptions{Align: 4, SoAlign: 4096}
+	return AlignOptions{Align: 4, SoAlign: 16384}
 }
 
 // Write 按指定对齐参数重写归档。
+//
+// 为保持与既有 8 处跨包调用方的兼容，本函数不返回错误：内部调用
+// WriteChecked，一旦输入触及 ZIP 的 16/32 位字段上限（例如条目数 > 65535）
+// 将 panic。调用方的输入**可能触及这些上限**时，必须改用 WriteChecked 并处理
+// 其返回的 error，而不是依赖 panic。
 //
 // 所有条目数据原样复制，不重新压缩，因此 CRC 与压缩大小保持有效。
 // 若原条目设置了 bit 3（数据描述符），此处会清除该位并把长度写回本地头，
 // 使结构更规范（Android 对此完全兼容）。
 //
-// 对齐通过向扩展字段追加一条 padding 记录实现（ID 0xd935），
-// 本地头与中央目录中的扩展字段保持一致。
+// 对齐通过向本地头与中央目录的扩展字段各追加一条 padding 记录（ID 0xd935）实现，
+// 其载荷前 2 字节为该条目的对齐倍数。
 func Write(a *Archive, opts AlignOptions) []byte {
+	out, err := WriteChecked(a, opts)
+	if err != nil {
+		panic("zipx.Write: " + err.Error())
+	}
+	return out
+}
+
+// WriteChecked 与 Write 相同，但会在写出前校验 ZIP 的字段上限并返回明确错误。
+//
+// ZIP 的非 ZIP64 结构用 16 位表示条目数、32 位表示偏移与长度；越界时静默
+// 回绕会产出不可解析的坏归档，因此这里一律拒绝而非截断。
+func WriteChecked(a *Archive, opts AlignOptions) ([]byte, error) {
 	if opts.Align <= 0 {
 		opts.Align = 4
 	}
@@ -34,29 +57,58 @@ func Write(a *Archive, opts AlignOptions) []byte {
 		opts.SoAlign = opts.Align
 	}
 
+	if len(a.Entries) > 0xFFFF {
+		return nil, fmt.Errorf("zipx: 条目数 %d 超过上限 65535（ZIP64 尚未支持）", len(a.Entries))
+	}
+	if len(a.Comment) > 0xFFFF {
+		return nil, fmt.Errorf("zipx: 归档注释长度 %d 超过上限 65535", len(a.Comment))
+	}
+
 	type record struct {
-		e     *Entry
-		lho   int
-		extra []byte
-		flags uint16
+		e            *Entry
+		lho          int
+		localExtra   []byte
+		centralExtra []byte
+		flags        uint16
 	}
 
 	out := make([]byte, 0, 1<<20)
 	records := make([]record, 0, len(a.Entries))
 
 	for _, e := range a.Entries {
+		if len(e.Name) > 0xFFFF {
+			return nil, fmt.Errorf("zipx: 条目名长度 %d 超过上限 65535", len(e.Name))
+		}
+		if len(e.Comment) > 0xFFFF {
+			return nil, fmt.Errorf("zipx: 条目 %q 注释长度 %d 超过上限 65535", e.Name, len(e.Comment))
+		}
+
 		align := alignOf(e, opts)
 		lho := len(out)
+		if lho > 0xFFFFFFFF {
+			return nil, fmt.Errorf("zipx: 条目 %q 本地头偏移 %d 超过上限 0xFFFFFFFF", e.Name, lho)
+		}
 
 		// 先清理扩展字段，再据其长度计算对齐：两者顺序不能反，
 		// 否则截断后的实际长度与计算所用长度不一致，对齐会失效。
-		extra := sanitizeExtra(e.LocalExtra)
+		//
+		// 本地与中央目录的扩展字段分别处理：中央目录还有自己的额外字段
+		// （如 0x5455 扩展时间戳），不能被本地扩展字段整体覆盖。
+		localExtra := sanitizeExtra(e.LocalExtra)
+		centralExtra := sanitizeExtra(e.CentralExtra)
 
-		// 数据区起始偏移 = 本地头 + 文件名 + 扩展字段。
-		base := lho + localHeaderLen + len(e.Name) + len(extra)
+		// 数据区起始偏移 = 本地头 + 文件名 + 本地扩展字段。
+		base := lho + localHeaderLen + len(e.Name) + len(localExtra)
 		padTotal := alignmentRecordSize(base, align)
 		if padTotal > 0 {
-			extra = appendAlignmentExtra(extra, padTotal-4)
+			localExtra = appendAlignmentExtra(localExtra, padTotal, align)
+			centralExtra = appendAlignmentExtra(centralExtra, padTotal, align)
+		}
+		if len(localExtra) > 0xFFFF {
+			return nil, fmt.Errorf("zipx: 条目 %q 本地扩展字段长度 %d 超过上限 65535", e.Name, len(localExtra))
+		}
+		if len(centralExtra) > 0xFFFF {
+			return nil, fmt.Errorf("zipx: 条目 %q 中央目录扩展字段长度 %d 超过上限 65535", e.Name, len(centralExtra))
 		}
 
 		flags := e.Flags &^ 0x0008 // 清除数据描述符位
@@ -80,17 +132,20 @@ func Write(a *Archive, opts AlignOptions) []byte {
 		binary.LittleEndian.PutUint32(hdr[18:], e.CompSize)
 		binary.LittleEndian.PutUint32(hdr[22:], e.UncompSize)
 		binary.LittleEndian.PutUint16(hdr[26:], uint16(len(e.Name)))
-		binary.LittleEndian.PutUint16(hdr[28:], uint16(len(extra)))
+		binary.LittleEndian.PutUint16(hdr[28:], uint16(len(localExtra)))
 
 		out = append(out, hdr[:]...)
 		out = append(out, e.Name...)
-		out = append(out, extra...)
+		out = append(out, localExtra...)
 		out = append(out, e.Raw...)
 
-		records = append(records, record{e: e, lho: lho, extra: extra, flags: flags})
+		records = append(records, record{e: e, lho: lho, localExtra: localExtra, centralExtra: centralExtra, flags: flags})
 	}
 
 	cdOff := len(out)
+	if cdOff > 0xFFFFFFFF {
+		return nil, fmt.Errorf("zipx: 中央目录偏移 %d 超过上限 0xFFFFFFFF", cdOff)
+	}
 	for _, r := range records {
 		e := r.e
 
@@ -106,7 +161,7 @@ func Write(a *Archive, opts AlignOptions) []byte {
 		binary.LittleEndian.PutUint32(h[20:], e.CompSize)
 		binary.LittleEndian.PutUint32(h[24:], e.UncompSize)
 		binary.LittleEndian.PutUint16(h[28:], uint16(len(e.Name)))
-		binary.LittleEndian.PutUint16(h[30:], uint16(len(r.extra)))
+		binary.LittleEndian.PutUint16(h[30:], uint16(len(r.centralExtra)))
 		binary.LittleEndian.PutUint16(h[32:], uint16(len(e.Comment)))
 		binary.LittleEndian.PutUint16(h[36:], e.IntAttr)
 		binary.LittleEndian.PutUint32(h[38:], e.ExtAttr)
@@ -114,10 +169,13 @@ func Write(a *Archive, opts AlignOptions) []byte {
 
 		out = append(out, h[:]...)
 		out = append(out, e.Name...)
-		out = append(out, r.extra...)
+		out = append(out, r.centralExtra...)
 		out = append(out, e.Comment...)
 	}
 	cdSize := len(out) - cdOff
+	if cdSize > 0xFFFFFFFF {
+		return nil, fmt.Errorf("zipx: 中央目录大小 %d 超过上限 0xFFFFFFFF", cdSize)
+	}
 
 	var eo [eocdLen]byte
 	binary.LittleEndian.PutUint32(eo[0:], sigEOCD)
@@ -129,18 +187,19 @@ func Write(a *Archive, opts AlignOptions) []byte {
 	out = append(out, eo[:]...)
 	out = append(out, a.Comment...)
 
-	return out
+	return out, nil
 }
 
 // alignOf 返回条目应满足的对齐字节数。
 //
 // 只有未压缩（Stored）条目才能通过对齐获益；压缩条目按 1 字节处理。
 // 未压缩的 .so 使用页对齐，便于运行时 mmap 映射。
+// 后缀判定大小写不敏感：现实中存在 LIB.SO 这类大写扩展名。
 func alignOf(e *Entry, opts AlignOptions) int {
 	if !e.IsStored() {
 		return 1
 	}
-	if hasSuffix(e.Name, ".so") {
+	if hasSuffixFold(e.Name, ".so") {
 		return opts.SoAlign
 	}
 	return opts.Align
@@ -176,8 +235,8 @@ func sanitizeExtra(extra []byte) []byte {
 
 // alignmentRecordSize 计算为使数据区起始偏移对齐到 align，需要追加的扩展字段总字节数。
 //
-// 返回值 0 表示当前偏移已对齐，无需追加；否则返回值不小于 4（扩展字段头长度），
-// 且保证 base+返回值 是 align 的整数倍。
+// 返回值 0 表示当前偏移已对齐，无需追加；否则返回值不小于 6，即至少容纳
+// 4 字节记录头 + 2 字节对齐倍数载荷，且保证 base+返回值 是 align 的整数倍。
 func alignmentRecordSize(base, align int) int {
 	if align <= 1 {
 		return 0
@@ -186,30 +245,48 @@ func alignmentRecordSize(base, align int) int {
 	if need == 0 {
 		return 0
 	}
-	if need < 4 {
-		// 扩展字段至少需要 4 字节头，因此补足一整轮对齐。
+	// 载荷前 2 字节要写对齐倍数，因此总长至少 6（4 字节头 + 2 字节载荷）。
+	for need < 6 {
 		need += align
 	}
 	return need
 }
 
-// appendAlignmentExtra 向扩展字段追加一条 padding 记录，payload 长度为 n。
-func appendAlignmentExtra(extra []byte, n int) []byte {
+// appendAlignmentExtra 向扩展字段追加一条对齐记录（ID 0xd935），总长 total。
+//
+// 依据 AOSP ApkSigner.java，0xd935 的载荷前 2 字节是 alignment multiple，
+// 其余为 0 填充。
+func appendAlignmentExtra(extra []byte, total, align int) []byte {
+	n := total - 4
+	if n < 2 {
+		// 调用方已通过 alignmentRecordSize 保证 total>=6；此处兜底避免越界。
+		n = 2
+	}
 	var rh [4]byte
 	binary.LittleEndian.PutUint16(rh[0:], 0xd935)
 	binary.LittleEndian.PutUint16(rh[2:], uint16(n))
 	extra = append(extra, rh[:]...)
-	extra = append(extra, make([]byte, n)...)
-	return extra
+	payload := make([]byte, n)
+	binary.LittleEndian.PutUint16(payload[0:], uint16(align))
+	return append(extra, payload...)
 }
 
 // NewStored 构造一个未压缩的新条目。
+//
+// 时间戳为 1980-01-01（ZIP 的 DOS 纪元下限）。需要与产物其余条目保持
+// 一致的时间时用 NewStoredAt，否则单独追加的条目会成为「异类指纹」。
 func NewStored(name string, data []byte) *Entry {
+	return NewStoredAt(name, data, 0, 0x21)
+}
+
+// NewStoredAt 构造一个带指定 DOS 时间/日期戳的未压缩条目。
+func NewStoredAt(name string, data []byte, dosTime, dosDate uint16) *Entry {
 	return &Entry{
 		VersionMade: 20,
 		VersionNeed: 20,
 		Method:      0,
-		ModDate:     0x21, // 1980-01-01
+		ModTime:     dosTime,
+		ModDate:     dosDate,
 		CRC32:       crc32.ChecksumIEEE(data),
 		CompSize:    uint32(len(data)),
 		UncompSize:  uint32(len(data)),
@@ -218,11 +295,49 @@ func NewStored(name string, data []byte) *Entry {
 	}
 }
 
+// DOSDateTime 把时间转换为 ZIP 使用的 DOS 时间与日期字段。
+//
+// ZIP 的 DOS 时间只精确到 2 秒，且年份下限是 1980；早于该时间一律钳到
+// 1980-01-01，否则年份字段会下溢成负数。
+func DOSDateTime(t time.Time) (uint16, uint16) {
+	t = t.UTC()
+	if t.Year() < 1980 {
+		t = time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	dosTime := uint16(t.Hour())<<11 | uint16(t.Minute())<<5 | uint16(t.Second()/2)
+	dosDate := uint16(t.Year()-1980)<<9 | uint16(t.Month())<<5 | uint16(t.Day())
+	return dosTime, dosDate
+}
+
 func hasSuffix(b []byte, s string) bool {
 	if len(b) < len(s) {
 		return false
 	}
 	return string(b[len(b)-len(s):]) == s
+}
+
+// hasSuffixFold 是 ASCII 大小写不敏感的后缀判定。
+//
+// 只对后缀做 ASCII 折叠，避免 strings.ToLower 对非法 UTF-8 字节做替换而改变长度。
+func hasSuffixFold(b []byte, s string) bool {
+	if len(b) < len(s) {
+		return false
+	}
+	off := len(b) - len(s)
+	for i := 0; i < len(s); i++ {
+		c := b[off+i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		d := s[i]
+		if d >= 'A' && d <= 'Z' {
+			d += 'a' - 'A'
+		}
+		if c != d {
+			return false
+		}
+	}
+	return true
 }
 
 // hasNonASCII 判断字节串中是否含有 >= 0x80 的字节。

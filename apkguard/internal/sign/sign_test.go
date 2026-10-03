@@ -413,3 +413,81 @@ func keysOf[V any](m map[uint32]V) []uint32 {
 	}
 	return out
 }
+
+// ---- 元数据一致性（A14 回归） ----
+
+// TestSignStampUnifiesSignatureEntries 断言签名新增的 v1 条目沿用调用方给定的时间戳。
+//
+// 背景：A14 统一了归档里全部条目的时间戳，但 MANIFEST.MF / CERT.SF / CERT.RSA
+// 是签名阶段才追加的，晚于 A14。若它们退回 ZIP 的 1980 默认值，产物里就会
+// 出现「唯独签名文件是 1980」这一枚独有的重打包指纹——恰好是 A14 想消除的东西。
+//
+// 这里复刻真实链路：先让全部条目统一时间戳（等价 A14），再签名并给定同一 Stamp。
+func TestSignStampUnifiesSignatureEntries(t *testing.T) {
+	mat := testMaterial(t, false)
+	stamp := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	dosT, dosD := zipx.DOSDateTime(stamp)
+
+	// 等价 A14：把归档里全部既有条目统一到同一时间戳。
+	ar, err := zipx.Read(minimalAPK(t))
+	if err != nil {
+		t.Fatalf("解析归档失败: %v", err)
+	}
+	for _, e := range ar.Entries {
+		e.ModTime, e.ModDate = dosT, dosD
+	}
+	pre := zipx.Write(ar, zipx.DefaultAlign())
+
+	res, err := Sign(pre, mat, Options{
+		V1: true, V2: true, V3: false, MinSDK: 24, Stamp: stamp,
+	})
+	if err != nil {
+		t.Fatalf("签名失败: %v", err)
+	}
+	// 逐一比对 DOS 字段：这是写入端唯一的事实来源，且不受读方时区解释影响。
+	got, err := zipx.Read(res.APK)
+	if err != nil {
+		t.Fatalf("解析签名产物失败: %v", err)
+	}
+	seen := map[[2]uint16][]string{}
+	for _, e := range got.Entries {
+		k := [2]uint16{e.ModTime, e.ModDate}
+		seen[k] = append(seen[k], e.NameString())
+	}
+	if len(seen) != 1 {
+		t.Fatalf("产物出现 %d 个不同时间戳 %v；A14 之后签名条目必须与其他条目同戳", len(seen), seen)
+	}
+	if _, ok := seen[[2]uint16{dosT, dosD}]; !ok {
+		t.Fatalf("统一后的时间戳与给定 Stamp 不符: %v", seen)
+	}
+	// 三个签名条目确实存在，别被「全都没时间戳」糊弄过去。
+	names := map[string]bool{}
+	for _, e := range got.Entries {
+		names[e.NameString()] = true
+	}
+	for _, want := range []string{"META-INF/MANIFEST.MF", "META-INF/CERT.SF", "META-INF/CERT.RSA"} {
+		if !names[want] {
+			t.Errorf("产物缺少 v1 签名条目 %s", want)
+		}
+	}
+}
+
+// TestSignWithoutStampKeepsDefault 记录未指定时间戳时的既有行为。
+func TestSignWithoutStampKeepsDefault(t *testing.T) {
+	mat := testMaterial(t, false)
+	res, err := Sign(minimalAPK(t), mat, Options{V1: true, V2: true, V3: false, MinSDK: 24})
+	if err != nil {
+		t.Fatalf("签名失败: %v", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(res.APK), int64(len(res.APK)))
+	if err != nil {
+		t.Fatalf("读取产物归档失败: %v", err)
+	}
+	for _, f := range zr.File {
+		if f.Name == "META-INF/MANIFEST.MF" || f.Name == "META-INF/CERT.SF" || f.Name == "META-INF/CERT.RSA" {
+			if f.Modified.Year() != 1980 {
+				t.Errorf("未给定 Stamp 时 %s 应为 1980 默认值，实际 %s", f.Name, f.Modified)
+			}
+		}
+	}
+}

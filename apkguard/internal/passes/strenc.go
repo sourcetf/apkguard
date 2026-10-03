@@ -2,6 +2,7 @@ package passes
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"sort"
@@ -54,7 +55,10 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 	})
 	host := units[0]
 
-	key := deriveKey(opts.DexKey, opts.Seed)
+	key, err := deriveKey(opts.DexKey, opts.Seed)
+	if err != nil {
+		return err
+	}
 	cls := fmt.Sprintf("L%s/Dec;", shellPkgOf(opts))
 	minLen := opts.ObfStringMin
 	if minLen < 0 {
@@ -88,11 +92,17 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		ok++
 	}
 
-	art.Note("A2 字符串加密：%d 个 DEX，加密 %d 个字符串，解密器 %s->a（密钥 %x，最短长度 %d）；%d → %d 字节（增加 %d）",
-		ok, totalEnc, cls, key, minLen, totalBefore, totalAfter, totalAfter-totalBefore)
+	// 只输出密钥的 4 字节指纹，绝不输出完整密钥。
+	//
+	// 日志与统计会随产物一起交付/存档，完整密钥写进去等于公开——
+	// 这也是审计曾发现的问题（A2.key 曾等于空口令回退常量）。
+	// 指纹足以核对「两次构建是否用了同一把密钥」，但不泄露密钥本身。
+	keyFP := fmt.Sprintf("%x", key[:4])
+	art.Note("A2 字符串加密：%d 个 DEX，加密 %d 个字符串，解密器 %s->a（密钥指纹 %s，最短长度 %d）；%d → %d 字节（增加 %d）",
+		ok, totalEnc, cls, keyFP, minLen, totalBefore, totalAfter, totalAfter-totalBefore)
 	art.Stat("A2.dex", fmt.Sprint(ok))
 	art.Stat("A2.strings", fmt.Sprint(totalEnc))
-	art.Stat("A2.key", fmt.Sprintf("%x", key))
+	art.Stat("A2.key.fp", keyFP)
 	art.Stat("A2.grow", fmt.Sprint(totalAfter-totalBefore))
 	return nil
 }
@@ -231,13 +241,21 @@ func shellPkgOf(opts *config.Options) string {
 // 取 SHA-256 的**全部 32 字节**：旧实现只取 sum[0] 一个字节，配合当时
 // 仿射密钥流可被单点已知明文攻破；现在密钥流由 SHA-256 派生，
 // 密钥宽度必须足够（32 字节），否则暴力枚举 256 种密钥即可解密全部字符串。
-func deriveKey(dexKey, seed string) [32]byte {
+// deriveKey 派生 A2 字符串加密的密钥。
+//
+// 口令（dexKey 或 seed）都为空时**生成随机密钥**，绝不回退到固定常量：
+// 常量密钥意味着任何拿到产物的人都能解开全部字符串密文。
+func deriveKey(dexKey, seed string) ([32]byte, error) {
 	src := dexKey
 	if src == "" {
 		src = seed
 	}
 	if src == "" {
-		src = "apkguard"
+		var k [32]byte
+		if _, err := rand.Read(k[:]); err != nil {
+			return k, fmt.Errorf("生成随机字符串密钥失败: %w", err)
+		}
+		return k, nil
 	}
-	return sha256.Sum256([]byte("apkguard/strkey/" + src))
+	return sha256.Sum256([]byte("apkguard/strkey/" + src)), nil
 }

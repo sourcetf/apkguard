@@ -145,19 +145,15 @@ func (metaUnify) ID() config.FeatureID { return "A14" }
 func (metaUnify) In() pipeline.Level   { return pipeline.LevelZip }
 func (metaUnify) Out() pipeline.Level  { return pipeline.LevelZip }
 
-// defaultStamp 是未指定时间戳时使用的固定时间。
-var defaultStamp = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+// defaultStamp 是未指定时间戳时使用的固定时间；来源见 config.DefaultStamp。
+var defaultStamp = config.DefaultStamp
 
 func (m *metaUnify) Run(_ context.Context, art *pipeline.Artifact, opts *config.Options) error {
-	stamp := defaultStamp
-	if opts.StampTime != "" {
-		t, err := time.Parse(time.RFC3339, opts.StampTime)
-		if err != nil {
-			return fmt.Errorf("时间戳格式非法（应为 RFC3339）: %w", err)
-		}
-		stamp = t
+	stamp, err := opts.UnifiedStamp()
+	if err != nil {
+		return err
 	}
-	dosTime, dosDate := toDOSDateTime(stamp)
+	dosTime, dosDate := zipx.DOSDateTime(stamp)
 
 	for _, e := range art.Entries() {
 		e.ModTime = dosTime
@@ -172,17 +168,6 @@ func (m *metaUnify) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 		len(art.Entries()), stamp.Format("2006-01-02 15:04:05"))
 	art.Stat("A14.entries", fmt.Sprint(len(art.Entries())))
 	return nil
-}
-
-// toDOSDateTime 把 time.Time 转换为 ZIP 使用的 DOS 时间与日期字段。
-func toDOSDateTime(t time.Time) (uint16, uint16) {
-	t = t.UTC()
-	if t.Year() < 1980 {
-		t = time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC)
-	}
-	dosTime := uint16(t.Hour())<<11 | uint16(t.Minute())<<5 | uint16(t.Second()/2)
-	dosDate := uint16(t.Year()-1980)<<9 | uint16(t.Month())<<5 | uint16(t.Day())
-	return dosTime, dosDate
 }
 
 // ---- A9 伪 DEX magic 填充块 ----

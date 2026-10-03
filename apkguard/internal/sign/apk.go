@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"time"
 
 	"apkguard/internal/keystore"
 	"apkguard/internal/zipx"
@@ -25,6 +26,22 @@ type Options struct {
 	// MinSDK / MaxSDK 写入 v3 签名块，用于平台版本区间判定。
 	MinSDK uint32
 	MaxSDK uint32
+
+	// Stamp 是新增 v1 签名条目（MANIFEST.MF / CERT.SF / CERT.RSA）使用的时间戳。
+	//
+	// 这三个条目是签名阶段才追加的，晚于 A14 元数据统一化；若不显式给它们
+	// 同一个时间，它们会退回 ZIP 的 1980 默认值，产物里就出现「唯独签名文件
+	// 是 1980」这一枚独有指纹，与 A14 消除重打包痕迹的目的背道而驰。
+	// 零值表示沿用 1980 默认（即不做统一，用于不关心元数据的调用方）。
+	Stamp time.Time
+
+	// Align 是 v1 重写归档时使用的对齐参数。
+	//
+	// v1 会新增条目并重写归档，若在此处硬编码 DefaultAlign，则调用方即使
+	// 关闭了 E2（zipalign）也会被强制对齐——E2 的开关因此形同虚设。
+	// 零值表示使用 zipx.DefaultAlign()；调用方应把当前实际使用的对齐参数
+	// 传进来（例如 E2 关闭时的 Align:1, SoAlign:1）。
+	Align zipx.AlignOptions
 }
 
 // DefaultOptions 返回与 apksigner 默认行为接近的配置。
@@ -239,17 +256,30 @@ func applyV1(apk []byte, mat *keystore.Material, leaf *x509.Certificate, opts Op
 
 	// 先移除可能存在的旧 MANIFEST.MF，再按 JAR 规范顺序重排：
 	// MANIFEST.MF 必须位于归档最前，随后是业务条目，最后是 .SF / .RSA。
+	// 这三个新增条目沿用调用方给定的统一时间戳，避免成为产物里仅存的
+	// 1980 默认值（详见 Options.Stamp 的说明）。
+	stampTime, stampDate := uint16(0), uint16(0x21)
+	if !opts.Stamp.IsZero() {
+		stampTime, stampDate = zipx.DOSDateTime(opts.Stamp)
+	}
 	archive.Remove(v1ManifestName)
 	ordered := make([]*zipx.Entry, 0, len(archive.Entries)+3)
-	ordered = append(ordered, zipx.NewStored(v1ManifestName, manifest))
+	ordered = append(ordered, zipx.NewStoredAt(v1ManifestName, manifest, stampTime, stampDate))
 	ordered = append(ordered, archive.Entries...)
 	ordered = append(ordered,
-		zipx.NewStored("META-INF/CERT.SF", sf),
-		zipx.NewStored("META-INF/CERT.RSA", pkcs7),
+		zipx.NewStoredAt("META-INF/CERT.SF", sf, stampTime, stampDate),
+		zipx.NewStoredAt("META-INF/CERT.RSA", pkcs7, stampTime, stampDate),
 	)
 	archive.Entries = ordered
 
-	return zipx.Write(archive, zipx.DefaultAlign()), nil
+	// 沿用调用方当前实际使用的对齐参数，而不是硬编码 DefaultAlign：
+	// 否则 E2（zipalign）被关闭时，v1 仍会强制重排对齐，开关失去意义。
+	// 零值表示调用方未指定，按默认对齐处理。
+	align := opts.Align
+	if align == (zipx.AlignOptions{}) {
+		align = zipx.DefaultAlign()
+	}
+	return zipx.WriteChecked(archive, align)
 }
 
 func b64(b []byte) string {

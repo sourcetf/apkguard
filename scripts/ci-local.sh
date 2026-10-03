@@ -17,6 +17,20 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 ok()   { printf '    \033[32m✓ %s\033[0m\n' "$1"; }
 bad()  { printf '    \033[31m✗ %s\033[0m\n' "$1"; FAIL=1; }
 
+# 选一个**真正可用**的 python：Windows 上 python3 常指向应用商店的空壳
+# （命令存在但执行即失败），因此必须实际跑一次才算数。功能项计数与原生库
+# 摘要检查都要用它；与 e2e.sh / build-testapp.sh 里的探测逻辑保持一致。
+PY_BIN=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1; then
+    PY_BIN="$c"; break
+  fi
+done
+if [ -z "$PY_BIN" ]; then
+  bad "找不到可用的 python（功能项计数与原生库检查需要 3.x）"
+  exit 1
+fi
+
 step "gofmt 检查"
 out="$(cd "$APP" && gofmt -l .)"
 if [ -z "$out" ]; then ok "全部已格式化"; else bad "未格式化：$out"; fi
@@ -30,6 +44,17 @@ for abi in arm64-v8a armeabi-v7a x86_64; do
   if [ -s "$f" ]; then ok "$abi（$(stat -c%s "$f" 2>/dev/null || wc -c <"$f") 字节）"
   else bad "缺少 $f"; fi
 done
+
+# 与 ci.yml 的「校验原生库摘要与 16KB 页对齐」同步：
+#  1) .agexpect 里回填的 .text+.rodata 摘要与当前内容一致；
+#  2) LOAD 段按 16 KB 对齐（Android 15+ 要求，Google Play 自 2025-11 强制）。
+# 以前本地 CI 没有这一步，页对齐出问题只有 GitHub CI 才会发现。
+step "原生库摘要与 16KB 页对齐"
+if "$PY_BIN" "$APP/internal/native/build_native.py" --check; then
+  ok "摘要一致、LOAD 段 16KB 对齐"
+else
+  bad "原生库摘要不一致或 LOAD 段未按 16KB 对齐"
+fi
 
 step "交叉编译"
 mkdir -p "$APP/dist"
@@ -57,17 +82,21 @@ case "$(uname -s)" in
   *) LOCAL_BIN="$APP/dist/apkguard-linux-amd64" ;;
 esac
 if "$LOCAL_BIN" -list >/dev/null 2>&1; then ok "-list 可执行"; else bad "-list 失败"; fi
-n="$("$LOCAL_BIN" -list | python3 "$ROOT/scripts/count-features.py")"
+n="$("$LOCAL_BIN" -list | "$PY_BIN" "$ROOT/scripts/count-features.py")"
 [ "$n" -eq 46 ] && ok "功能项 46 个" || bad "功能项数量为 $n（应为 46）"
 
 printf 'x' > /tmp/ag-fake.apk
 # 注意：本脚本开了 pipefail，而这两条命令**预期会非零退出**（报错即成功）。
 # 直接 `cmd | grep -q X` 会因为管道里前半段非零而让整个 if 判假，
 # 于是「确实报了错」反而被记成失败。必须先取输出再匹配。
-out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable A6 2>&1 || true)"
+#
+# 断言必须匹配**错误文案**而不是功能项 ID：`-enable A7` 的输出里
+# 「启用功能项: …A7…」这一行也含 A7，只匹配 ID 会让「根本没校验」也算通过
+# （旧版对 A6 就是一条这样的空断言）。A7 是确定未实现的项（见 config 注册表）。
+out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable A7 2>&1 || true)"
 case "$out" in
-  *A6*) ok "未实现的功能项被正确拒绝" ;;
-  *)    bad "启用未实现的 A6 没有报错" ;;
+  *尚未实现*A7*) ok "未实现的功能项被正确拒绝" ;;
+  *)             bad "启用未实现的 A7 没有按要求报错" ;;
 esac
 out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable E1 2>&1 || true)"
 case "$out" in

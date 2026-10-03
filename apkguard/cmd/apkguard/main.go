@@ -9,6 +9,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
@@ -214,16 +216,39 @@ func run() error {
 func runChannels(opts *config.Options) error {
 	ext := filepath.Ext(opts.Out)
 	base := strings.TrimSuffix(opts.Out, ext)
-	for _, ch := range opts.Channels {
+	sanitized, err := sanitizeChannels(opts.Channels)
+	if err != nil {
+		return err
+	}
+	for i, ch := range opts.Channels {
 		child := *opts
 		child.Channels = []string{ch}
-		child.Out = base + "-" + sanitizeChannel(ch) + ext
+		child.Out = base + "-" + sanitized[i] + ext
 		fmt.Printf("渠道 %s -> %s\n", ch, child.Out)
 		if err := runOnce(&child); err != nil {
 			return fmt.Errorf("渠道 %s 产出失败: %w", ch, err)
 		}
 	}
 	return nil
+}
+
+// sanitizeChannels 清洗渠道名并检测碰撞。
+//
+// 清洗会把 / \ ? : 等非法字符统一替换为 _，因此 "a/b" 与 "a?b" 都会变成 "a_b"。
+// 若不去重，后一个会静默覆盖前一个产物（同名文件），用户以为产出了两个渠道包。
+// 原始名相同（"a,a"）同样属于配置错误。两种情况都明确报错，不做静默覆盖。
+func sanitizeChannels(channels []string) ([]string, error) {
+	seen := make(map[string]string, len(channels))
+	out := make([]string, 0, len(channels))
+	for _, ch := range channels {
+		s := sanitizeChannel(ch)
+		if prev, ok := seen[s]; ok {
+			return nil, fmt.Errorf("渠道名清洗后重复：%q 与 %q 都映射为 %q，会互相覆盖；请改用不冲突的渠道名", prev, ch, s)
+		}
+		seen[s] = ch
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // sanitizeChannel 把渠道名规整为可安全用于文件名的形式。
@@ -246,10 +271,23 @@ func sanitizeChannel(s string) string {
 // quietMode 为 true 时抑制单次加固的详细输出（批量模式下由汇总代替）。
 var quietMode bool
 
+// batchJobs 决定批量并发度：显式参数优先，其次 opts.Jobs，最后回退 CPU 核数。
+//
+// 单次加固主要是 CPU 密集（DEX 解析与重建），按核数并行即可跑满，再高只会
+// 加剧内存压力（每个任务都会把整个 APK 读进内存）。
+func batchJobs(opts *config.Options, jobs int) int {
+	if jobs <= 0 {
+		jobs = opts.Jobs
+	}
+	if jobs <= 0 {
+		jobs = runtime.NumCPU()
+	}
+	return jobs
+}
+
 // runBatch 并发加固目录下的全部 APK。
 //
-// 并发度默认取 CPU 核数：单个 APK 的加固主要是 CPU 密集（DEX 解析与重建），
-// 按核数并行即可跑满，再高只会加剧内存压力（每个任务都会把整个 APK 读进内存）。
+// jobs<=0 时依次回退 opts.Jobs、CPU 核数（见 batchJobs）。
 func runBatch(opts *config.Options, jobs int) error {
 	names, err := listAPKs(opts.In)
 	if err != nil {
@@ -258,9 +296,7 @@ func runBatch(opts *config.Options, jobs int) error {
 	if len(names) == 0 {
 		return fmt.Errorf("目录 %s 下没有找到 .apk 文件", opts.In)
 	}
-	if jobs <= 0 {
-		jobs = runtime.NumCPU()
-	}
+	jobs = batchJobs(opts, jobs)
 	if jobs > len(names) {
 		jobs = len(names)
 	}
@@ -352,6 +388,23 @@ func batchOutputPath(outDir, in, srcDir string) string {
 }
 
 // buildOptions 把 CLI 参数转换为配置对象。
+// seedOrRandom 返回用户指定的种子；未指定时生成随机种子。
+//
+// 帮助文本承诺「留空则每次随机」，但此前的实现只是把空串透传下去：载荷 IV、
+// 载荷名、垃圾条目名等全部由 seed 派生，空串意味着**每次构建结果完全一致**，
+// 攻击者拿到一个产物就能预判另一个。显式给 -seed 时才走可复现路径。
+func seedOrRandom(seed string) string {
+	if seed != "" {
+		return seed
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 失败属于环境级故障；退化为时间戳而非静默用空种子。
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
 func buildOptions(c cliConfig) (*config.Options, error) {
 	opts := &config.Options{
 		Enabled: map[config.FeatureID]bool{},
@@ -372,7 +425,7 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		NamePrefix:    c.namePrefix,
 		PackageShrink: c.packageShrink,
 		ObfStringMin:  c.obfStringMin,
-		Seed:          c.seed,
+		Seed:          seedOrRandom(c.seed),
 		FakeDexCount:  c.fakeDexCount,
 		FakeDexSize:   c.fakeDexSize,
 		JunkTopCount:  c.junkTopCount,

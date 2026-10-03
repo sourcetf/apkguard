@@ -26,6 +26,104 @@ import (
 // 否则框架实例化组件时必然 ClassNotFoundException。
 
 // apkShellDex 从一个 APK 里取出壳 DEX 与全部 assets 条目。
+// realWorldAPK 解析「真实加固产物」固件路径（通用版）。
+//
+// 这些测试要在**加固产物**上跑壳链路与结构体检——它们需要壳 DEX 与 assets 里的
+// 加密载荷，因此**不能**指向未加固的原始 APK。
+//
+// 历史问题：它们默认指向 realworld/rd-v20.apk（某次会话的临时产物，从未入库），
+// 而 RD_APK 环境变量**从未被任何脚本设置**，于是这几个测试在任何环境下都跳过，
+// 等于死代码——README 主打的「产物级守卫」实际上是空的。
+//
+// 现在按候选列表查找：优先 e2e 生成的交付包（CI 的 e2e 作业会先生成 deliver/
+// 再跑 go test，因此它们会真正执行）；RD_APK 仍可覆盖为真实应用产物。
+func realWorldAPK(t *testing.T) string {
+	p, _ := realAppAPK(t)
+	return p
+}
+
+// realAppAPK 解析固件路径，并回答「它是真实应用产物吗」。
+//
+// 为什么要区分：有两条测试断言的是**真实应用的规模**（"应有大量 try/catch"、
+// "原型数量应上千"）。这些断言在交付包（testapp，几十个类）上必然失败，
+// 但那些测试的**结构体检部分**（handler_off / shorty / static_values 的合法性）
+// 在任何产物上都该跑。所以：结构体检始终执行，规模断言只在真固件上生效。
+//
+// 解析顺序：
+//  1. RD_APK 环境变量（显式声明"这是真实应用产物"，因此规模断言生效）；
+//  2. realworld/apps/ 下我们生成的真实应用全选项产物（rustdesk-* 等）；
+//  3. 退化为 e2e 生成的交付包（结构体检仍有效，规模断言跳过）。
+func realAppAPK(t *testing.T) (string, bool) {
+	t.Helper()
+	var cands []string
+	if p := os.Getenv("RD_APK"); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("RD_APK=%s 不存在: %v", p, err)
+		}
+		cands = append(cands, p)
+	}
+	cands = append(cands,
+		"../../../realworld/apps/rustdesk-all.apk",
+		"../../../deliver/2-full-checks.apk",
+		"../../../deliver/1-shell-only.apk",
+	)
+	for _, p := range cands {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		return p, payloadBytes(t, p) >= 1<<20
+	}
+	// 通配兜底：realworld/apps 下任何真实应用产物
+	if m, _ := filepath.Glob("../../../realworld/apps/*-all.apk"); len(m) > 0 {
+		return m[0], true
+	}
+	t.Skip("未找到任何加固产物固件：先跑 scripts/e2e.sh 生成 deliver/，或设 RD_APK 指向真实应用产物")
+	return "", false
+}
+
+// payloadBytes 返回产物里 assets 载荷的总字节数。
+//
+// 用它来判断"这是不是真实应用产物"——而不是去信任 RD_APK 或文件名：
+// 真实应用的载荷是 MB 级，交付包（testapp）只有几 KB，量级差三个数量级，
+// 因此这个判据既简单又不会误判（把 testapp 当真实应用去比"应有上千个原型"
+// 会让测试假失败；反过来把真实应用当小样本会让规模断言形同虚设）。
+func payloadBytes(t *testing.T, path string) int64 {
+	t.Helper()
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("打开 %s 失败: %v", path, err)
+	}
+	defer zr.Close()
+	var n int64
+	for _, f := range zr.File {
+		if strings.HasPrefix(f.Name, "assets/") {
+			n += int64(f.UncompressedSize64)
+		}
+	}
+	return n
+}
+
+// rustdeskAPK 解析「RustDesk 加固产物」固件路径（专有版）。
+//
+// TestRustDeskPayloadHasApplication 断言的是 RustDesk 专有类名
+// （Lcom/carriez/flutter_hbb/MainApplication;），因此不能拿别的应用产物顶替。
+// 它只在真的存在 RustDesk 加固产物时才跑——注意要排除**未加固**的
+// realworld/apps/rustdesk.apk（它没有壳 DEX 与载荷），所以用 rustdesk-*.apk。
+func rustdeskAPK(t *testing.T) string {
+	t.Helper()
+	if p := os.Getenv("RD_APK"); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("RD_APK=%s 不存在: %v", p, err)
+		}
+		return p
+	}
+	if m, _ := filepath.Glob("../../../realworld/apps/rustdesk-*.apk"); len(m) > 0 {
+		return m[0]
+	}
+	t.Skip("未找到 RustDesk 加固产物（realworld/apps/rustdesk-*.apk）：先用 -in realworld/apps/rustdesk.apk 加固一次，或设 RD_APK")
+	return ""
+}
+
 func apkShellDex(t *testing.T, path string) (*File, map[string][]byte) {
 	t.Helper()
 	zr, err := zip.OpenReader(path)

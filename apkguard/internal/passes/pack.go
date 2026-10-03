@@ -89,7 +89,7 @@ func (e *encryptDex) Run(_ context.Context, art *pipeline.Artifact, opts *config
 
 	// 密钥来源取决于 C1：启用后由 native 种子 + 签名摘要派生（同一纯函数
 	// 在运行时由 libapkguard.so 复算），否则退回内联口令派生。
-	key, err := payloadKey(opts)
+	key, err := payloadKey(art, opts)
 	if err != nil {
 		return err
 	}
@@ -169,14 +169,40 @@ func sampleNames(names []string, n int) string {
 	return strings.Join(names[:n], "、") + "…"
 }
 
-// payloadKey 返回载荷加密所用的密钥。
+// sharedKeyPayloadKey 是「本次运行解析出的载荷密钥」在 Artifact 里的键。
+const sharedKeyPayloadKey = "pack.payloadkey"
+
+// payloadKey 返回载荷加密所用的密钥，**整个运行期内只解析一次**。
+//
+// 为什么要缓存：B1（DEX 载荷）与 C2（原生库载荷）必须用同一把密钥，壳才能
+// 用一把密钥解两者（B3 里有显式一致性校验）。DexKey 留空时密钥是随机的，
+// 若两处各自生成就会得到两把不同的随机密钥——这正是「C2 的 SO 载荷密钥与
+// B1 载荷密钥不一致，无法由同一个壳解密」这条报错的来源。同为空的两次
+// 随机调用永远不可能相等，所以必须共享同一个解析结果。
+func payloadKey(art *pipeline.Artifact, opts *config.Options) ([pack.KeySize]byte, error) {
+	if v := art.Get(sharedKeyPayloadKey); v != nil {
+		if k, ok := v.([pack.KeySize]byte); ok {
+			return k, nil
+		}
+	}
+	k, err := resolvePayloadKey(opts)
+	if err != nil {
+		return k, err
+	}
+	art.Put(sharedKeyPayloadKey, k)
+	return k, nil
+}
+
+// resolvePayloadKey 真正推导密钥。
 //
 // C1 启用时密钥来自 native 派生函数的同一实现（Go 侧复算），并把
 // 「本 APK 的签名证书摘要」并入输入；运行时由 libapkguard.so 用同一公式
 // 复算，因此换签名重打包后两端算出的密钥不同，密文解不开。
-func payloadKey(opts *config.Options) ([pack.KeySize]byte, error) {
+func resolvePayloadKey(opts *config.Options) ([pack.KeySize]byte, error) {
 	if !opts.IsEnabled("C1") {
-		return pack.Key(opts.DexKey), nil
+		// DexKey 留空时由 pack.Key 生成随机密钥，绝不回退到固定常量
+		// ——那会让产物等价于明文。
+		return pack.Key(opts.DexKey)
 	}
 	digest, err := expectedSigDigest(opts)
 	if err != nil {

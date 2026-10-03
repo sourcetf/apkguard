@@ -89,6 +89,17 @@ func (m *manifestPad) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 // defaultManifestPadMB 是未显式指定尺寸时使用的填充量（MB）。
 const defaultManifestPadMB = 100
 
+// maxPadU32 是 uint32 能表达的最大长度（填充 chunk 头里的 size 字段是 uint32）。
+const maxPadU32 = int64(1)<<32 - 1
+
+// manifestPadOverflows 判断填充后的长度是否会越过 uint32 表达上限。
+//
+// 单独抽出成纯函数，便于在不分配几 GB 内存的前提下直接测试边界分支。
+// total 是填充后整个文件的长度，pad 是填充字节数（填充 chunk = 8+pad）。
+func manifestPadOverflows(pad, total int64) bool {
+	return pad+8 > maxPadU32 || total > maxPadU32
+}
+
 // padManifest 在真实 XML 内容之前插入零填充 chunk，并更新顶层 size。
 //
 // 输入必须是**完整的 AXML**（顶层 XML chunk + 其后的各子 chunk）。
@@ -119,14 +130,27 @@ func padManifest(data []byte, pad int) ([]byte, error) {
 	real := data[hs:size] // 真实子 chunk 序列
 	trailing := data[size:]
 
+	// 显式校验长度，绝不静默截断。
+	//
+	// 配置上限允许 4096 MB，而 4096<<20 == 2^32：此时 8+pad 的 uint32
+	// 会回绕成 8，填充 chunk 的声明长度被截断，Android 直接报
+	// "Bad XML block"。这里在分配之前就拒绝，既不产生几 GB 的临时内存，
+	// 也避免产出一个装不上的包。
+	total := int64(hs) + 8 + int64(pad) + int64(len(real)) + int64(len(trailing))
+	if manifestPadOverflows(int64(pad), total) {
+		return nil, fmt.Errorf(
+			"A15：%s 填充后长度 total=%d 或填充 chunk 长度=%d 超过 uint32 上限（%d），"+
+				"声明长度会被截断成错误的包头，拒绝生成",
+			manifestName, total, int64(pad)+8, maxPadU32)
+	}
+
 	// 填充 chunk 自身：8 字节头 + pad 字节零
 	padChunk := make([]byte, 8+pad)
 	binary.LittleEndian.PutUint16(padChunk[0:], padChunkType)
 	binary.LittleEndian.PutUint16(padChunk[2:], 8)
 	binary.LittleEndian.PutUint32(padChunk[4:], uint32(len(padChunk)))
 
-	total := hs + len(padChunk) + len(real) + len(trailing)
-	out := make([]byte, 0, total)
+	out := make([]byte, 0, int(total))
 	head := make([]byte, hs)
 	copy(head, data[:hs])
 	binary.LittleEndian.PutUint32(head[4:], uint32(total))

@@ -48,11 +48,23 @@ const macDomain = "apkguard/payload-mac"
 // 这里只做确定性派生（SHA-256）：同一口令必须得到同一密钥，
 // 以便同一 APK 的多次加固结果可复现。「密钥不以明文存在、按设备派生」
 // 由 C1（native 密钥派生）在阶段4接管，届时口令本身也会被消除。
-func Key(secret string) [KeySize]byte {
+//
+// secret 为空时**生成随机密钥**，绝不回退到固定常量：固定常量意味着任何
+// 拿到产物的人都能用公开可算的密钥解出载荷，等于明文交付。
+func Key(secret string) ([KeySize]byte, error) {
 	if secret == "" {
-		secret = "apkguard"
+		return RandomKey()
 	}
-	return sha256.Sum256([]byte("apkguard/packkey/" + secret))
+	return sha256.Sum256([]byte("apkguard/packkey/" + secret)), nil
+}
+
+// RandomKey 生成一个随机 AES-256 密钥。
+func RandomKey() ([KeySize]byte, error) {
+	var k [KeySize]byte
+	if _, err := rand.Read(k[:]); err != nil {
+		return k, fmt.Errorf("pack: 生成随机密钥失败: %w", err)
+	}
+	return k, nil
 }
 
 // RandomIV 生成一个随机 IV（用于需要不可预测性的场景）。

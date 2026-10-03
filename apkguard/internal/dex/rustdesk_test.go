@@ -16,13 +16,7 @@ import (
 // 需要区分两种可能：①分片把该类丢了（B4 划分错误）；
 // ②类在载荷里但加载器看不到（路径/时机问题）。
 func TestRustDeskPayloadHasApplication(t *testing.T) {
-	apk := os.Getenv("RD_APK")
-	if apk == "" {
-		apk = "../../../realworld/rd-noA1.apk"
-	}
-	if _, err := os.Stat(apk); err != nil {
-		t.Skipf("未找到 %s，跳过", apk)
-	}
+	apk := rustdeskAPK(t)
 	g, assets := apkShellDex(t, apk)
 	env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
 	restore := installLoaderMocks(env)

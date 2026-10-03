@@ -107,12 +107,24 @@ func constantArrayHelperCode(strInit MethodSpec) (*CodeBlob, error) {
 	}, nil
 }
 
-// isStringDecryptPattern 判断「第 i 项之后」是否为 A2 留下的解密调用序列。
+// isStringDecryptPattern 判断「第 i 项之后」是否为 A2 留下的解密调用序列
+// （用**旧方法表**判签名；用于对已完成重建的产物做后验检查）。
+func (l *InsnList) isStringDecryptPattern(i int, f *File) bool {
+	return l.isStringDecryptPatternPlanned(i, nil, f)
+}
+
+// isStringDecryptPatternPlanned 是 isStringDecryptPattern 的 plan 感知版本。
 //
 // A2 会把 const-string 改写为「const-string/jumbo + invoke-static/range + move-result-object」，
 // 因此若在 const-string 之后立即看到「单寄存器调用一个 (String)String 方法并接住结果」，
 // 说明该常量已由 A2 处理，A3 应跳过以免重复包装。
-func (l *InsnList) isStringDecryptPattern(i int, f *File) bool {
+//
+// 关键：**不能只看旧方法表**。同一次 Rebuild 内 A2 写入的调用索引是**最终**索引，
+// 用 b.f.MethodDesc（旧表）去判签名会读错方法，判据失效 → A3 拿新索引去旧字符串池
+// 取串，嵌入完全错误的明文。因此：
+//   - pl.strEnc != nil（同一次 Rebuild 刚跑过 A2）：直接比对 plan 里的解密方法索引；
+//   - 否则（A3 单独运行，面对的是上一次 Rebuild 产物）：指令里仍是旧索引，用旧表判签名。
+func (l *InsnList) isStringDecryptPatternPlanned(i int, pl *plan, f *File) bool {
 	if i+2 >= l.ItemCount() {
 		return false
 	}
@@ -135,7 +147,15 @@ func (l *InsnList) isStringDecryptPattern(i int, f *File) bool {
 	if int(res.words[0]>>8) != reg {
 		return false
 	}
-	desc, err := f.MethodDesc(uint32(inv.words[1]))
+	idx := uint32(inv.words[1])
+	if pl != nil && pl.strEnc != nil {
+		v, ok := pl.methodIdx[pl.strEnc.decrypt.Key()]
+		return ok && v == idx
+	}
+	if f == nil {
+		return false
+	}
+	desc, err := f.MethodDesc(idx)
 	if err != nil {
 		return false
 	}
@@ -150,13 +170,16 @@ func hasStringToStringSignature(desc string) bool {
 
 // arrayizeCodeItem 把 code_item 中的 const-string 改写为常量数组构造序列。
 //
-// 输入 src 是「当前形态」的 code_item 字节流（可能是原始字节，
-// 也可能是 A2 改写后的产物）。与 A2 相同，返回的 blob 尚未做索引重映射，
-// skip 给出其中「已是新索引」的字位置。
-func (b *builder) arrayizeCodeItem(pl *plan, src []byte) (blob []byte, skip map[int]bool, changed bool, err error) {
+// 输入 src 是「当前形态」的 code_item 字节流（可能是原始字节，也可能是 A2
+// 改写后的产物）。inSkip 是上游改写步骤登记的「已是最终索引、不可再映射」的
+// **绝对字位置，坐标系是 src**；本函数在返回时把它换算为本步产物坐标系。
+//
+// 返回的 blob 尚未做索引重映射，skip 给出其中「已是新索引」的字位置（含换算后
+// 的上游 skip 与本步自身的 fresh）。
+func (b *builder) arrayizeCodeItem(pl *plan, src []byte, inSkip map[int]bool) (blob []byte, skip map[int]bool, changed bool, err error) {
 	ca := pl.constArr
 	if ca == nil {
-		return nil, nil, false, nil
+		return nil, inSkip, false, nil
 	}
 	ci, err := ParseCodeItemBytes(src)
 	if err != nil {
@@ -189,6 +212,12 @@ func (b *builder) arrayizeCodeItem(pl *plan, src []byte) (blob []byte, skip map[
 	if err != nil {
 		return nil, nil, false, err
 	}
+	// 解析后、任何替换前记录各项字长：skip 坐标平移依赖它把「项内相对偏移」
+	// 从 src 坐标映到本步产物坐标（与 widenConstStrings 同一做法）。
+	oldLens := make([]int, len(l.items))
+	for i := range l.items {
+		oldLens[i] = len(l.items[i].words)
+	}
 
 	replaced := map[int]bool{}
 	for i := 0; i < l.ItemCount(); i++ {
@@ -216,7 +245,7 @@ func (b *builder) arrayizeCodeItem(pl *plan, src []byte) (blob []byte, skip map[
 			continue
 		}
 		// 已由 A2 加密处理的常量不再重复包装
-		if l.isStringDecryptPattern(i, b.f) {
+		if l.isStringDecryptPatternPlanned(i, pl, b.f) {
 			continue
 		}
 
@@ -250,12 +279,23 @@ func (b *builder) arrayizeCodeItem(pl *plan, src []byte) (blob []byte, skip map[
 		replaced[i] = true
 	}
 	if len(replaced) == 0 {
-		return nil, nil, false, nil
+		// 本步无布局变化，src 坐标即产物坐标，上游 skip 原样透传。
+		return nil, inSkip, false, nil
 	}
 
-	insns, m, fresh := l.Encode()
+	insns, m, fresh, eerr := l.EncodeChecked()
+	if eerr != nil {
+		return nil, nil, false, eerr
+	}
 	ca.count += len(replaced)
-	skip = fresh
+	// 先换算上游 skip，再并入本步 fresh（两者此时都是本步产物坐标）。
+	skip = l.translateSkip(inSkip, oldLens)
+	if skip == nil {
+		skip = map[int]bool{}
+	}
+	for k := range fresh {
+		skip[k] = true
+	}
 
 	ci.Insns = insns
 	if ci.Outs < 1 {

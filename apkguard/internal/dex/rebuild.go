@@ -635,6 +635,10 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 	}
 	var fentries []fieldEntry
 	fseen := map[string]uint32{}
+	// fdup 记录「因重命名塌缩而被去重丢弃的旧 field_id」-> 存活那条的旧 field_id。
+	// 索引表定稿后要统一把它们回填为存活条目的新索引；否则这些旧 id 会保留
+	// Identity 映射，class_data / 方法体引用写出越界或错误的索引。
+	var fdup [][2]uint32
 	for i := uint32(0); i < f.NField; i++ {
 		c, t, n, err := f.FieldRefAt(i)
 		if err != nil {
@@ -653,7 +657,8 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 			name: name,
 		}
 		k := fieldKey(e.cls, e.name, e.typ)
-		if _, dup := fseen[k]; dup {
+		if kept, dup := fseen[k]; dup {
+			fdup = append(fdup, [2]uint32{i, kept})
 			continue
 		}
 		fseen[k] = i
@@ -689,6 +694,10 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 			R.Field[e.old] = uint32(i)
 		}
 	}
+	// 回填被去重丢弃的旧 id：映射到存活那条的新索引（存活 ID 此时已确定）。
+	for _, p := range fdup {
+		R.Field[p[0]] = R.Field[p[1]]
+	}
 
 	// ---- 5) 方法（按 class, name, proto 排序）----
 	type methodEntry struct {
@@ -697,6 +706,9 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 	}
 	var mentries []methodEntry
 	mseen := map[string]uint32{}
+	// mdup 记录「因重命名塌缩而被去重丢弃的旧 method_id」-> 存活那条的旧 method_id。
+	// 理由同 fdup：索引表定稿后必须回填，否则旧 id 保留 Identity 映射会越界。
+	var mdup [][2]uint32
 	for i := uint32(0); i < f.NMethod; i++ {
 		ref, err := f.MethodRefAt(i)
 		if err != nil {
@@ -713,7 +725,10 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 			return nil, err
 		}
 		k := methodKey(cls, name, pk)
-		if _, dup := mseen[k]; dup {
+		if kept, dup := mseen[k]; dup {
+			if kept != noOld {
+				mdup = append(mdup, [2]uint32{i, kept})
+			}
 			continue
 		}
 		mseen[k] = i
@@ -748,6 +763,10 @@ func buildPlan(f *File, opts RebuildOptions) (*plan, error) {
 		if e.old != noOld {
 			R.Method[e.old] = uint32(i)
 		}
+	}
+	// 回填被去重丢弃的旧 id：映射到存活那条的新索引。
+	for _, p := range mdup {
+		R.Method[p[0]] = R.Method[p[1]]
 	}
 
 	// ---- 6) 类定义 ----

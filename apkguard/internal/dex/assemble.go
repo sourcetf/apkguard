@@ -381,6 +381,22 @@ func sameBases(a, b map[uint16]uint32) bool {
 	return true
 }
 
+// resolveAnnoOff 把 class_def 的旧 annotations_directory 偏移解析为新偏移。
+//
+// annoOff == 0 表示该类没有注解（合法）。非 0 却查不到映射说明注解树与
+// class_def 不自洽：早期实现直接 dirMap[annoOff] 会返回零值，把注解目录
+// 静默清掉（产物丢注解且无声）。这里改为报错。
+func resolveAnnoOff(dirMap map[uint32]uint32, annoOff uint32) (uint32, error) {
+	if annoOff == 0 {
+		return 0, nil
+	}
+	v, ok := dirMap[annoOff]
+	if !ok {
+		return 0, fmt.Errorf("dex: 类的 annotations_directory 偏移 %d 未在注解树中重映射（结构不自洽）", annoOff)
+	}
+	return v, nil
+}
+
 // generate 生成一遍索引表与数据区内容。
 //
 // base 给出各 section 的起始偏移；传 nil 表示仅测量大小（此时偏移按 0 计算，
@@ -427,16 +443,27 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 		return off
 	}
 	// 旧 type_list：按旧偏移读取并重映射
-	makeOldTypeList := func(oldOff uint32) uint32 {
+	makeOldTypeList := func(oldOff uint32) (uint32, error) {
 		if oldOff == 0 {
-			return 0
+			return 0, nil
+		}
+		if int(oldOff)+4 > len(d) {
+			return 0, fmt.Errorf("%w: type_list 偏移越界 %d", ErrTruncated, oldOff)
 		}
 		n := binary.LittleEndian.Uint32(d[oldOff:])
+		if int(oldOff)+4+2*int(n) > len(d) {
+			return 0, fmt.Errorf("%w: type_list @%d 声明 %d 项，超出文件范围", ErrTruncated, oldOff, n)
+		}
 		idx := make([]uint32, 0, n)
 		for k := uint32(0); k < n; k++ {
-			idx = append(idx, b.R.Type[binary.LittleEndian.Uint16(d[oldOff+4+2*k:])])
+			old := binary.LittleEndian.Uint16(d[oldOff+4+2*k:])
+			v, err := mapRefChecked(b.R.Type, uint32(old), "type_list type")
+			if err != nil {
+				return 0, err
+			}
+			idx = append(idx, v)
 		}
-		return makeTypeList(idx)
+		return makeTypeList(idx), nil
 	}
 
 	// ---- 原型参数 type_list ----
@@ -545,29 +572,21 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 			}
 			blob = append([]byte(nil), d[co:co+uint32(length)]...)
 			// skip 汇总「已是新索引、不可再映射」的字位置，交给 remapCode。
-			// 它必须与**产生它的改写步骤**的输出字节流严格对应，因此每一步
-			// 改写后若再平移字位置，之前的 skip 就失效——这正是 A6 必须排在
-			// A2/A3 之前的原因（见下）。
+			//
+			// 坐标系约定：skip 始终是**当前 blob** 的绝对字位置。每一步改写
+			// （A2/A3）都会把自己的输出坐标系回传，并在接收上游 skip 时先做
+			// 坐标平移（arrayizeCodeItem 的 inSkip 参数 / widenConstStrings 的
+			// skip 参数）。绝不能把不同步骤坐标系的位置直接求并集：那会让
+			// remapCode 漏跳或错跳，把已是最终值的索引按旧表二次映射，产物静默
+			// 损坏（实测报 "method 索引越界 51/46"）。
 			var skip map[int]bool
-			mergeSkip := func(s map[int]bool) {
-				if len(s) == 0 {
-					return
-				}
-				if skip == nil {
-					skip = map[int]bool{}
-				}
-				for k := range s {
-					skip[k] = true
-				}
-			}
 			// A6：控制流混淆。
 			//
 			// 必须排在 A2/A3 **之前**。A2/A3 返回的是**绝对字位置**，交给后面的
 			// remapCode 使用；A6 会插入/替换指令、整体平移后续字位置，若排在
-			// A2/A3 之后，那些位置会全部错位，remapCode 要么跳过错误的字、要么
-			// 漏跳正确的字，导致池引用被二次映射或漏映射，产物静默损坏。
-			// A6 自身不产生任何池引用、不需要 skip，且不触碰 const-string，
-			// 对后续 A2/A3 无干扰，因此放在最前最稳。
+			// A2/A3 之后，那些位置会全部错位。A6 自身不产生任何池引用、
+			// 不需要 skip，且不触碰 const-string，对后续 A2/A3 无干扰，因此放在
+			// 最前最稳。
 			if pl.controlFlow != nil {
 				nb, sk, changed, err := b.controlFlowCodeItem(pl, codeName[co], blob)
 				if err != nil {
@@ -575,7 +594,7 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 				}
 				if changed {
 					blob = nb
-					mergeSkip(sk)
+					skip = sk
 				}
 			}
 			// A2/A3：改写 const-string。
@@ -590,29 +609,31 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 				}
 				if changed {
 					blob = nb
-					mergeSkip(sk)
+					skip = sk
 				}
 			}
 			if pl.constArr != nil {
-				nb, sk, changed, err := b.arrayizeCodeItem(pl, blob)
+				// 传入当前 skip（坐标为 blob），arrayizeCodeItem 会把它平移到
+				// 自己的产物坐标系并与自身 fresh 合并后返回。
+				nb, sk, changed, err := b.arrayizeCodeItem(pl, blob, skip)
 				if err != nil {
 					return nil, err
 				}
 				if changed {
 					blob = nb
-					mergeSkip(sk)
 				}
+				// 无论是否发生改写，都采用回传的 skip：没有改写时它就是平移后
+				// 的上游 skip（坐标系不变，直接沿用）。
+				skip = sk
 			}
 			// 字符串索引越界自动加宽：把新下标 >65535 的 const-string
 			// 换成 const-string/jumbo。
 			//
 			// 必须排在 A2/A3 **之后**：只有这两步改完之后，剩下的 0x1a 才是
-			// 真正需要加宽的对象（A2 会把部分 0x1a 直接换成 jumbo，A3 会换成
-			// 数组构造序列）；也必须排在 remapCode **之前**，因为 remapCode 按
-			// 固定宽度线性遍历，加宽改变了字位置，在其后做会让后续字全部错位。
+			// 真正需要加宽的对象；也必须排在 remapCode **之前**，因为 remapCode
+			// 按固定宽度线性遍历，加宽改变了字位置。
 			//
-			// 本步会返回平移后的 skip：skip 是绝对字位置，插入一个字后其后
-			// 位置全部后移，平移错了 remapCode 会漏跳/错跳，静默损坏产物。
+			// 本步返回平移后的 skip（按项内相对偏移换算），坐标系为加宽后 blob。
 			{
 				nb, nsk, changed, err := b.widenConstStrings(pl, blob, skip)
 				if err != nil {
@@ -720,7 +741,19 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 		for oldPos, fl := range pcd.StaticFields {
 			ents = append(ents, sfEnt{newIdx: b.R.Field[fl.Idx], oldPos: oldPos})
 		}
-		sort.Slice(ents, func(a, c2 int) bool { return ents[a].newIdx < ents[c2].newIdx })
+		sort.SliceStable(ents, func(a, c2 int) bool { return ents[a].newIdx < ents[c2].newIdx })
+		// 与 emitClassData 的字段去重保持一致：塌缩后同索引只保留
+		// 原始顺序中的第一条，使 static_values 的个数与 class_data 的静态字段数一致。
+		if len(ents) > 0 {
+			kept := ents[:1]
+			for k := 1; k < len(ents); k++ {
+				if ents[k].newIdx == kept[len(kept)-1].newIdx {
+					continue
+				}
+				kept = append(kept, ents[k])
+			}
+			ents = kept
+		}
 
 		// 自校验：每个值切片必须自身合法，否则拼出的数组会字节错位。
 		for idx, e := range ents {
@@ -839,14 +872,25 @@ func (b *builder) generate(pl *plan, base map[uint16]uint32) (*layout, error) {
 			}
 			interfacesOff = makeTypeList(idx)
 		} else {
-			interfacesOff = makeOldTypeList(c.ifaceOff)
+			var ierr error
+			interfacesOff, ierr = makeOldTypeList(c.ifaceOff)
+			if ierr != nil {
+				return nil, ierr
+			}
 		}
 		binary.LittleEndian.PutUint32(classDefs[base:], c.classIdx)
 		binary.LittleEndian.PutUint32(classDefs[base+4:], c.access)
 		binary.LittleEndian.PutUint32(classDefs[base+8:], c.superIdx)
 		binary.LittleEndian.PutUint32(classDefs[base+12:], interfacesOff)
 		binary.LittleEndian.PutUint32(classDefs[base+16:], c.sourceIdx)
-		binary.LittleEndian.PutUint32(classDefs[base+20:], dirMap[c.annoOff])
+		// 注解目录偏移：annoOff 为 0 表示无注解（合法，写 0）。非 0 却不在
+		// 重映射表里说明注解树与 class_def 不自洽——绝不能静默取 0，那会把
+		// 该类的注解目录整体清掉（产物静默丢失注解）。
+		annoNew, aerr := resolveAnnoOff(dirMap, c.annoOff)
+		if aerr != nil {
+			return nil, aerr
+		}
+		binary.LittleEndian.PutUint32(classDefs[base+20:], annoNew)
 		if c.spec != nil {
 			binary.LittleEndian.PutUint32(classDefs[base+24:], injectedData[c.spec])
 		} else {
@@ -878,22 +922,50 @@ func bytesIndexByte(b []byte, c byte) int {
 // emitClassData 重新编码 class_data_item。
 func emitClassData(cd *ClassData, R *Remap, codeMap map[uint32]uint32) []byte {
 	out := make([]byte, 0, 64)
-	out = PutULEB128(out, uint32(len(cd.StaticFields)))
-	out = PutULEB128(out, uint32(len(cd.InstanceFields)))
-	out = PutULEB128(out, uint32(len(cd.DirectMethods)))
-	out = PutULEB128(out, uint32(len(cd.VirtualMethods)))
 
-	// 字段/方法索引重排后必须重新排序
+	// 字段/方法索引重排后必须重新排序；重命名可能把两条 id 塌缩为同一条，
+	// 编码要求 class_data 内索引严格递增，因此必须先映射、排序、去重，
+	// 再按**去重后**的数量写头部计数（否则头部声明的条目数多于实际写入，
+	// 解析器会串读后续字节，产生巨大的越界索引）。
 	sf := make([][2]uint32, 0, len(cd.StaticFields))
 	for _, fl := range cd.StaticFields {
 		sf = append(sf, [2]uint32{R.Field[fl.Idx], fl.Acc})
 	}
-	sort.Slice(sf, func(a, c int) bool { return sf[a][0] < sf[c][0] })
+	sort.SliceStable(sf, func(a, c int) bool { return sf[a][0] < sf[c][0] })
+	sf = dedupFieldPairs(sf)
 	inf := make([][2]uint32, 0, len(cd.InstanceFields))
 	for _, fl := range cd.InstanceFields {
 		inf = append(inf, [2]uint32{R.Field[fl.Idx], fl.Acc})
 	}
-	sort.Slice(inf, func(a, c int) bool { return inf[a][0] < inf[c][0] })
+	sort.SliceStable(inf, func(a, c int) bool { return inf[a][0] < inf[c][0] })
+	inf = dedupFieldPairs(inf)
+
+	dedupMethods := func(lst []EncodedMethod) []EncodedMethod {
+		sorted := make([]EncodedMethod, len(lst))
+		copy(sorted, lst)
+		for i := range sorted {
+			sorted[i].Idx = R.Method[sorted[i].Idx]
+		}
+		sort.SliceStable(sorted, func(a, c int) bool { return sorted[a].Idx < sorted[c].Idx })
+		if len(sorted) == 0 {
+			return sorted
+		}
+		out := sorted[:1]
+		for i := 1; i < len(sorted); i++ {
+			if sorted[i].Idx == out[len(out)-1].Idx {
+				continue
+			}
+			out = append(out, sorted[i])
+		}
+		return out
+	}
+	dm := dedupMethods(cd.DirectMethods)
+	vm := dedupMethods(cd.VirtualMethods)
+
+	out = PutULEB128(out, uint32(len(sf)))
+	out = PutULEB128(out, uint32(len(inf)))
+	out = PutULEB128(out, uint32(len(dm)))
+	out = PutULEB128(out, uint32(len(vm)))
 
 	writeFields := func(lst [][2]uint32) {
 		var prev uint32
@@ -907,14 +979,8 @@ func emitClassData(cd *ClassData, R *Remap, codeMap map[uint32]uint32) []byte {
 	writeFields(inf)
 
 	writeMethods := func(lst []EncodedMethod) {
-		sorted := make([]EncodedMethod, len(lst))
-		copy(sorted, lst)
-		for i := range sorted {
-			sorted[i].Idx = R.Method[sorted[i].Idx]
-		}
-		sort.Slice(sorted, func(a, c int) bool { return sorted[a].Idx < sorted[c].Idx })
 		var prev uint32
-		for _, m := range sorted {
+		for _, m := range lst {
 			out = PutULEB128(out, m.Idx-prev)
 			out = PutULEB128(out, m.Acc)
 			newCode := uint32(0)
@@ -925,8 +991,23 @@ func emitClassData(cd *ClassData, R *Remap, codeMap map[uint32]uint32) []byte {
 			prev = m.Idx
 		}
 	}
-	writeMethods(cd.DirectMethods)
-	writeMethods(cd.VirtualMethods)
+	writeMethods(dm)
+	writeMethods(vm)
+	return out
+}
+
+// dedupFieldPairs 去掉排序后相邻的重复字段索引（重命名塌缩所致），保留第一条。
+func dedupFieldPairs(in [][2]uint32) [][2]uint32 {
+	if len(in) == 0 {
+		return in
+	}
+	out := in[:1]
+	for i := 1; i < len(in); i++ {
+		if in[i][0] == out[len(out)-1][0] {
+			continue
+		}
+		out = append(out, in[i])
+	}
 	return out
 }
 

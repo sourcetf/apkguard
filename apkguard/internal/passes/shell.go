@@ -50,6 +50,11 @@ type shellInfo struct {
 	EntryName string
 	// OrigJavaName 是原 Manifest 声明的 Application 类名（已解析为完整类名）。
 	OrigJavaName string
+	// NativeKey 非空表示载荷密钥由该桥接类在运行时向 native 索取（C1）。
+	//
+	// B2 写入、B3 读取：B3 构造 dex.LoaderSpec 时必须把它传下去，否则
+	// dex 层会退回「逐字节内联密钥」的分支，C1 的安全声明就落空了。
+	NativeKey string
 }
 
 // appReplace 把 Manifest 的 android:name 指向壳 Application，并注入壳 DEX。
@@ -237,6 +242,7 @@ func (a *appReplace) Run(_ context.Context, art *pipeline.Artifact, opts *config
 		CheckOrder:   checkOrder,
 		EntryName:    name,
 		OrigJavaName: origName,
+		NativeKey:    sh.NativeKey,
 	})
 
 	art.Note("B2 Application 替换：壳类 %s 已注入 %s（%d 字节），Manifest android:name 由 %q 改为壳类",
@@ -384,6 +390,10 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		Items:   items,
 		TempDir: loaderTempDir,
 		Debug:   opts.DebugShell,
+		// C1 生效时把 native 桥接类传下去：dex 层据此生成
+		// key = Native.derive(Native.sig(base)) 的调用，而不是把密钥
+		// 逐字节内联进字节码。漏掉这一步会让 C1 的安全声明落空。
+		NativeKey: info.NativeKey,
 		// 只读标记只对 targetSdk ≥ 34 有意义（Android 14+ 的加载要求）；
 		// 对更低 targetSdk 的应用标记反而会挡住 ART 打开这些文件。
 		MarkReadOnly: manifestSDKOf(art, "targetSdkVersion") >= 34,
@@ -1026,19 +1036,33 @@ func (c *compatCheck) Run(_ context.Context, art *pipeline.Artifact, _ *config.O
 		libsByAbi[parts[1]][parts[len(parts)-1]] = true
 	}
 	if len(libsByAbi) > 1 {
-		// 以第一个 ABI 的库集合为基准，其余缺失即报错。
+		// 求所有 ABI 库集合的**并集**，再对每个 ABI 报告它相对并集缺失的库。
+		//
+		// 不能以「字母序第一个 ABI」为基准做单向比较：当残缺方恰好排在前面时，
+		// 它缺的库不会与任何人比较、也就不会被报出来（假阴性），而这正是本检查
+		// 要防的线上事故（某架构因缺一个 .so 而崩）。并集比较对任意一方都成立。
+		union := map[string]bool{}
+		for _, libs := range libsByAbi {
+			for lib := range libs {
+				union[lib] = true
+			}
+		}
 		var abis []string
 		for a := range libsByAbi {
 			abis = append(abis, a)
 		}
 		sort.Strings(abis)
-		base := abis[0]
-		for _, a := range abis[1:] {
-			for lib := range libsByAbi[base] {
+		for _, a := range abis {
+			var missing []string
+			for lib := range union {
 				if !libsByAbi[a][lib] {
-					problems = append(problems, fmt.Sprintf(
-						"ABI %s 缺少 %s（%s 有）：该架构上的应用会因缺少原生库而崩溃", a, lib, base))
+					missing = append(missing, lib)
 				}
+			}
+			sort.Strings(missing) // 固定顺序，保证错误信息可复现
+			for _, lib := range missing {
+				problems = append(problems, fmt.Sprintf(
+					"ABI %s 缺少 %s（其他 ABI 有）：该架构上的应用会因缺少原生库而崩溃", a, lib))
 			}
 		}
 	}

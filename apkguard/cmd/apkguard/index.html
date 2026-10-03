@@ -84,19 +84,53 @@
       <label class="row"><span>别名</span><input type="text" id="alias" placeholder="留空取第一个私钥条目"></label>
     </div>
     <div class="card">
-      <h2>高级</h2>
-      <details><summary>展开（渠道 / 设备绑定 / 混淆与膨胀参数）</summary>
+      <h2>高级<span class="hint">数值框已预填 CLI 默认值，勾选即生效</span></h2>
+      <details open><summary>签名 / SDK / 并发</summary>
+        <label class="row"><span>禁用 v1</span><input type="checkbox" id="no_v1"></label>
+        <label class="row"><span>禁用 v2</span><input type="checkbox" id="no_v2"></label>
+        <label class="row"><span>禁用 v3</span><input type="checkbox" id="no_v3"></label>
+        <label class="row"><span>额外 v4</span><input type="checkbox" id="v4"></label>
+        <label class="row"><span>minSdk</span><input type="number" id="min_sdk" value="24"></label>
+        <label class="row"><span>maxSdk</span><input type="number" id="max_sdk" value="2147483647"></label>
+        <label class="row"><span>并发数</span><input type="number" id="jobs" value="0" placeholder="0 = CPU 核数（E5）"></label>
+      </details>
+      <details><summary>渠道 / 设备绑定 / 签名指纹</summary>
         <label class="row"><span>渠道列表</span><input type="text" id="channels" placeholder="huawei,xiaomi（E4）"></label>
         <label class="row"><span>设备绑定</span><input type="text" id="bind_device" placeholder="android_id（D5）"></label>
         <label class="row"><span>签名指纹</span><input type="text" id="sig_hash" placeholder="SHA-256 十六进制（D1）"></label>
+      </details>
+      <details><summary>混淆与膨胀参数</summary>
         <label class="row"><span>名称前缀</span><input type="text" id="name_prefix" placeholder="A1 混淆类名前缀"></label>
+        <label class="row"><span>压缩包名</span><input type="checkbox" id="package_shrink"></label>
         <label class="row"><span>保留白名单</span><input type="text" id="keep_rules" placeholder="A1 规则文件路径（每行一条）"></label>
-        <label class="row"><span>最短加密</span><input type="number" id="obf_string_min" placeholder="0 = 全部（A2）"></label>
-        <label class="row"><span>拆分份数</span><input type="number" id="split_count" placeholder="0 = 不拆（B4）"></label>
-        <label class="row"><span>类膨胀数</span><input type="number" id="class_pad_count" placeholder="100（A13）"></label>
-        <label class="row"><span>伪 DEX 块</span><input type="number" id="fake_dex_count" placeholder="1（A9）"></label>
+        <label class="row"><span>最短加密</span><input type="number" id="obf_string_min" value="0" placeholder="0 = 全部（A2）"></label>
+        <label class="row"><span>垃圾顶文件</span><input type="number" id="junk_top_count" value="800" placeholder="800（A10）"></label>
+        <label class="row"><span>垃圾深目录</span><input type="number" id="junk_dir_count" value="400" placeholder="400（A10）"></label>
+        <label class="row"><span>深目录层数</span><input type="number" id="junk_dir_depth" value="16" placeholder="16（A10）"></label>
+        <label class="row"><span>畸形 META</span><input type="number" id="junk_meta_count" value="20" placeholder="20（A10）"></label>
+        <label class="row"><span>伪 DEX 块数</span><input type="number" id="fake_dex_count" value="1" placeholder="1（A9）"></label>
+        <label class="row"><span>伪 DEX 块大小</span><input type="number" id="fake_dex_size" value="80000" placeholder="80000（A9）"></label>
+        <label class="row"><span>ZIP 攻击条数</span><input type="number" id="zip_atk_count" value="150" placeholder="150（A12）"></label>
+        <label class="row"><span>类膨胀数</span><input type="number" id="class_pad_count" value="100" placeholder="100（A13）"></label>
         <label class="row"><span>时间戳</span><input type="text" id="stamp_time" placeholder="2024-01-01T00:00:00Z（A14）"></label>
-        <label class="row"><span>Manifest 填充</span><input type="number" id="manifest_pad_mb" placeholder="0=默认100MB（A15，危险区）"></label>
+        <label class="row"><span>Manifest 填充</span><input type="number" id="manifest_pad_mb" value="0" placeholder="0=默认100MB（A15，危险区）"></label>
+        <label class="row"><span>诱饵核心组</span><input type="number" id="decoy_core_count" value="0" placeholder="0=默认（A16）"></label>
+        <label class="row"><span>诱饵 APK MB</span><input type="number" id="decoy_apk_mb" value="0" placeholder="0=默认（A17）"></label>
+        <label class="row"><span>诱饵元数据</span><input type="number" id="decoy_meta_count" value="0" placeholder="0=默认（A18）"></label>
+        <label class="row"><span>垃圾字符串</span><input type="number" id="str_junk_count" value="0" placeholder="0=默认（A19）"></label>
+        <label class="row"><span>花指令组数</span><input type="number" id="junk_insn_count" value="0" placeholder="0=默认（A20）"></label>
+      </details>
+      <details><summary>加壳 / Native 参数</summary>
+        <label class="row"><span>DEX 密钥</span><input type="text" id="dex_key" placeholder="B1 加密密钥（留空自动生成）"></label>
+        <label class="row"><span>诱饵假包名</span><input type="text" id="decoy_pkg" placeholder="dummy.installed.check（B8）"></label>
+        <label class="row"><span>载荷 MAC</span><input type="checkbox" id="payload_mac"></label>
+        <label class="row"><span>SO 加密</span><input type="checkbox" id="so_encrypt"></label>
+        <label class="row"><span>壳包名</span><input type="text" id="shell_pkg" value="com.apkguard.shell"></label>
+        <label class="row"><span>拆分份数</span><input type="number" id="split_count" value="0" placeholder="0 = 不拆（B4）"></label>
+        <label class="row"><span>抽取比例</span><input type="number" id="extract_ratio" value="0" placeholder="B5 未实现，须为 0"></label>
+        <label class="row"><span>排障壳</span><input type="checkbox" id="debug_shell"></label>
+        <label class="row"><span>假库名</span><input type="text" id="lib_fake_name" placeholder="libsqlite3x.so（C7）"></label>
+        <label class="row"><span>清 ELF 节头</span><input type="checkbox" id="lib_strip_sections"></label>
       </details>
     </div>
     <div class="card">
@@ -150,8 +184,16 @@ const PRESETS = {
   min: ['A1','A2','A3','A4','E1','E2','E3','E6'],
   shell: ['A1','A2','A3','A4','B1','B2','B3','B4','E1','E2','E3','E6']
 };
-function val(id) { return (document.getElementById(id).value || '').trim(); }
-function num(id) { const v = val(id); return v === '' ? undefined : Number(v); }
+function val(id) { const el = document.getElementById(id); return el ? (el.value || '').trim() : ''; }
+function checked(id) { const el = document.getElementById(id); return !!(el && el.checked); }
+// num 在输入框留空时回退到 def，保证「清空输入框」不会退化成 0 = 空操作。
+// def 必须与 cmd/apkguard/main.go 里对应 flag 的默认值一致。
+function num(id, def) {
+  const v = val(id);
+  if (v === '') return def;
+  const n = Number(v);
+  return isNaN(n) ? def : n;
+}
 // channels 必须按逗号切成数组：后端的 Options.Channels 是 []string，
 // 直接发字符串会让 json.Decode 报 "cannot unmarshal string into ... []string"，
 // 导致界面上任何一次「开始加固」都失败。
@@ -161,25 +203,101 @@ function channels() {
   const out = v.split(',').map(function(s){ return s.trim(); }).filter(Boolean);
   return out.length ? out : undefined;
 }
+// collect() 的键必须与 config.Options 的全部 JSON tag 一一对应。
+// 缺键会让对应功能项在 Web 路径下拿到 Go 零值（数值项为 0 即空操作），
+// cmd/apkguard/auditfix_web_test.go 会断言这份集合完全相等。
 function collect() {
   const enabled = {};
   for (const f of state.features) enabled[f.id] = !!state.enabled[f.id];
-  return {enabled: enabled, in: val('in'), out: val('out'), ks: val('ks'),
-    ks_pass: val('ks_pass'), key_pass: val('key_pass'), ks_type: val('ks_type'),
-    alias: val('alias'), seed: val('seed'), channels: channels(),
-    bind_device: val('bind_device'),
+  return {
+    enabled: enabled,
+    in: val('in'),
+    out: val('out'),
+    ks: val('ks'),
+    ks_pass: val('ks_pass'),
+    key_pass: val('key_pass'),
+    ks_type: val('ks_type'),
+    alias: val('alias'),
+    no_v1: checked('no_v1'),
+    no_v2: checked('no_v2'),
+    no_v3: checked('no_v3'),
+    v4: checked('v4'),
+    min_sdk: num('min_sdk', 24),
+    max_sdk: num('max_sdk', 2147483647),
+    name_prefix: val('name_prefix'),
+    package_shrink: checked('package_shrink'),
+    keep_rules: val('keep_rules'),
+    obf_string_min: num('obf_string_min', 0),
+    seed: val('seed'),
+    fake_dex_count: num('fake_dex_count', 1),
+    fake_dex_size: num('fake_dex_size', 80000),
+    junk_top_count: num('junk_top_count', 800),
+    junk_dir_count: num('junk_dir_count', 400),
+    junk_dir_depth: num('junk_dir_depth', 16),
+    junk_meta_count: num('junk_meta_count', 20),
+    zip_atk_count: num('zip_atk_count', 150),
+    class_pad_count: num('class_pad_count', 100),
+    stamp_time: val('stamp_time'),
+    manifest_pad_mb: num('manifest_pad_mb', 0),
+    decoy_core_count: num('decoy_core_count', 0),
+    decoy_apk_mb: num('decoy_apk_mb', 0),
+    decoy_meta_count: num('decoy_meta_count', 0),
+    str_junk_count: num('str_junk_count', 0),
+    junk_insn_count: num('junk_insn_count', 0),
+    lib_fake_name: val('lib_fake_name'),
+    lib_strip_sections: checked('lib_strip_sections'),
+    dex_key: val('dex_key'),
+    decoy_pkg: val('decoy_pkg'),
+    payload_mac: checked('payload_mac'),
+    so_encrypt: checked('so_encrypt'),
+    shell_pkg: val('shell_pkg'),
+    split_count: num('split_count', 0),
+    extract_ratio: num('extract_ratio', 0),
+    debug_shell: checked('debug_shell'),
     sig_hashes: val('sig_hash') ? [val('sig_hash')] : undefined,
-    name_prefix: val('name_prefix'), keep_rules: val('keep_rules'),
-    obf_string_min: num('obf_string_min'), split_count: num('split_count'),
-    class_pad_count: num('class_pad_count'), fake_dex_count: num('fake_dex_count'),
-    stamp_time: val('stamp_time'), manifest_pad_mb: num('manifest_pad_mb')};
+    bind_device: val('bind_device'),
+    channels: channels(),
+    jobs: num('jobs', 0)
+  };
 }
-function status(html) { document.getElementById('status').innerHTML = html; }
+// status / busy 一律用 textContent 写文本，绝不拼 innerHTML：
+// 错误信息、输出路径、notes/stats 都可能来自用户输入或 APK 内容（条目名/组件名），
+// 直接 innerHTML 会形成自 XSS 与注入面。
+function status(msg, cls) {
+  const el = document.getElementById('status');
+  el.textContent = '';
+  if (cls) {
+    const s = document.createElement('span');
+    s.className = cls;
+    s.textContent = msg;
+    el.appendChild(s);
+  } else {
+    el.textContent = msg;
+  }
+}
+function busy(msg) {
+  const el = document.getElementById('status');
+  el.textContent = '';
+  const sp = document.createElement('span');
+  sp.className = 'spin';
+  el.appendChild(sp);
+  el.appendChild(document.createTextNode(msg));
+}
 async function run() {
+  // 危险区二次确认：启用这些功能项可能破坏兼容性或显著增大体积，
+  // 提交前必须让用户看清并显式确认。用户取消则不提交。
+  const danger = state.features.filter(function(f){
+    return state.enabled[f.id] && f.risk === '危险区';
+  }).map(function(f){ return '  ' + f.id + ' ' + f.name; });
+  if (danger.length && !confirm('已勾选以下危险区功能项，可能破坏兼容性或显著增大体积：\n\n'
+      + danger.join('\n') + '\n\n确认继续加固？')) {
+    return;
+  }
   const btn = document.getElementById('run');
   btn.disabled = true;
-  document.getElementById('result').innerHTML = '';
-  status('<span class="spin"></span>正在加固，大包可能需要几分钟…');
+  const result = document.getElementById('result');
+  result.textContent = '';
+  busy('正在加固，大包可能需要几分钟…');
   const t0 = Date.now();
   try {
     const resp = await fetch('/api/run', {method: 'POST',
@@ -187,31 +305,46 @@ async function run() {
     const d = await resp.json();
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     if (!d.ok) {
-      status('<span class="err">加固失败（' + secs + 's）：' + (d.error || '未知错误') + '</span>');
+      status('加固失败（' + secs + 's）：' + (d.error || '未知错误'), 'err');
       return;
     }
-    status('<span class="ok">加固完成（' + (d.duration || secs + 's') + '）</span>');
-    let html = '';
-    // 多渠道时后端逐个产出、返回多个路径；单渠道/单包时只有一个。
+    status('加固完成（' + (d.duration || secs + 's') + '）', 'ok');
+    // 多渠道/批量时后端返回多个路径；单包时只有一个。
     const outs = (d.outs && d.outs.length) ? d.outs : [d.out];
     for (const o of outs) {
       const kb = (o === d.out && d.size) ? '（' + (d.size / 1024).toFixed(1) + ' KB）' : '';
-      html += '<div class="out">输出：' + o + kb + '</div>';
+      const div = document.createElement('div');
+      div.className = 'out';
+      div.textContent = '输出：' + o + kb;
+      result.appendChild(div);
     }
     if (d.ran && d.ran.length) {
-      html += '<p class="dim">执行了 ' + d.ran.length + ' 项：' + d.ran.join(', ') + '</p>';
+      const p = document.createElement('p');
+      p.className = 'dim';
+      p.textContent = '执行了 ' + d.ran.length + ' 项：' + d.ran.join(', ');
+      result.appendChild(p);
     }
     if (d.notes && d.notes.length) {
-      html += '<pre>' + d.notes.join('\n') + '</pre>';
+      const pre = document.createElement('pre');
+      pre.textContent = d.notes.join('\n');
+      result.appendChild(pre);
     }
     const st = d.stats || {}, keys = Object.keys(st).sort();
     if (keys.length) {
-      html += '<table>' + keys.map(function(k){
-        return '<tr><td class="k">' + k + '</td><td>' + st[k] + '</td></tr>'; }).join('') + '</table>';
+      const table = document.createElement('table');
+      for (const k of keys) {
+        const tr = document.createElement('tr');
+        const tdK = document.createElement('td');
+        tdK.className = 'k';
+        tdK.textContent = k;
+        const tdV = document.createElement('td');
+        tdV.textContent = st[k];
+        tr.appendChild(tdK); tr.appendChild(tdV); table.appendChild(tr);
+      }
+      result.appendChild(table);
     }
-    document.getElementById('result').innerHTML = html;
   } catch (e) {
-    status('<span class="err">请求失败：' + e + '</span>');
+    status('请求失败：' + e, 'err');
   } finally { btn.disabled = false; }
 }
 document.getElementById('run').addEventListener('click', run);

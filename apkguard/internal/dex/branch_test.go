@@ -1,7 +1,6 @@
 package dex
 
 import (
-	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -139,13 +138,7 @@ func TestArtifactBranchTargets(t *testing.T) {
 //
 //	"invalid branch target" 并拒绝整个类。
 func TestRealWorldBranchTargets(t *testing.T) {
-	apk := os.Getenv("RD_APK")
-	if apk == "" {
-		apk = "../../../realworld/rd-v20.apk"
-	}
-	if _, err := os.Stat(apk); err != nil {
-		t.Skipf("未找到 %s，跳过", apk)
-	}
+	apk := realWorldAPK(t)
 	g, assets := apkShellDex(t, apk)
 	env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
 	restore := installLoaderMocks(env)

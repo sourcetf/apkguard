@@ -1,7 +1,6 @@
 package dex
 
 import (
-	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -89,13 +88,7 @@ func TestArtifactShortyStrings(t *testing.T) {
 
 // TestRealWorldPayloadShorty 检查真实应用载荷的 shorty（自研样本覆盖不到）。
 func TestRealWorldPayloadShorty(t *testing.T) {
-	apk := os.Getenv("RD_APK")
-	if apk == "" {
-		apk = "../../../realworld/rd-v20.apk"
-	}
-	if _, err := os.Stat(apk); err != nil {
-		t.Skipf("未找到 %s，跳过", apk)
-	}
+	apk, isRealApp := realAppAPK(t)
 	g, assets := apkShellDex(t, apk)
 	env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
 	restore := installLoaderMocks(env)
@@ -118,7 +111,10 @@ func TestRealWorldPayloadShorty(t *testing.T) {
 		total += checkShortyStrings(t, filepath.Base(apk)+" "+filepath.Base(name), pg)
 	}
 	t.Logf("RustDesk 载荷共检查 %d 个原型 shorty", total)
-	if total < 1000 {
+	// 规模断言只在**真实应用产物**上生效：交付包（testapp）规模小得多，
+	// 用它去比"应有上千个原型"必然失败，但那不是缺陷。
+	// 结构体检（上面 checkXxx 的合法性断言）在任何产物上都已执行。
+	if isRealApp && total < 1000 {
 		t.Fatalf("真实应用原型数量异常（只检查到 %d 个）", total)
 	}
 }

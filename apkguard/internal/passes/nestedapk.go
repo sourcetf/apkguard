@@ -619,9 +619,11 @@ func (w *mfWriter) start(n *mfNode) []byte {
 	binary.LittleEndian.PutUint16(body[8:], 20) // attributeStart
 	binary.LittleEndian.PutUint16(body[10:], 20)
 	binary.LittleEndian.PutUint16(body[12:], uint16(len(n.attrs)))
-	binary.LittleEndian.PutUint16(body[14:], 0)      // idIndex
-	binary.LittleEndian.PutUint16(body[16:], 0xffff) // classIndex
-	binary.LittleEndian.PutUint16(body[18:], 0xffff) // styleIndex
+	binary.LittleEndian.PutUint16(body[14:], 0) // idIndex
+	// classIndex/styleIndex 的「无」用 0（AOSP 语义，真实 aapt 产物即 0）；
+	// 0xffff 会被解析器当成「第 65534 个属性」而错位。
+	binary.LittleEndian.PutUint16(body[16:], 0) // classIndex
+	binary.LittleEndian.PutUint16(body[18:], 0) // styleIndex
 	for _, a := range n.attrs {
 		at := make([]byte, 20)
 		if a.ns == "android" {
@@ -630,7 +632,8 @@ func (w *mfWriter) start(n *mfNode) []byte {
 			binary.LittleEndian.PutUint32(at[0:], noIndex)
 		}
 		binary.LittleEndian.PutUint32(at[4:], w.idx[a.name])
-		binary.LittleEndian.PutUint16(at[12:], 20)
+		// Res_value.size 恒为 8（Res_value 结构体大小），不是整个 attribute 的 20。
+		binary.LittleEndian.PutUint16(at[12:], 8)
 		switch a.kind {
 		case 0:
 			binary.LittleEndian.PutUint32(at[8:], w.idx[a.s]) // rawValue

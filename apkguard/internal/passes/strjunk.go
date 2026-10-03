@@ -89,11 +89,16 @@ func (s *strJunk) Run(_ context.Context, art *pipeline.Artifact, opts *config.Op
 	}
 
 	rng := newRand(opts.Seed)
-	before, after := 0, 0
+	// before 是处理前总字节数，delta 是处理带来的**增量**。
+	//
+	// 曾经把 delta 直接当成「处理后大小」打印，于是日志出现
+	// 「5012264 → 22528 字节（增加 -4989736）」这种看起来把 DEX 毁掉的行，
+	// 而实际产物是增大的——统计口径错了会误导排查方向，必须如实计算。
+	before, delta := 0, 0
 	var requested, added, skipped int
 	ok := 0
 	for _, u := range units {
-		req, add, bytes, skip, err := strJunkUnit(u, rng, n)
+		req, add, d, skip, err := strJunkUnit(u, rng, n)
 		if err != nil {
 			return fmt.Errorf("重建 %s 失败: %w", u.entry.NameString(), err)
 		}
@@ -105,11 +110,12 @@ func (s *strJunk) Run(_ context.Context, art *pipeline.Artifact, opts *config.Op
 			continue
 		}
 		before += len(u.data)
-		after += bytes
+		delta += d
 		requested += req
 		added += add
 		ok++
 	}
+	after := before + delta
 
 	art.Note("A19 字符串池垃圾注入：%d 个 DEX，请求 %d 条、实际新增 %d 条（与既有池去重/生成冲突 %d 条），"+
 		"跳过 %d 个 DEX（池接近 16 位上限）；%d → %d 字节（增加 %d）",
@@ -117,7 +123,7 @@ func (s *strJunk) Run(_ context.Context, art *pipeline.Artifact, opts *config.Op
 	art.Stat("A19.dex", fmt.Sprint(ok))
 	art.Stat("A19.requested", fmt.Sprint(requested))
 	art.Stat("A19.added", fmt.Sprint(added))
-	art.Stat("A19.bytes", fmt.Sprint(after-before))
+	art.Stat("A19.bytes", fmt.Sprint(delta))
 	art.Stat("A19.skipped", fmt.Sprint(skipped))
 	return nil
 }

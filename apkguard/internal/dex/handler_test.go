@@ -1,7 +1,6 @@
 package dex
 
 import (
-	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -184,13 +183,7 @@ func TestArtifactTryHandlers(t *testing.T) {
 // 这条路专门守「自研样本覆盖不到」的场景：真实应用遍布 try/catch，
 // 而测试样本里没有，因此只有真实包才能暴露 handler_off 这类缺陷。
 func TestRealWorldPayloadTryHandlers(t *testing.T) {
-	apk := os.Getenv("RD_APK")
-	if apk == "" {
-		apk = "../../../realworld/rd-v20.apk"
-	}
-	if _, err := os.Stat(apk); err != nil {
-		t.Skipf("未找到 %s，跳过", apk)
-	}
+	apk, isRealApp := realAppAPK(t)
 	g, assets := apkShellDex(t, apk)
 	env := &loaderEnv{assets: assets, fs: map[string][]byte{}}
 	restore := installLoaderMocks(env)
@@ -213,7 +206,10 @@ func TestRealWorldPayloadTryHandlers(t *testing.T) {
 		total += checkTryHandlers(t, filepath.Base(apk)+" "+filepath.Base(name), pg)
 	}
 	t.Logf("RustDesk 载荷共检查 %d 个 try_item", total)
-	if total < 100 {
+	// 规模断言只在**真实应用产物**上生效：交付包（testapp）规模小得多，
+	// 用它去比"应有上千个原型"必然失败，但那不是缺陷。
+	// 结构体检（上面 checkXxx 的合法性断言）在任何产物上都已执行。
+	if isRealApp && total < 100 {
 		t.Fatalf("真实应用应有大量 try/catch，只检查到 %d 个，样本可能不对", total)
 	}
 }

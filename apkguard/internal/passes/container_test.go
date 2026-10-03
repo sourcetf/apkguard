@@ -1,11 +1,10 @@
 package passes
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -17,12 +16,9 @@ import (
 
 // TestPayloadContainerMovesAndDeceives 是 B8 的核心判据。
 //
-// 参考样本的做法是：真实载荷藏在 assets/<随机名>.zip 里，zip 内含 .dat 密文与
-// 一份写着假包名的 json。我们的实现要达到同样的效果：
-//   - 真实载荷不再出现在 assets 顶层（改名到容器目录树里）；
-//   - 载荷清单同步更新（否则 B3 生成的 Loader 会去开一个不存在的条目，
-//     应用启动即崩——这是本功能最容易踩的坑）；
-//   - 另有一个同构的诱饵容器（.dat + json，json 里是假包名）。
+// 真实载荷移入 assets/<词>/<hex8>/<hex12>.<ext>；诱饵必须**与真载荷同构**——
+// 同目录树、同命名形态、纯高熵字节且不带 PK 头。否则脱壳脚本只要「找 PK 头」
+// 就能锁定诱饵、跳过真载荷，等于用排除法替攻击者定位真目标。
 func TestPayloadContainerMovesAndDeceives(t *testing.T) {
 	art := newArtifact(
 		zipx.NewStored("classes.dex", smallDexWithClass(t, "Lapp/A;")),
@@ -68,65 +64,84 @@ func TestPayloadContainerMovesAndDeceives(t *testing.T) {
 		t.Fatalf("只更新了 %d/%d 份载荷", moved, len(sp.Items))
 	}
 
-	// ② 出现诱饵容器，且内含 .dat 与 json（json 里是假包名）
+	// ② 诱饵与真载荷同构：同目录树、同命名形态、高熵、无 PK 头
 	decoy := art.Stats["B8.decoy"]
-	if decoy == "" {
-		t.Fatal("未记录诱饵容器名")
+	cfgName := art.Stats["B8.decoy_cfg"]
+	if decoy == "" || cfgName == "" {
+		t.Fatalf("未记录诱饵条目（decoy=%q cfg=%q）", decoy, cfgName)
 	}
+	tree := dirOf(sp.Items[0].Asset)
+	if dirOf(decoy) != tree {
+		t.Fatalf("诱饵 %s 不在真载荷目录树 %s 下（可被路径差异识别）", decoy, tree)
+	}
+	if dirOf(cfgName) != tree {
+		t.Fatalf("诱饵配置 %s 不在真载荷目录树 %s 下", cfgName, tree)
+	}
+	// 命名形态：<hex12>.<ext>，ext 属于容器扩展名集合。
+	isoName := regexp.MustCompile(`^[0-9a-f]{12}\.(dat|bin|res|pack)$`)
+	if !isoName.MatchString(pathBaseName(decoy)) {
+		t.Fatalf("诱饵 %s 的命名形态与真载荷不同构", decoy)
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{12}\.json$`).MatchString(pathBaseName(cfgName)) {
+		t.Fatalf("诱饵配置 %s 的命名形态异常", cfgName)
+	}
+
 	de := pipeline.Find(art, decoy)
 	if de == nil {
-		t.Fatalf("诱饵容器 %s 不存在", decoy)
+		t.Fatalf("诱饵条目 %s 不存在", decoy)
 	}
 	blob, err := de.Data()
 	if err != nil {
-		t.Fatalf("读取诱饵容器失败: %v", err)
+		t.Fatalf("读取诱饵失败: %v", err)
 	}
-	zr, err := zip.NewReader(bytes.NewReader(blob), int64(len(blob)))
+	if bytes.HasPrefix(blob, []byte("PK")) {
+		t.Fatal("诱饵带 PK 头：脱壳脚本只要找 PK 就能锁定诱饵、跳过真载荷")
+	}
+	if len(blob) < 256<<10 {
+		t.Fatalf("诱饵只有 %d 字节，太小会被一眼看作占位文件", len(blob))
+	}
+	seen := map[byte]bool{}
+	for _, b := range blob {
+		seen[b] = true
+	}
+	if len(seen) < 200 {
+		t.Errorf("诱饵熵值过低（只出现 %d 种字节），会被一眼看作占位文件", len(seen))
+	}
+
+	// 配置 JSON 与样本同构，写的是假包名。
+	ce := pipeline.Find(art, cfgName)
+	if ce == nil {
+		t.Fatalf("诱饵配置 %s 不存在", cfgName)
+	}
+	cfgBlob, err := ce.Data()
 	if err != nil {
-		t.Fatalf("诱饵容器不是合法 zip: %v", err)
+		t.Fatalf("读取诱饵配置失败: %v", err)
 	}
-	var sawDat, sawJSON bool
-	for _, f := range zr.File {
-		rc, err := f.Open()
-		if err != nil {
-			t.Fatalf("打开 %s 失败: %v", f.Name, err)
-		}
-		data, _ := io.ReadAll(rc)
-		rc.Close()
-		switch {
-		case strings.HasSuffix(f.Name, ".dat"):
-			sawDat = true
-			// 高熵：字节种类应接近 256
-			seen := map[byte]bool{}
-			for _, b := range data {
-				seen[b] = true
-			}
-			if len(seen) < 200 {
-				t.Errorf("诱饵 .dat 熵值过低（只出现 %d 种字节），会被一眼看作占位文件", len(seen))
-			}
-		case strings.HasSuffix(f.Name, ".json"):
-			sawJSON = true
-			var cfg decoyConfig
-			if err := json.Unmarshal(data, &cfg); err != nil {
-				t.Fatalf("诱饵配置不是合法 JSON: %v", err)
-			}
-			if cfg.PackageName != defaultDecoyPkg {
-				t.Errorf("诱饵包名应为 %q，实际 %q", defaultDecoyPkg, cfg.PackageName)
-			}
-			if cfg.APKFileName == "" {
-				t.Error("诱饵配置缺少 apkFileName")
-			}
-		}
+	var cfg decoyConfig
+	if err := json.Unmarshal(cfgBlob, &cfg); err != nil {
+		t.Fatalf("诱饵配置不是合法 JSON: %v", err)
 	}
-	if !sawDat || !sawJSON {
-		t.Fatalf("诱饵容器内容不全：dat=%v json=%v", sawDat, sawJSON)
+	if cfg.PackageName != defaultDecoyPkg {
+		t.Errorf("诱饵包名应为 %q，实际 %q", defaultDecoyPkg, cfg.PackageName)
 	}
+	if cfg.APKFileName == "" {
+		t.Error("诱饵配置缺少 apkFileName")
+	}
+
 	// ③ 诱饵包名不得等于真实包名（否则起不到误导作用）
 	if defaultDecoyPkg == "com.agtest" {
 		t.Fatal("诱饵包名与真实包名相同，失去误导价值")
 	}
-	t.Logf("B8：%d 份载荷移入容器目录，诱饵容器 %s（%d 字节，假包名 %s）",
-		moved, decoy, len(blob), defaultDecoyPkg)
+	t.Logf("B8：%d 份载荷移入 %s/，同构诱饵 %s（%d 字节，无 PK 头），假包名 %s",
+		moved, tree, decoy, len(blob), defaultDecoyPkg)
+}
+
+// dirOf 返回路径的目录部分（含结尾斜杠前的内容）。
+func dirOf(p string) string {
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[:i]
+	}
+	return ""
 }
 
 // TestPayloadContainerRequiresB1 校验未启用 B1 时给出可操作的错误。

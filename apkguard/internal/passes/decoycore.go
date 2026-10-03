@@ -215,9 +215,11 @@ func decoyElemBody(ns, name uint32, attrs []decoyElemAttr) []byte {
 	binary.LittleEndian.PutUint16(ext[8:], 20)  // attributeStart
 	binary.LittleEndian.PutUint16(ext[10:], 20) // attributeSize
 	binary.LittleEndian.PutUint16(ext[12:], uint16(len(attrs)))
-	binary.LittleEndian.PutUint16(ext[14:], 0)              // idIndex
-	binary.LittleEndian.PutUint16(ext[16:], noIndex&0xffff) // classIndex
-	binary.LittleEndian.PutUint16(ext[18:], noIndex&0xffff) // styleIndex
+	binary.LittleEndian.PutUint16(ext[14:], 0) // idIndex
+	// classIndex/styleIndex 的「无」用 0（AOSP 语义，真实 aapt 产物即 0）；
+	// 0xffff 会被解析器当成「第 65534 个属性」而错位。
+	binary.LittleEndian.PutUint16(ext[16:], 0) // classIndex
+	binary.LittleEndian.PutUint16(ext[18:], 0) // styleIndex
 	out := append([]byte(nil), ext...)
 	for _, a := range attrs {
 		e := make([]byte, 20)

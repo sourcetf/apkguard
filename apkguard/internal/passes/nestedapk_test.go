@@ -298,8 +298,8 @@ func TestNestedAPKWithContainer(t *testing.T) {
 		t.Fatal("诱饵条目名撞签名关键文件")
 	}
 
-	// 两个诱饵都必须能被 archive/zip 打开。
-	for _, n := range []string{a17, b8} {
+	// A17 的假 APK 是合法 zip；B8 的诱饵已改为与真载荷同构的高熵文件（非 zip）。
+	for _, n := range []string{a17} {
 		e := pipeline.Find(art, n)
 		if e == nil {
 			t.Fatalf("诱饵条目 %s 不存在", n)
@@ -309,7 +309,28 @@ func TestNestedAPKWithContainer(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := zip.NewReader(bytes.NewReader(blob), int64(len(blob))); err != nil {
-			t.Fatalf("诱饵 %s 不是合法 zip: %v", n, err)
+			t.Fatalf("A17 诱饵 %s 不是合法 zip: %v", n, err)
+		}
+	}
+	// B8 诱饵必须与真载荷同目录树且不带 PK 头（否则排除法即可定位真载荷）。
+	{
+		e := pipeline.Find(art, b8)
+		if e == nil {
+			t.Fatalf("B8 诱饵条目 %s 不存在", b8)
+		}
+		blob, err := e.Data()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.HasPrefix(blob, []byte("PK")) {
+			t.Fatal("B8 诱饵带 PK 头（与真载荷不同构，可被排除法识别）")
+		}
+		psp := payloadsOf(art)
+		if psp == nil || len(psp.Items) == 0 {
+			t.Fatal("B1 载荷清单丢失")
+		}
+		if dirOf(b8) != dirOf(psp.Items[0].Asset) {
+			t.Fatalf("B8 诱饵 %s 不在真载荷目录树 %s 下", b8, dirOf(psp.Items[0].Asset))
 		}
 	}
 

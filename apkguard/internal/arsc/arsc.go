@@ -45,6 +45,9 @@ type Table struct {
 	// strings 是池内字符串（与池中索引一一对应）。
 	strings []string
 	utf8    bool
+	// styles 是原池的 style（富文本样式）数据；无 style 时为 nil。
+	// 重建池时必须原样保留，否则样式数据会被静默丢弃。
+	styles *axml.Styles
 	// edits 保存「索引 → 新值」的改写。
 	edits map[int]string
 }
@@ -80,8 +83,10 @@ func Parse(data []byte) (*Table, error) {
 	if count < 0 || count > 1<<22 {
 		return nil, fmt.Errorf("arsc: 字符串数量异常 %d", count)
 	}
+	styleCount := int(binary.LittleEndian.Uint32(data[off+12:]))
 	flags := binary.LittleEndian.Uint32(data[off+16:])
 	stringsStart := int(binary.LittleEndian.Uint32(data[off+20:]))
+	stylesStart := int(binary.LittleEndian.Uint32(data[off+24:]))
 	base := off + stringsStart
 	if base < off+poolHeaderLen || base > poolEnd {
 		return nil, fmt.Errorf("arsc: 字符串数据区偏移非法 %d", stringsStart)
@@ -90,6 +95,34 @@ func Parse(data []byte) (*Table, error) {
 	if off+poolHeaderLen+count*4 > poolEnd {
 		return nil, fmt.Errorf("arsc: 字符串偏移数组越界")
 	}
+	if styleCount < 0 || styleCount > count {
+		return nil, fmt.Errorf("arsc: style 数量异常 %d（字符串 %d）", styleCount, count)
+	}
+
+	// style 数据必须一并解析并保留：其偏移数组紧跟字符串偏移数组，
+	// 数据区位于 stylesStart 起。丢失它会让富文本样式（权限对话框等）
+	// 被静默破坏。
+	var styles *axml.Styles
+	if styleCount > 0 {
+		styleArrEnd := off + poolHeaderLen + count*4 + styleCount*4
+		if styleArrEnd > poolEnd {
+			return nil, fmt.Errorf("arsc: style 偏移数组越界")
+		}
+		if stylesStart <= 0 || off+stylesStart < styleArrEnd || off+stylesStart > poolEnd {
+			return nil, fmt.Errorf("arsc: stylesStart 非法 %d", stylesStart)
+		}
+		offs := make([]uint32, styleCount)
+		for i := range offs {
+			offs[i] = binary.LittleEndian.Uint32(data[off+poolHeaderLen+count*4+4*i:])
+		}
+		sdata := data[off+stylesStart : poolEnd]
+		for i, o := range offs {
+			if o != 0xffffffff && int(o) >= len(sdata) {
+				return nil, fmt.Errorf("arsc: 第 %d 个 style 偏移越界 %d", i, o)
+			}
+		}
+		styles = &axml.Styles{Count: styleCount, Offsets: offs, Data: sdata}
+	}
 
 	t := &Table{
 		data:    data,
@@ -97,6 +130,7 @@ func Parse(data []byte) (*Table, error) {
 		poolEnd: poolEnd,
 		strings: make([]string, count),
 		utf8:    flags&utf8Flag != 0,
+		styles:  styles,
 		edits:   map[int]string{},
 	}
 	for i := 0; i < count; i++ {
@@ -156,22 +190,18 @@ func (t *Table) Encode() ([]byte, error) {
 	}
 	vals := make([]string, len(t.strings))
 	copy(vals, t.strings)
+	// 单遍「索引 → 新值」映射：edits 的键就是池下标，直接逐个赋值即可。
+	// 不要做「旧值 → 新值」的按值二次重写——那会级联改写：
+	// strings=["a","b"]、edits={0:"b",1:"c"} 时，第一次映射得到 ["b","c"]，
+	// 再按值把 "b" 重写成 "c" 就成了 ["c","c"]（"a" 被错误变成 "c"）。
 	for i, v := range t.edits {
 		vals[i] = v
 	}
-	// 池内若含重复项，改一处会导致同名项不一致；这里按「旧值→新值」统一，
-	// 与 Replace 的语义保持一致。
-	byOld := map[string]string{}
-	for i, v := range t.edits {
-		byOld[t.strings[i]] = v
-	}
-	for i, v := range vals {
-		if nv, ok := byOld[v]; ok {
-			vals[i] = nv
-		}
-	}
 
-	pool := axml.EncodeStringPool(vals, t.utf8)
+	pool, err := axml.EncodeStringPoolWithStyles(vals, t.utf8, t.styles)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]byte, 0, len(t.data)+len(pool))
 	out = append(out, t.data[:t.poolOff]...)
 	out = append(out, pool...)

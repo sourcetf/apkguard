@@ -206,7 +206,12 @@ func (f *File) Rewrite(edit Edit) ([]byte, error) {
 	}
 
 	// ---- 4) 生成新的字符串池块 ----
-	poolBlob := encodeStringPool(values, f.poolUTF8)
+	// 原池若带 style 数据必须原样保留（只改文本、条数与索引不变时是安全的）；
+	// 丢弃会让富文本样式静默损坏。
+	poolBlob, err := encodeStringPoolStyled(values, f.poolUTF8, f.poolStyles)
+	if err != nil {
+		return nil, err
+	}
 
 	// ---- 5) 组装：根块头 + 新池 + 其余块（按需改值/插入属性/插入元素）----
 	const rootHeaderSize = 8
@@ -382,7 +387,26 @@ func (f *File) nthElement(name string, n int) *Element {
 	return nil
 }
 
-// encodeStringPool 按给定字符串列表生成一个字符串池块。
+// Styles 描述字符串池的 style（富文本样式）数据。
+//
+// ResStringPool 的 style 由两部分组成：
+//   - style 偏移数组：紧跟在字符串偏移数组之后（仅当 styleCount > 0 时存在），
+//     每项相对 stylesStart，0xffffffff 表示该字符串没有样式；
+//   - style 数据区：位于 stylesStart 起，编码各字符串的 span 列表。
+//
+// 重建池时原样搬运这两部分即可——style 偏移是**相对** stylesStart 的，
+// 字符串数据长度变化只会让 stylesStart 的绝对值平移，相对偏移不受影响，
+// 因此只需回填新的 stringsStart/stylesStart，绝不能把 styleCount 置零。
+type Styles struct {
+	// Count 是 style 条目数（原池 styleCount）。
+	Count int
+	// Offsets 是长度为 Count 的 style 偏移数组（相对 stylesStart）。
+	Offsets []uint32
+	// Data 是从 stylesStart 起的 style 数据区（原样字节）。
+	Data []byte
+}
+
+// encodeStringPool 按给定字符串列表生成一个字符串池块（无 style）。
 //
 // 布局：chunk 头(28) + 偏移表(n*4) + 字符串数据 + 4 字节对齐填充。
 // 偏移表中的值是「相对 stringsStart 的偏移」——这是 AXML 的规定，
@@ -390,8 +414,34 @@ func (f *File) nthElement(name string, n int) *Element {
 //
 // 编码风格（UTF-8 / UTF-16）跟随原文件，以免引入额外的兼容性差异。
 func encodeStringPool(strs []string, utf8Pool bool) []byte {
+	out, _ := encodeStringPoolStyled(strs, utf8Pool, nil)
+	return out
+}
+
+// encodeStringPoolStyled 是字符串池编码的完整实现，支持原样保留 style 数据。
+//
+// 当 st 非空时，布局为：
+//
+//	chunk 头(28) + 字符串偏移表(n*4) + style 偏移表(styleCount*4)
+//	  + 字符串数据 + 对齐填充 + style 数据区 + 对齐填充
+//
+// style 偏移数组与 style 数据区都按传入值原样写入；st.Count > n 时无法安全
+// 保留（被引用的字符串不存在），返回错误而绝不静默置零。
+func encodeStringPoolStyled(strs []string, utf8Pool bool, st *Styles) ([]byte, error) {
 	n := len(strs)
 	const headerSize = 28
+
+	styleCount := 0
+	if st != nil && st.Count > 0 {
+		if len(st.Offsets) != st.Count {
+			return nil, fmt.Errorf("axml: style 偏移数组长度 %d 与 styleCount %d 不符", len(st.Offsets), st.Count)
+		}
+		// style 条目按下标与字符串一一对应；字符串变少时无法安全保留。
+		if n < st.Count {
+			return nil, fmt.Errorf("axml: 字符串数量 %d 少于 styleCount %d，无法安全保留 style", n, st.Count)
+		}
+		styleCount = st.Count
+	}
 
 	datas := make([][]byte, n)
 	dataLen := 0
@@ -404,8 +454,13 @@ func encodeStringPool(strs []string, utf8Pool bool) []byte {
 		dataLen += len(datas[i])
 	}
 
-	stringsStart := headerSize + n*4
+	stringsStart := headerSize + n*4 + styleCount*4
 	size := stringsStart + dataLen
+	stylesStart := 0
+	if styleCount > 0 {
+		stylesStart = align4(size)
+		size = stylesStart + len(st.Data)
+	}
 	if r := size % 4; r != 0 {
 		size += 4 - r
 	}
@@ -415,7 +470,7 @@ func encodeStringPool(strs []string, utf8Pool bool) []byte {
 	binary.LittleEndian.PutUint16(out[2:], headerSize)
 	binary.LittleEndian.PutUint32(out[4:], uint32(size))
 	binary.LittleEndian.PutUint32(out[8:], uint32(n))
-	binary.LittleEndian.PutUint32(out[12:], 0) // styleCount
+	binary.LittleEndian.PutUint32(out[12:], uint32(styleCount))
 	flags := uint32(0)
 	if isSortedUTF16(strs) {
 		flags |= flagSorted
@@ -425,7 +480,7 @@ func encodeStringPool(strs []string, utf8Pool bool) []byte {
 	}
 	binary.LittleEndian.PutUint32(out[16:], flags)
 	binary.LittleEndian.PutUint32(out[20:], uint32(stringsStart))
-	binary.LittleEndian.PutUint32(out[24:], 0) // stylesStart
+	binary.LittleEndian.PutUint32(out[24:], uint32(stylesStart))
 
 	p := stringsStart
 	for i, b := range datas {
@@ -433,7 +488,22 @@ func encodeStringPool(strs []string, utf8Pool bool) []byte {
 		copy(out[p:], b)
 		p += len(b)
 	}
-	return out
+	if styleCount > 0 {
+		// style 偏移数组原样搬运；相对偏移不随 stylesStart 平移而改变。
+		for i := 0; i < styleCount; i++ {
+			binary.LittleEndian.PutUint32(out[headerSize+n*4+4*i:], st.Offsets[i])
+		}
+		copy(out[stylesStart:], st.Data)
+	}
+	return out, nil
+}
+
+// align4 把 n 向上对齐到 4 的倍数。
+func align4(n int) int {
+	if r := n % 4; r != 0 {
+		return n + 4 - r
+	}
+	return n
 }
 
 // isSortedUTF16 判断字符串列表是否已按 UTF-16 码元序严格递增。
@@ -539,6 +609,15 @@ func utf16Units(s string) []uint16 {
 // 长度前缀」这些容易出错的细节只有一处代码。
 func EncodeStringPool(strs []string, utf8Pool bool) []byte {
 	return encodeStringPool(strs, utf8Pool)
+}
+
+// EncodeStringPoolWithStyles 在编码字符串池时原样保留 style 数据。
+//
+// 供 ARSC / AXML 重写复用：只要字符串条数与索引顺序不变（只改文本），
+// 传入原池的 *Styles 即可让 styleCount 与每条 style 的 span 数据保持不变。
+// 若 strs 数量少于 st.Count（被引用字符串不存在），返回错误而不是丢样式。
+func EncodeStringPoolWithStyles(strs []string, utf8Pool bool, st *Styles) ([]byte, error) {
+	return encodeStringPoolStyled(strs, utf8Pool, st)
 }
 
 // PoolSorted 报告字符串列表是否已按 UTF-16 码元序严格递增。

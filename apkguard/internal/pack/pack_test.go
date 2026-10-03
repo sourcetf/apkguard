@@ -9,7 +9,10 @@ import (
 
 // TestEncryptDecryptRoundTrip 验证加解密往返，覆盖各长度边界。
 func TestEncryptDecryptRoundTrip(t *testing.T) {
-	key := Key("test-key")
+	key, err := Key("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
 	iv := IVFromSeed("s")
 
 	cases := [][]byte{
@@ -46,15 +49,25 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 	}
 }
 
+// mustKey 是测试用的口令派生辅助（口令非空，不会失败）。
+func mustKey(t *testing.T, secret string) [KeySize]byte {
+	t.Helper()
+	k, err := Key(secret)
+	if err != nil {
+		t.Fatalf("派生密钥失败: %v", err)
+	}
+	return k
+}
+
 // TestDecryptWrongKey 验证错误密钥不会静默返回垃圾数据。
 func TestDecryptWrongKey(t *testing.T) {
-	key := Key("right")
+	key := mustKey(t, "right")
 	plain := bytes.Repeat([]byte{0x42}, 64)
 	blob, err := Encrypt(plain, key, IVFromSeed("s"))
 	if err != nil {
 		t.Fatalf("加密失败: %v", err)
 	}
-	wrong := Key("wrong")
+	wrong := mustKey(t, "wrong")
 	got, err := Decrypt(blob, wrong)
 	// 错误密钥下 PKCS#7 校验大概率失败；即便偶然通过，内容也必然不同。
 	if err == nil && bytes.Equal(got, plain) {
@@ -64,15 +77,29 @@ func TestDecryptWrongKey(t *testing.T) {
 
 // TestKeyDeterministic 验证密钥派生可复现。
 func TestKeyDeterministic(t *testing.T) {
-	a, b := Key("same"), Key("same")
+	a, b := mustKey(t, "same"), mustKey(t, "same")
 	if a != b {
 		t.Fatal("同口令派生出的密钥不一致")
 	}
-	if c := Key("other"); c == a {
+	if c := mustKey(t, "other"); c == a {
 		t.Fatal("不同口令派生出了相同密钥")
 	}
-	// 空口令必须有兜底值，不能panic
-	_ = Key("")
+	// 空口令不再回退到固定常量：必须生成随机密钥（两次不同）。
+	// 固定常量意味着任何拿到产物的人都能解出载荷，等于明文交付。
+	k1, err := Key("")
+	if err != nil {
+		t.Fatalf("空口令生成随机密钥失败: %v", err)
+	}
+	k2, err := Key("")
+	if err != nil {
+		t.Fatalf("空口令生成随机密钥失败: %v", err)
+	}
+	if k1 == k2 {
+		t.Fatal("空口令两次派生出了同一个密钥——退回了固定常量")
+	}
+	if k1 == sha256.Sum256([]byte("apkguard/packkey/apkguard")) {
+		t.Fatal("空口令等于旧的固定兜底常量")
+	}
 }
 
 // TestAssetName 验证载荷名的伪装性与确定性。
@@ -101,7 +128,7 @@ func TestAssetName(t *testing.T) {
 
 // TestMake 验证批量生成：数量、命名唯一、可解密还原。
 func TestMake(t *testing.T) {
-	key := Key("k")
+	key := mustKey(t, "k")
 	dexes := []Dex{
 		{Name: "classes.dex", Data: bytes.Repeat([]byte{0x01}, 100)},
 		{Name: "classes2.dex", Data: bytes.Repeat([]byte{0x02}, 200)},
@@ -152,7 +179,7 @@ func TestMake(t *testing.T) {
 
 // TestMakeDeterministic 验证同输入可复现。
 func TestMakeDeterministic(t *testing.T) {
-	key := Key("k")
+	key := mustKey(t, "k")
 	dexes := []Dex{{Name: "classes.dex", Data: bytes.Repeat([]byte{0x07}, 128)}}
 	a, err := Make(dexes, key, "seed")
 	if err != nil {
@@ -174,7 +201,7 @@ func TestMakeDeterministic(t *testing.T) {
 
 // TestMACRoundTrip 验证带 MAC 载荷的「先验后解」往返。
 func TestMACRoundTrip(t *testing.T) {
-	key := Key("mac-key")
+	key := mustKey(t, "mac-key")
 	plain := bytes.Repeat([]byte{0x5a}, 333)
 	dex := Dex{Name: "classes.dex", Data: plain}
 
@@ -210,7 +237,7 @@ func TestMACRoundTrip(t *testing.T) {
 
 // TestMACTamperDetected 验证篡改任意关键字节都会被 DecryptMAC 拒绝。
 func TestMACTamperDetected(t *testing.T) {
-	key := Key("mac-key")
+	key := mustKey(t, "mac-key")
 	plain := bytes.Repeat([]byte{0x11}, 200)
 	ps, err := MakeMAC([]Dex{{Name: "classes2.dex", Data: plain}}, key, "s")
 	if err != nil {
@@ -238,7 +265,7 @@ func TestMACTamperDetected(t *testing.T) {
 		t.Fatal("错误 name 仍通过 MAC 校验（载荷可被互换）")
 	}
 	// 错误 key：macKey 不同，失败。
-	if _, err := DecryptMAC(p.Blob, Key("other"), p.Name); err == nil {
+	if _, err := DecryptMAC(p.Blob, mustKey(t, "other"), p.Name); err == nil {
 		t.Fatal("错误 key 仍通过 MAC 校验")
 	}
 	// 过短载荷必须失败而不是 panic。
@@ -251,7 +278,7 @@ func TestMACTamperDetected(t *testing.T) {
 //
 // 这是向后兼容的硬约束：不追加尾部字节、不改变 IV/密文。
 func TestMACDisabledByteCompatible(t *testing.T) {
-	key := Key("compat")
+	key := mustKey(t, "compat")
 	dex := Dex{Name: "classes.dex", Data: bytes.Repeat([]byte{0x42}, 100)}
 	ps, err := Make([]Dex{dex}, key, "s")
 	if err != nil {
@@ -274,7 +301,7 @@ func TestMACDisabledByteCompatible(t *testing.T) {
 // TestMacKeyDomainSeparation 验证 MAC 密钥经过域分离，不等于 AES 密钥本身，
 // 且与实现使用同一公式（跨文件对拍）。
 func TestMacKeyDomainSeparation(t *testing.T) {
-	key := Key("k")
+	key := mustKey(t, "k")
 	mk := MacKey(key)
 	if bytes.Equal(mk[:], key[:]) {
 		t.Fatal("MAC 密钥不应等于 AES 密钥")

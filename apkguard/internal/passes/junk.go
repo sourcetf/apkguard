@@ -91,15 +91,19 @@ func realisticAXML(rnd *rand.Rand, target int) []byte {
 	binary.LittleEndian.PutUint16(ext[8:], 20)          // attributeStart
 	binary.LittleEndian.PutUint16(ext[10:], attrSize)   // attributeSize
 	binary.LittleEndian.PutUint16(ext[12:], uint16(len(attrList)))
-	binary.LittleEndian.PutUint16(ext[14:], 0)              // idIndex
-	binary.LittleEndian.PutUint16(ext[16:], noIndex&0xffff) // classIndex
-	binary.LittleEndian.PutUint16(ext[18:], noIndex&0xffff) // styleIndex
+	binary.LittleEndian.PutUint16(ext[14:], 0) // idIndex
+	// classIndex/styleIndex 的「无」用 0（AOSP 语义，真实 aapt 产物即 0）；
+	// 0xffff 会被解析器当成「第 65534 个属性」而错位。
+	binary.LittleEndian.PutUint16(ext[16:], 0) // classIndex
+	binary.LittleEndian.PutUint16(ext[18:], 0) // styleIndex
 	elemBody = append(elemBody, ext...)
 	for _, at := range attrList {
 		attr := make([]byte, attrSize)
 		binary.LittleEndian.PutUint32(attr[0:], idxNSURI) // ns -> android 命名空间 URI
 		binary.LittleEndian.PutUint32(attr[4:], uint32(attrIdx[at.name]))
 		binary.LittleEndian.PutUint32(attr[8:], uint32(valIdx[at.value])) // rawValue
+		// Res_value.size 恒为 8（Res_value 结构体大小），不是整个 attribute 的 20。
+		binary.LittleEndian.PutUint16(attr[12:], 8)
 		attr[15] = at.dtype
 		if at.dtype == 0x10 {
 			binary.LittleEndian.PutUint32(attr[16:], 0x7f010000)

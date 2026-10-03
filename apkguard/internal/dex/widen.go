@@ -126,7 +126,10 @@ func (b *builder) widenConstStrings(pl *plan, src []byte, skip map[int]bool) (bl
 		})
 	}
 
-	insns, m, _ := l.Encode()
+	insns, m, _, err := l.EncodeChecked()
+	if err != nil {
+		return nil, nil, false, err
+	}
 	pl.widen.Widened += len(todo)
 
 	ci.Insns = insns
@@ -172,5 +175,9 @@ func (b *builder) widenConstStrings(pl *plan, src []byte, skip map[int]bool) (bl
 		newSkip[np] = true
 	}
 
-	return ci.Encode(fixAddr), newSkip, true, nil
+	code, err := ci.EncodeChecked(fixAddr)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return code, newSkip, true, nil
 }

@@ -219,7 +219,7 @@ func (e *encryptNativeLibs) Run(_ context.Context, art *pipeline.Artifact, opts 
 		return nil
 	}
 
-	key, err := payloadKey(opts)
+	key, err := payloadKey(art, opts)
 	if err != nil {
 		return err
 	}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // v1ManifestName 是 JAR 清单文件名。
@@ -133,28 +134,28 @@ func attrValue(block []byte, key string) (string, bool) {
 }
 
 // writeManifestAttr 按 JAR 规范写入一个属性，超过 72 字节时折行。
+//
+// 折行必须在**字符**边界进行：java.util.jar.Manifest 按行（字符）处理清单，
+// 若按字节切在 3/4 字节 UTF-8 字符中间，续行会以孤立尾字节开头，Java 逐行
+// UTF-8 解码时直接报非法，该条目在 MANIFEST 里就找不到对应 section，v1 校验
+// 失败（API < 24 只认 v1）。
+//
+// 首行上限 72 字节；续行以单个空格开头（占 1 字节），内容上限 71 字节。
+// 绝不切断单个多字节字符。
 func writeManifestAttr(b *bytes.Buffer, key, value string) {
 	line := key + ": " + value
 	const maxLine = 72
-	if len(line) <= maxLine {
-		b.WriteString(line)
-		b.WriteString("\r\n")
-		return
+	w := 0
+	for _, r := range line {
+		n := utf8.RuneLen(r)
+		if w > 0 && w+n > maxLine {
+			b.WriteString("\r\n ")
+			w = 1 // 续行已写入一个前导空格
+		}
+		b.WriteRune(r)
+		w += n
 	}
-	b.WriteString(line[:maxLine])
 	b.WriteString("\r\n")
-	rest := line[maxLine:]
-	for len(rest) > maxLine-1 {
-		b.WriteString(" ")
-		b.WriteString(rest[:maxLine-1])
-		b.WriteString("\r\n")
-		rest = rest[maxLine-1:]
-	}
-	if len(rest) > 0 {
-		b.WriteString(" ")
-		b.WriteString(rest)
-		b.WriteString("\r\n")
-	}
 }
 
 // BuildSF 生成 .SF 文件内容。

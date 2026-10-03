@@ -235,8 +235,21 @@ func Load(path string) (*Artifact, error) {
 }
 
 // Bytes 把条目集合序列化为 ZIP（不做对齐与签名）。
+//
+// 为保持既有调用方（多个 passes 包与测试）的签名兼容，本函数不返回错误：
+// 内部用 WriteChecked，一旦条目数/字段长度触及 ZIP 上限将 panic。调用方的
+// 输入可能触及这些上限时，应改用 BytesChecked 并处理其返回的 error。
 func Bytes(art *Artifact) []byte {
-	return zipx.Write(art.Archive, zipx.AlignOptions{Align: 1, SoAlign: 1})
+	out, err := BytesChecked(art)
+	if err != nil {
+		panic("pipeline.Bytes: " + err.Error())
+	}
+	return out
+}
+
+// BytesChecked 与 Bytes 相同，但把归档写出的错误向上返回。
+func BytesChecked(art *Artifact) ([]byte, error) {
+	return zipx.WriteChecked(art.Archive, zipx.AlignOptions{Align: 1, SoAlign: 1})
 }
 
 // Find 按名字查找条目，未找到返回 nil。

@@ -125,6 +125,16 @@ func (b *builder) remapDebugInfo(off uint32, length int) ([]byte, error) {
 	out := make([]byte, 0, length)
 	var err error
 
+	// emitP1 写入一个已重映射的 uleb128p1 索引；越界即返回错误，不静默清零。
+	emitP1 := func(v uint32, tbl []uint32) error {
+		r, e := b.remapP1(v, tbl)
+		if e != nil {
+			return e
+		}
+		out = PutULEB128(out, r)
+		return nil
+	}
+
 	// line_start
 	var v uint32
 	v, p, err = ULEB128(d, p)
@@ -146,7 +156,9 @@ func (b *builder) remapDebugInfo(off uint32, length int) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = PutULEB128(out, b.remapP1(nameIdx, b.R.String))
+		if err = emitP1(nameIdx, b.R.String); err != nil {
+			return nil, err
+		}
 	}
 
 	// 状态机
@@ -182,8 +194,12 @@ func (b *builder) remapDebugInfo(off uint32, length int) ([]byte, error) {
 				return nil, err
 			}
 			out = PutULEB128(out, reg)
-			out = PutULEB128(out, b.remapP1(nameIdx, b.R.String))
-			out = PutULEB128(out, b.remapP1(typeIdx, b.R.Type))
+			if err = emitP1(nameIdx, b.R.String); err != nil {
+				return nil, err
+			}
+			if err = emitP1(typeIdx, b.R.Type); err != nil {
+				return nil, err
+			}
 		case 0x04: // START_LOCAL_EXTENDED: reg, name, type, sig(string)
 			var reg, nameIdx, typeIdx, sigIdx uint32
 			if reg, p, err = ULEB128(d, p); err != nil {
@@ -199,9 +215,15 @@ func (b *builder) remapDebugInfo(off uint32, length int) ([]byte, error) {
 				return nil, err
 			}
 			out = PutULEB128(out, reg)
-			out = PutULEB128(out, b.remapP1(nameIdx, b.R.String))
-			out = PutULEB128(out, b.remapP1(typeIdx, b.R.Type))
-			out = PutULEB128(out, b.remapP1(sigIdx, b.R.String))
+			if err = emitP1(nameIdx, b.R.String); err != nil {
+				return nil, err
+			}
+			if err = emitP1(typeIdx, b.R.Type); err != nil {
+				return nil, err
+			}
+			if err = emitP1(sigIdx, b.R.String); err != nil {
+				return nil, err
+			}
 		case 0x05, 0x06: // END_LOCAL / RESTART_LOCAL: reg
 			if v, p, err = ULEB128(d, p); err != nil {
 				return nil, err
@@ -211,7 +233,9 @@ func (b *builder) remapDebugInfo(off uint32, length int) ([]byte, error) {
 			if v, p, err = ULEB128(d, p); err != nil {
 				return nil, err
 			}
-			out = PutULEB128(out, b.remapP1(v, b.R.String))
+			if err = emitP1(v, b.R.String); err != nil {
+				return nil, err
+			}
 		default:
 			// 无操作数
 		}
@@ -219,15 +243,29 @@ func (b *builder) remapDebugInfo(off uint32, length int) ([]byte, error) {
 }
 
 // remapP1 映射 uleb128p1 形式的索引（0 表示「无」，其余为 idx+1）。
-func (b *builder) remapP1(v uint32, tbl []uint32) uint32 {
+//
+// 越界（畸形输入）返回 error，而不是静默清成 0——后者会让 debug_info 指向
+// 错误的字符串/类型，且完全无声。
+func (b *builder) remapP1(v uint32, tbl []uint32) (uint32, error) {
 	if v == 0 {
-		return 0
+		return 0, nil
 	}
 	old := v - 1
 	if int(old) >= len(tbl) {
-		return 0
+		return 0, fmt.Errorf("dex: debug_info 的 uleb128p1 索引 %d 越界（表长 %d，畸形输入）", old, len(tbl))
 	}
-	return tbl[old] + 1
+	return tbl[old] + 1, nil
+}
+
+// mapRefChecked 把旧索引重映射为新索引，越界时返回错误。
+//
+// 注解树与 encoded_value 里的 type/string/method/field 索引都来自输入文件，
+// 畸形输入可能越界；直接下标会 panic，静默取 0 会把目录/取值指向错误条目。
+func mapRefChecked(tbl []uint32, idx uint32, kind string) (uint32, error) {
+	if int(idx) >= len(tbl) {
+		return 0, fmt.Errorf("dex: %s 索引 %d 越界（表长 %d，畸形输入）", kind, idx, len(tbl))
+	}
+	return tbl[idx], nil
 }
 
 // ---- 注解树 ----
@@ -363,7 +401,12 @@ func (b *builder) emitAnnotations() (aiMap, setMap, rlMap, dirMap map[uint32]uin
 		for k, so := range r.items {
 			v := uint32(0)
 			if so != 0 {
-				v = setMap[so]
+				var ok bool
+				v, ok = setMap[so]
+				if !ok {
+					return nil, nil, nil, nil, fmt.Errorf(
+						"dex: annotation_set_ref_list 引用的偏移 %d 未在注解树中重映射（结构不自洽）", so)
+				}
 			}
 			binary.LittleEndian.PutUint32(blob[4+4*k:], v)
 		}
@@ -373,7 +416,16 @@ func (b *builder) emitAnnotations() (aiMap, setMap, rlMap, dirMap map[uint32]uin
 	for _, do := range sortedKeysU32(dirOffs) {
 		info := dirs[do]
 		blob := make([]byte, 0, 16+8*(len(info.fields)+len(info.methods)+len(info.parameters)))
-		blob = appendU32(blob, setMap[info.classAnno])
+		classSet := uint32(0)
+		if info.classAnno != 0 {
+			var ok bool
+			classSet, ok = setMap[info.classAnno]
+			if !ok {
+				return nil, nil, nil, nil, fmt.Errorf(
+					"dex: annotations_directory 的类注解偏移 %d 未在注解树中重映射（结构不自洽）", info.classAnno)
+			}
+		}
+		blob = appendU32(blob, classSet)
 		blob = appendU32(blob, uint32(len(info.fields)))
 		blob = appendU32(blob, uint32(len(info.methods)))
 		blob = appendU32(blob, uint32(len(info.parameters)))
@@ -383,27 +435,42 @@ func (b *builder) emitAnnotations() (aiMap, setMap, rlMap, dirMap map[uint32]uin
 			idx uint32
 			off uint32
 		}
-		emitPairs := func(items [][2]uint32, kind refKind, m map[uint32]uint32) {
+		emitPairs := func(items [][2]uint32, kind refKind, m map[uint32]uint32) error {
 			pairs := make([]pair, 0, len(items))
 			for _, it := range items {
 				var newIdx uint32
+				var err error
 				switch kind {
 				case refField:
-					newIdx = b.R.Field[it[0]]
+					newIdx, err = mapRefChecked(b.R.Field, it[0], "annotation field")
 				case refMethod:
-					newIdx = b.R.Method[it[0]]
+					newIdx, err = mapRefChecked(b.R.Method, it[0], "annotation method")
 				}
-				pairs = append(pairs, pair{idx: newIdx, off: m[it[1]]})
+				if err != nil {
+					return err
+				}
+				off, ok := m[it[1]]
+				if !ok {
+					return fmt.Errorf("dex: 注解目录引用的偏移 %d 未在注解树中重映射（结构不自洽）", it[1])
+				}
+				pairs = append(pairs, pair{idx: newIdx, off: off})
 			}
 			sort.Slice(pairs, func(a, c int) bool { return pairs[a].idx < pairs[c].idx })
 			for _, p := range pairs {
 				blob = appendU32(blob, p.idx)
 				blob = appendU32(blob, p.off)
 			}
+			return nil
 		}
-		emitPairs(info.fields, refField, setMap)
-		emitPairs(info.methods, refMethod, setMap)
-		emitPairs(info.parameters, refMethod, rlMap)
+		if err := emitPairs(info.fields, refField, setMap); err != nil {
+			return nil, nil, nil, nil, err
+		}
+		if err := emitPairs(info.methods, refMethod, setMap); err != nil {
+			return nil, nil, nil, nil, err
+		}
+		if err := emitPairs(info.parameters, refMethod, rlMap); err != nil {
+			return nil, nil, nil, nil, err
+		}
 
 		dirMap[do] = b.place(0x2006, blob, 4)
 	}
@@ -434,7 +501,11 @@ func (b *builder) remapEncodedAnnotation(p int, d []byte) ([]byte, int, error) {
 	if err != nil {
 		return nil, np, err
 	}
-	out := PutULEB128(nil, b.R.Type[typeIdx])
+	newType, err := mapRefChecked(b.R.Type, typeIdx, "annotation type")
+	if err != nil {
+		return nil, p, err
+	}
+	out := PutULEB128(nil, newType)
 	out = PutULEB128(out, size)
 	p = np2
 	for i := uint32(0); i < size; i++ {
@@ -443,7 +514,11 @@ func (b *builder) remapEncodedAnnotation(p int, d []byte) ([]byte, int, error) {
 		if err != nil {
 			return nil, p, err
 		}
-		out = PutULEB128(out, b.R.String[nameIdx])
+		newName, err := mapRefChecked(b.R.String, nameIdx, "annotation name")
+		if err != nil {
+			return nil, p, err
+		}
+		out = PutULEB128(out, newName)
 		var ev []byte
 		ev, p, err = b.remapEncodedValue(p, d)
 		if err != nil {
@@ -510,7 +585,10 @@ func (b *builder) remapEncodedValue(p int, d []byte) ([]byte, int, error) {
 		return append([]byte{at}, d[p:p+n]...), p + n, nil
 	}
 	old := readUintLE(d, p, int(va)+1)
-	newVal := tbl[old]
+	newVal, merr := mapRefChecked(tbl, old, "encoded_value")
+	if merr != nil {
+		return nil, p, merr
+	}
 	nb := uint32Bytes(newVal)
 	return append([]byte{(at & 0x1f) | byte((len(nb)-1)<<5)}, nb...), p + int(va) + 1, nil
 }

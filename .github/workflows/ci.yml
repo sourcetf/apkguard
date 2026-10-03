@@ -119,12 +119,21 @@ jobs:
           [ "$n" -eq 46 ] || { echo "::error::功能项数量不是 46（实际 $n）"; exit 1; }
 
           # 未实现的功能项必须是显式错误，而不是静默跳过——
-          # 否则使用者会以为自己拿到了 VMP/控制流混淆等防护，实际完全没有。
-          echo "-- 未实现的功能项应被拒绝"
-          if printf 'x' > /tmp/fake.apk; then :; fi
-          out="$("$BIN" -in /tmp/fake.apk -enable A6 2>&1 || true)"
+          # 否则使用者会以为自己拿到了 VMP/反射化等防护，实际完全没有。
+          #
+          # 断言必须匹配**错误文案**而不是功能项 ID：`-enable A7` 的输出里
+          # 「启用功能项: …A7…」这一行也含 A7，只 grep ID 会把「根本没校验」
+          # 误判成「已报错」（旧版对 A6 就是这么一条空断言，把 A6 换成任意
+          # 已实现项也照样通过）。这里锁定错误正文。
+          echo "-- 未实现的功能项应被拒绝（用确定未实现的 A7）"
+          printf 'x' > /tmp/fake.apk
+          out="$("$BIN" -in /tmp/fake.apk -enable A7 2>&1 || true)"
           echo "$out" | head -3
-          echo "$out" | grep -q "A6" || { echo "::error::启用未实现的 A6 没有报错"; exit 1; }
+          if echo "$out" | grep -qE '尚未实现.*A7'; then
+            echo "   正确报错"
+          else
+            echo "::error::启用未实现的 A7 没有按要求报错"; exit 1
+          fi
 
           echo "-- 缺密钥库时应报错"
           # 这条命令**预期非零退出**；若将来给 run 打开 pipefail，
@@ -175,7 +184,44 @@ jobs:
           done
           java -version 2>&1 | head -1
 
-      # 1~7 步：构建测试 APK、加固 6 组功能集、校验签名与对齐、
+      # derive_test.go 的对拍需要宿主编译器（优先 tcc，其次 cc/gcc/clang）。
+      # ubuntu runner 自带 gcc，但仍显式确认；都没有时装 TinyCC。
+      - name: 准备 C 编译器（C/Go 派生对拍需要）
+        run: |
+          if command -v cc >/dev/null || command -v gcc >/dev/null \
+             || command -v clang >/dev/null || command -v tcc >/dev/null; then
+            echo "C 编译器就绪：$(command -v cc || command -v gcc || command -v clang || command -v tcc)"
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq tcc
+          fi
+
+      # 这两条测试在缺 C 编译器 / aapt2 时会 Skip，从而在 CI 上**静默失效**：
+      #   - internal/native/derive_test.go  ：C 与 Go 的密钥派生逐字节对拍
+      #     （差 1 bit 就让所有产物在真机上解不开载荷，是本包最重要的测试）；
+      #   - internal/passes/resources_test.go：用官方 aapt2 复核资源 ID
+      #     （A5/A11 是否破坏资源表的决定性判据）。
+      # 这里显式断言它们必须**执行并通过**（输出中不得出现 --- SKIP）。
+      - name: 强制环境依赖测试不得跳过
+        working-directory: apkguard
+        run: |
+          set -e
+          run_required() {
+            name="$1"; pkg="$2"; testname="$3"
+            out="$(go test "$pkg" -run "$testname" -v -count=1 2>&1)" || {
+              echo "$out"; echo "::error::$testname 执行失败"; return 1; }
+            echo "$out"
+            if echo "$out" | grep -q -- '--- SKIP'; then
+              echo "::error::$testname 在 CI 上被跳过（缺依赖：C 编译器 / aapt2）"; return 1
+            fi
+            if ! echo "$out" | grep -q -- '--- PASS'; then
+              echo "::error::$testname 未执行（可能因样本缺失被跳过）"; return 1
+            fi
+            echo "$name 已真实执行并通过"
+          }
+          run_required "C/Go 派生对拍" ./internal/native/ TestDeriveMatchesNativeC
+          run_required "aapt2 资源 ID 复核" ./internal/passes/ TestResourceRewritePreservesResourceIDs
+
+      # 1~7 步：构建测试 APK、加固多组功能集、校验签名与对齐、
       # 生成签名摘要、跑产物级守卫、跑全量测试。
       - name: 运行端到端验证
         run: bash scripts/e2e.sh

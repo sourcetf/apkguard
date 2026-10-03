@@ -15,19 +15,22 @@ import (
 
 // ---- B8 载荷容器化 + 诱饵配置 ----
 //
-// 手法来自参考样本（`sample.apk`）：它的真实载荷藏在
-// `assets/<随机名>.zip` 里，zip 内是 `*.dat`（14.4 MB 密文）与 `*.json`，
-// 而 json 里写的包名是 `dummy.installed.check`——与真实包名无关。
-// 效果是：按 assets 顶层逐个解密的分析脚本会先撞上容器与假包名。
+// 手法来自参考样本（`sample.apk`）：真实载荷藏在容器里，容器内是密文与一份
+// 写着假包名的配置 JSON。效果是：按 assets 顶层逐个解密的分析脚本会先撞上
+// 假线索。
 //
 // 我们的实现分两件事，都不需要改加载器：
 //
-//  1. **载荷重定位**：把真实载荷从 `assets/<word>_<hex>.<ext>` 移到
-//     `assets/<容器路径>/...` 的目录树里。B3 生成 Loader 时读的是载荷清单里的
-//     Asset 字段，路径本就参数化，因此壳侧零改动。
-//  2. **诱饵容器**：另植入一个 `assets/<名字>.zip`，内含高熵的 `.dat`
-//     （随机字节，看起来就是加密载荷）与一份配置 JSON（假包名 + 假文件名），
-//     与样本的容器同构。分析者会优先怀疑它。
+//  1. **载荷重定位**：把真实载荷移进 `assets/<词>/<hex8>/<hex12>.<ext>` 的
+//     目录树里。B3 生成 Loader 时读的是载荷清单里的 Asset 字段，路径本就参数化，
+//     因此壳侧零改动。
+//  2. **诱饵容器**：在**同一个目录树**里另植入诱饵文件，内容是高熵随机字节，
+//     外加一份写着假包名的配置 JSON。关键要求是**与真实载荷同构**——同样的
+//     路径形态、同样的扩展名集合、同样的字节观感。
+//
+// 为什么必须同构：早期实现把诱饵放成顶层 `assets/<词>_<hex>.zip`（带 PK 头），
+// 脱壳脚本只要「找 PK 头」就能直接锁定诱饵、跳过真载荷，等于用排除法替攻击者
+// 定位了真目标。现在从路径到字节都无法区分，排除法失效。
 type payloadContainer struct{}
 
 func (payloadContainer) ID() config.FeatureID { return "B8" }
@@ -60,17 +63,46 @@ func (c *payloadContainer) Run(_ context.Context, art *pipeline.Artifact, opts *
 		}
 		d := sha256.Sum256([]byte("apkguard/container/item/" + opts.Seed + "/" + sp.Items[i].Name))
 		name := fmt.Sprintf("%s/%s.%s", tree, hex.EncodeToString(d[:6]), containerExts[int(d[6])%len(containerExts)])
+		// 与诱饵同名时错开，避免重名条目（apksigner 会以 Duplicate entry 拒绝整个归档）。
+		for pipeline.Find(art, name) != nil {
+			d = sha256.Sum256(d[:])
+			name = fmt.Sprintf("%s/%s.%s", tree, hex.EncodeToString(d[:6]), containerExts[int(d[6])%len(containerExts)])
+		}
 		e.Name = []byte(name)
 		sp.Items[i].Asset = name
 		renamed++
 	}
 
-	// 诱饵容器：内容与样本同构（一个高熵 .dat + 一份配置 JSON）。
-	decoyPkg := strings.TrimSpace(opts.DecoyPkg)
-	if decoyPkg == "" {
-		decoyPkg = defaultDecoyPkg
+	// C2 的原生库载荷也必须一起搬走。
+	//
+	// 只搬 B1 的 DEX 载荷是不够的：C2 的库载荷当时仍以顶层
+	// `assets/<词>_<hex>.<ext>` 存在，而它往往是**整个 APK 里最大的 assets
+	// 条目**（termux 的 libtermux.so 加密后 28 MB，比任何单个 DEX 载荷都大）。
+	// 「按体积抓最大的 assets 条目」的脱壳脚本一抓就中，B8 想要的「顶层不再
+	// 直接暴露载荷」直接落空——留着一份真载荷在顶层，等于给攻击者排除了大量
+	// 噪声。B3 在本 Pass 之后才生成壳，读的是 soItem.Asset，所以这里改路径
+	// 不需要动壳。
+	if sl := soLibsOf(art); sl != nil {
+		for i := range sl.Items {
+			e := pipeline.Find(art, sl.Items[i].Asset)
+			if e == nil {
+				continue
+			}
+			d := sha256.Sum256([]byte("apkguard/container/lib/" + opts.Seed + "/" + sl.Items[i].Abi + "/" + sl.Items[i].Name))
+			name := fmt.Sprintf("%s/%s.%s", tree, hex.EncodeToString(d[:6]), containerExts[int(d[6])%len(containerExts)])
+			for pipeline.Find(art, name) != nil {
+				d = sha256.Sum256(d[:])
+				name = fmt.Sprintf("%s/%s.%s", tree, hex.EncodeToString(d[:6]), containerExts[int(d[6])%len(containerExts)])
+			}
+			e.Name = []byte(name)
+			sl.Items[i].Asset = name
+			renamed++
+		}
+		art.Put(sharedKeySOLibs, sl)
 	}
-	decoyName := "assets/" + seg1 + "_" + seg2 + ".zip"
+
+	// 诱饵：与真实载荷同构地落进同一个目录树。
+	//
 	// 体积取真实载荷总量的 2%（至少 256 KB）：太小会被一眼看作占位文件。
 	decoySize := packTotal(sp) / 50
 	if decoySize < 256<<10 {
@@ -79,20 +111,36 @@ func (c *payloadContainer) Run(_ context.Context, art *pipeline.Artifact, opts *
 	if decoySize > 4<<20 {
 		decoySize = 4 << 20
 	}
-	blob, err := decoyContainer(opts.Seed, decoyName, decoyPkg, decoySize)
-	if err != nil {
-		return err
+	decoyPkg := strings.TrimSpace(opts.DecoyPkg)
+	if decoyPkg == "" {
+		decoyPkg = defaultDecoyPkg
 	}
+	decoyName := decoyFileName(art, tree, "apkguard/container/decoy/"+opts.Seed)
+	blob := decoyBytes(opts.Seed, decoySize)
 	pipeline.Add(art, zipx.NewStored(decoyName, blob))
+
+	// 配置 JSON 与样本容器内的 json 同构（假包名），同样落进该目录树。
+	// 它是给分析者的假线索，不参与任何加载路径。
+	cfgName := decoyJSONName(art, tree, "apkguard/container/decoycfg/"+opts.Seed)
+	cfg, err := json.MarshalIndent(decoyConfig{
+		PackageName: decoyPkg,
+		AppName:     seg1,
+		APKFileName: pathBaseName(decoyName),
+	}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("B8：生成诱饵配置失败: %w", err)
+	}
+	pipeline.Add(art, zipx.NewStored(cfgName, cfg))
 
 	art.Put(sharedKeyPayloads, sp)
 
-	art.Note("B8 载荷容器化：%d 份载荷移入 %s/（顶层 assets 不再直接暴露载荷）；"+
-		"另植入诱饵容器 %s（内含高熵 .dat 与假包名 %q 的配置）",
+	art.Note("B8 载荷容器化：%d 份载荷（含 C2 的原生库载荷）移入 %s/（顶层 assets 不再直接暴露载荷）；"+
+		"另在同目录树植入同构诱饵 %s（高熵随机字节，无 PK 头）与假包名 %q 的配置，排除法无法区分真假",
 		renamed, tree, decoyName, decoyPkg)
 	art.Stat("B8.moved", fmt.Sprint(renamed))
 	art.Stat("B8.tree", tree)
 	art.Stat("B8.decoy", decoyName)
+	art.Stat("B8.decoy_cfg", cfgName)
 	art.Stat("B8.decoy_pkg", decoyPkg)
 	art.Stat("B8.decoy_bytes", fmt.Sprint(len(blob)))
 	return nil
@@ -120,36 +168,50 @@ type decoyConfig struct {
 	APKFileName string `json:"apkFileName"`
 }
 
-// decoyContainer 生成一个内含「高熵 .dat + 配置 JSON」的 zip。
+// decoyFileName 生成与真实载荷同构的诱饵条目名：同目录、同 <hex12>.<ext> 形态。
 //
-// 用 zipx 自己的写入器构造：产物与真实 APK 的打包路径一致，
-// 不会因为用了不同的压缩实现而露出「这个 zip 不是同一个工具产的」这一类痕迹。
-func decoyContainer(seed, containerName, decoyPkg string, size int) ([]byte, error) {
-	base := strings.TrimSuffix(pathBase(containerName), ".zip")
-	rnd := newRand(seed + "/decoy")
-	dat := make([]byte, size)
-	for i := range dat {
-		dat[i] = byte(rnd.Intn(256))
+// deriveKey 种子不同即名字不同；与既有条目（真载荷、配置）冲突时重哈希避让。
+func decoyFileName(art *pipeline.Artifact, tree, seed string) string {
+	d := sha256.Sum256([]byte(seed))
+	for {
+		name := fmt.Sprintf("%s/%s.%s", tree, hex.EncodeToString(d[:6]),
+			containerExts[int(d[6])%len(containerExts)])
+		if pipeline.Find(art, name) == nil {
+			return name
+		}
+		d = sha256.Sum256(d[:])
 	}
-	// 让 .dat 开头也像加密载荷（前置 16 字节 IV 的可辨识特征不存在，
-	// 因此纯随机即可；这里刻意不要放任何 magic）。
-	cfg, err := json.MarshalIndent(decoyConfig{
-		PackageName: decoyPkg,
-		AppName:     base,
-		APKFileName: base + ".dat",
-	}, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("B8：生成诱饵配置失败: %w", err)
-	}
-
-	archive := &zipx.Archive{}
-	archive.Entries = append(archive.Entries, zipx.NewStored(base+".dat", dat))
-	archive.Entries = append(archive.Entries, zipx.NewStored(base+".json", cfg))
-	return zipx.Write(archive, zipx.AlignOptions{Align: 1, SoAlign: 1}), nil
 }
 
-// pathBase 返回路径的最后一段。
-func pathBase(p string) string {
+// decoyJSONName 生成诱饵配置 JSON 的同构条目名（同目录树下的 <hex12>.json）。
+func decoyJSONName(art *pipeline.Artifact, tree, seed string) string {
+	d := sha256.Sum256([]byte(seed))
+	for {
+		name := fmt.Sprintf("%s/%s.json", tree, hex.EncodeToString(d[:6]))
+		if pipeline.Find(art, name) == nil {
+			return name
+		}
+		d = sha256.Sum256(d[:])
+	}
+}
+
+// decoyBytes 生成高熵随机字节，且刻意不含 PK 头。
+//
+// 与真实载荷一样是纯随机（前置 16 字节 IV 没有可辨识 magic），
+// 因此「找 PK 头 / 找 zip」这类启发式无法把诱饵与真载荷区分开。
+// 随机首字节恰好凑成 "PK" 的概率极低，但仍然显式排掉，杜绝偶发魔数。
+func decoyBytes(seed string, size int) []byte {
+	rnd := newRand(seed + "/decoydata")
+	b := make([]byte, size)
+	rnd.Read(b)
+	if len(b) >= 2 && b[0] == 'P' && b[1] == 'K' {
+		b[0] ^= 0xff
+	}
+	return b
+}
+
+// pathBaseName 返回路径的最后一段。
+func pathBaseName(p string) string {
 	if i := strings.LastIndex(p, "/"); i >= 0 {
 		return p[i+1:]
 	}

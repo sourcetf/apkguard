@@ -39,6 +39,19 @@
 #define AG_LOG(fmt, ...) ((void)0)
 #endif
 
+/*
+ * ag_log_once 只打印一次。
+ *
+ * 给「能力降级」这类日志用：D4 的看门狗每 3 秒调一次 ag_intact()，若每次都打
+ * 同一行日志，logcat 会被刷屏（实测每个进程每 3 秒一行），既淹没有效信息，
+ * 又会让「降级可见」这个设计初衷变成噪音而被无视。降级是设备特性、不会自愈，
+ * 打一次足够。
+ */
+static int ag_once_flag = 0;
+#define AG_LOG_ONCE(fmt, ...) do { \
+	if (!ag_once_flag) { ag_once_flag = 1; AG_LOG(fmt, ##__VA_ARGS__); } \
+} while (0)
+
 /* ------------------------------------------------------------------ */
 /* SHA-256                                                             */
 /* ------------------------------------------------------------------ */
@@ -222,7 +235,30 @@ static int ag_open(const char *path, int flags) { return open(path, flags); }
 static int ag_read(int fd, char *buf, int n) { return (int)read(fd, buf, (unsigned)n); }
 static int ag_read_byte(int fd, uint8_t *buf, int n) { return (int)read(fd, buf, (unsigned)n); }
 static void ag_close(int fd) { close(fd); }
-static long ag_seek(int fd, int64_t off) { return (long)lseek(fd, (off_t)off, SEEK_SET); }
+/*
+ * ag_seek 返回 0 表示成功、-1 表示失败。
+ *
+ * 注意**不能**直接 `return lseek(...)`：lseek 成功时返回的是**新的文件偏移**，
+ * 只有 seek 0 才恰好返回 0。曾因此留下一个极隐蔽的缺陷——所有
+ * `if (ag_seek(fd, off) != 0) return 0;` 的写法，只要 off 非 0 就被判成失败，
+ * 于是 ELF 节表定位在第一次非零 seek 处即告失败，C6/D4 在**所有设备上**
+ * 静默降级，表现为「自身文件缺少 .text/.rodata 节名」。
+ */
+static int ag_seek(int fd, int64_t off) {
+	return lseek(fd, (off_t)off, SEEK_SET) < 0 ? -1 : 0;
+}
+/* 取文件大小；失败返回负值。SEEK_END 在没有 <stdio.h> 的环境里不一定可见，
+ * 这里按 ABI 语义写死（bionic 与 glibc 都是 2）。 */
+static long ag_size(int fd) {
+	long cur = lseek(fd, 0, SEEK_CUR);
+	long end;
+	if (cur < 0) {
+		return -1;
+	}
+	end = lseek(fd, 0, 2 /* SEEK_END */);
+	(void)lseek(fd, cur, SEEK_SET);
+	return end;
+}
 static int ag_socket(int d, int t, int p) { return socket(d, t, p); }
 static int ag_setsockopt(int fd, int lv, int opt, const void *v, unsigned len) {
 	return setsockopt(fd, lv, opt, v, len);
@@ -380,6 +416,10 @@ static uint64_t ag_rd64(const uint8_t *p) {
 	return (uint64_t)ag_rd32(p) | ((uint64_t)ag_rd32(p + 4) << 32);
 }
 
+/* g_sec_err 记录 ag_find_section 最近一次失败的原因，供降级日志显示。
+ * 只用于诊断，不参与判定。 */
+static const char *g_sec_err = "?";
+
 /*
  * ag_find_section 在已打开的 ELF 文件中查找指定名字的节。
  *
@@ -389,24 +429,44 @@ static uint64_t ag_rd64(const uint8_t *p) {
  * 只认 64 位的话，32 位产物上的完整性校峰会静默失效——那是最糟的失败
  * 模式（看起来有防护，实际没有）。
  */
-static int ag_find_section(int fd, const char *want, uint64_t *off, uint64_t *size) {
+static int ag_find_section(int fd, uint64_t base, const char *want, uint64_t *off, uint64_t *size) {
 	uint8_t hdr[64];
-	int n = ag_read_byte(fd, hdr, 64);
+	int n;
 	int is64;
 	uint64_t shoff = 0, stroff = 0, strsize = 0;
 	uint16_t shentsize, shnum, shstrndx;
 	uint16_t i;
+	/*
+	 * 必须先把文件偏移复位到 base：本函数会被连续调用两次（先 .text 再 .rodata），
+	 * 上一次调用结束时 fd 停在某个节名/节头的位置。若不复位，第二次读到的就
+	 * 不是 ELF 头，magic 检查失败 → 返回 0 → 调用方判定「缺少节名」并跳过
+	 * 自校验。后果是 C6/D4 **完全失效**，而 logcat 里只有一行容易被忽略的日志
+	 * ——正是本项目最忌讳的「看起来有防护，实际没有」。
+	 *
+	 * base 非 0 的情形：库被直接打包在 APK 内（extractNativeLibs=false），
+	 * dladdr 给出的是 "…/base.apk!/lib/<abi>/libxxx.so"。此时 fd 指向 APK，
+	 * ELF 从条目数据处开始，base 就是该条目的数据偏移（见 ag_zip_data_offset）。
+	 */
+	if (ag_seek(fd, (int64_t)base) != 0) {
+		g_sec_err = "seek";
+		return 0;
+	}
+	n = ag_read_byte(fd, hdr, 64);
 	if (n < 64) {
+		g_sec_err = "short-header";
 		return 0;
 	}
 	if (!(hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F')) {
+		g_sec_err = "bad-magic";
 		return 0;
 	}
 	if (hdr[5] != 1) {
+		g_sec_err = "big-endian";
 		return 0; /* 大端：Android 上不存在 */
 	}
 	is64 = (hdr[4] == 2) ? 1 : (hdr[4] == 1 ? 0 : -1);
 	if (is64 < 0) {
+		g_sec_err = "bad-class";
 		return 0;
 	}
 	if (is64) {
@@ -421,23 +481,28 @@ static int ag_find_section(int fd, const char *want, uint64_t *off, uint64_t *si
 		shstrndx = ag_rd16(hdr + 0x32);
 	}
 	if (shoff == 0 || shnum == 0 || shstrndx >= shnum) {
+		g_sec_err = "no-section-table";
 		return 0;
 	}
 	if (shentsize < (is64 ? 64 : 40)) {
+		g_sec_err = "bad-shentsize";
 		return 0;
 	}
 	{
 		uint8_t sh[64];
 		/* 先读节名字表所在节，取得字符串表的位置。 */
-		if (ag_seek(fd, (int64_t)(shoff + (uint64_t)shstrndx * shentsize)) != 0) {
+		if (ag_seek(fd, (int64_t)(base + shoff + (uint64_t)shstrndx * shentsize)) != 0) {
+			g_sec_err = "section-name-table-seek";
 			return 0;
 		}
 		if (ag_read_byte(fd, sh, (int)shentsize) < (int)shentsize) {
+			g_sec_err = "section-name-table-read";
 			return 0;
 		}
 		stroff = is64 ? ag_rd64(sh + 0x18) : ag_rd32(sh + 0x10);
 		strsize = is64 ? ag_rd64(sh + 0x20) : ag_rd32(sh + 0x14);
 		if (stroff == 0 || strsize == 0) {
+			g_sec_err = "section-name-table-empty";
 			return 0;
 		}
 	}
@@ -446,17 +511,20 @@ static int ag_find_section(int fd, const char *want, uint64_t *off, uint64_t *si
 		uint8_t name[64];
 		uint32_t name_off;
 		int k = 0;
-		if (ag_seek(fd, (int64_t)(shoff + (uint64_t)i * shentsize)) != 0) {
+		if (ag_seek(fd, (int64_t)(base + shoff + (uint64_t)i * shentsize)) != 0) {
+			g_sec_err = "section-header-seek";
 			return 0;
 		}
 		if (ag_read_byte(fd, sh, (int)shentsize) < (int)shentsize) {
+			g_sec_err = "section-header-read";
 			return 0;
 		}
 		name_off = ag_rd32(sh);
 		if (name_off >= strsize) {
 			continue;
 		}
-		if (ag_seek(fd, (int64_t)(stroff + name_off)) != 0) {
+		if (ag_seek(fd, (int64_t)(base + stroff + name_off)) != 0) {
+			g_sec_err = "section-name-seek";
 			return 0;
 		}
 		if (ag_read_byte(fd, name, 63) <= 0) {
@@ -467,16 +535,196 @@ static int ag_find_section(int fd, const char *want, uint64_t *off, uint64_t *si
 			k++;
 		}
 		if (want[k] == 0 && name[k] == 0) {
-			*off = is64 ? ag_rd64(sh + 0x18) : ag_rd32(sh + 0x10);
+			/* 返回**文件绝对偏移**：base 是库在 fd 里的起点（APK 情形下为条目数据偏移）。 */
+			*off = base + (is64 ? ag_rd64(sh + 0x18) : ag_rd32(sh + 0x10));
 			*size = is64 ? ag_rd64(sh + 0x20) : ag_rd32(sh + 0x14);
 			return 1;
 		}
 	}
+	g_sec_err = "section-not-found";
+	return 0;
+}
+
+/* ---- 直接打包在 APK 内的自身文件（extractNativeLibs=false） ---- */
+
+/*
+ * 现代 Android（targetSdk>=30）默认 extractNativeLibs=false：native 库不落盘，
+ * 由链接器直接从 base.apk 里 mmap。此时 dladdr 给出的是
+ *
+ *     /data/app/…/base.apk!/lib/x86_64/libguardx.so
+ *
+ * 这种「APK 路径 + ! + 条目名」的形式（见 Android 链接器 soinfo::set_dt_flags /
+ * dli_fname 的构造）。旧实现直接把它当普通路径 open()，必然失败，于是 C6/D4
+ * 在**这类设备上（即绝大多数新设备）完全失效**。
+ *
+ * 这里自己解析 ZIP 把条目数据偏移找出来：因子表只处理 Stored（未压缩）条目——
+ * extractNativeLibs=false 要求 native 库不压缩并按页对齐，这是唯一可能出现
+ * 的形态；遇到压缩条目（或 ZIP64）返回 0，由调用方走「降级 + 打一次日志」。
+ *
+ * 为什么不用 zlib/inflate：APK 里这类库一定是 Stored，引入 inflate 只为
+ * 一个不可能出现的分支而增加体积与攻击面，不划算。
+ */
+static const uint8_t AG_PK_EOCD[4] = { 0x50, 0x4b, 0x05, 0x06 };
+static const uint8_t AG_PK_CD[4]   = { 0x50, 0x4b, 0x01, 0x02 };
+static const uint8_t AG_PK_LFH[4]  = { 0x50, 0x4b, 0x03, 0x04 };
+
+static int ag_same4(const uint8_t *a, const uint8_t *b) {
+	return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static int ag_zip_data_offset(int fd, const char *want, uint64_t *out) {
+	static uint8_t buf[66000];
+	uint64_t fsz, tail, start, cd_off, cd_size, pos, end;
+	uint8_t *p = 0;
+	int n, i, want_len = 0;
+	/* dladdr 给的条目名带前导 '/'，ZIP 里不带。 */
+	while (want[0] == '/') {
+		want++;
+	}
+	while (want[want_len] != 0) {
+		want_len++;
+	}
+	if (want_len == 0 || want_len > 255) {
+		return 0;
+	}
+	fsz = (uint64_t)ag_size(fd);
+	if (fsz < 22 || fsz > 0x7fffffffULL) {
+		g_sec_err = "zip-size";
+		return 0; /* 不支持 zip64 的巨型归档 */
+	}
+	/* EOCD 只可能出现在文件末尾 64KB 内（注释长度上限 65535）。 */
+	tail = fsz < sizeof(buf) ? fsz : sizeof(buf);
+	start = fsz - tail;
+	if (ag_seek(fd, (int64_t)start) != 0) {
+		return 0;
+	}
+	n = ag_read_byte(fd, buf, (int)tail);
+	if (n < 22) {
+		g_sec_err = "zip-short";
+		return 0;
+	}
+	for (i = n - 22; i >= 0; i--) {
+		if (ag_same4(buf + i, AG_PK_EOCD)) {
+			p = buf + i;
+			break;
+		}
+	}
+	if (p == 0) {
+		g_sec_err = "zip-no-eocd";
+		return 0;
+	}
+	cd_size = ag_rd32(p + 12);
+	cd_off = ag_rd32(p + 16);
+	if (cd_off == 0xffffffffUL || cd_size == 0xffffffffUL) {
+		g_sec_err = "zip64";
+		return 0; /* ZIP64：本工具不产出，遇到即降级 */
+	}
+	if (cd_off > fsz || cd_size > fsz - cd_off) {
+		g_sec_err = "zip-cd-range";
+		return 0;
+	}
+	pos = cd_off;
+	end = cd_off + cd_size;
+	while (pos + 46 <= end) {
+		uint8_t h[46];
+		uint16_t nlen, elen, clen, method;
+		uint32_t lho;
+		if (ag_seek(fd, (int64_t)pos) != 0) {
+			return 0;
+		}
+		if (ag_read_byte(fd, h, 46) < 46) {
+			return 0;
+		}
+		if (!ag_same4(h, AG_PK_CD)) {
+			return 0;
+		}
+		method = ag_rd16(h + 10);
+		nlen = ag_rd16(h + 28);
+		elen = ag_rd16(h + 30);
+		clen = ag_rd16(h + 32);
+		lho = ag_rd32(h + 42);
+		if ((int)nlen == want_len) {
+			uint8_t nm[256];
+			if (ag_seek(fd, (int64_t)(pos + 46)) == 0 &&
+			    ag_read_byte(fd, nm, want_len) == want_len &&
+			    memcmp(nm, want, (size_t)want_len) == 0) {
+				uint8_t lh[30];
+				uint16_t lnlen, lelen;
+				if (method != 0) {
+					g_sec_err = "zip-deflated";
+					return 0; /* 压缩条目：无法在不解压的前提下摘要 */
+				}
+				if (ag_seek(fd, (int64_t)lho) != 0) {
+					return 0;
+				}
+				if (ag_read_byte(fd, lh, 30) < 30) {
+					return 0;
+				}
+				if (!ag_same4(lh, AG_PK_LFH)) {
+					return 0;
+				}
+				lnlen = ag_rd16(lh + 26);
+				lelen = ag_rd16(lh + 28);
+				*out = (uint64_t)lho + 30 + lnlen + lelen;
+				return 1;
+			}
+		}
+		pos += 46 + nlen + elen + clen;
+	}
+	g_sec_err = "zip-entry-not-found";
 	return 0;
 }
 
 /*
- * ag_self_path 从 /proc/self/maps 中取出本库自己的绝对路径。
+ * ag_self_open 打开「自身文件」，并把 ELF 起点偏移写回 base。
+ *
+ * 两种情形：
+ *   1) dladdr 给出真实文件路径（库已落盘）→ 直接 open，base = 0；
+ *   2) 路径含 '!'（库在 APK 内）→ 打开 APK，定位条目，base = 条目数据偏移。
+ *
+ * 成功返回 fd（>=0），失败返回负值。
+ */
+static int ag_self_open(const char *path, uint64_t *base) {
+	int i, bang = -1;
+	char zip[512];
+	*base = 0;
+	for (i = 0; path[i] != 0; i++) {
+		if (path[i] == '!') {
+			bang = i;
+			break;
+		}
+	}
+	if (bang < 0) {
+		return ag_open(path, 0);
+	}
+	if (bang <= 0 || bang >= (int)sizeof(zip)) {
+		g_sec_err = "bad-apk-path";
+		return -1;
+	}
+	for (i = 0; i < bang; i++) {
+		zip[i] = path[i];
+	}
+	zip[bang] = 0;
+	{
+		int fd = ag_open(zip, 0);
+		uint64_t off = 0;
+		if (fd < 0) {
+			return -1;
+		}
+		if (!ag_zip_data_offset(fd, path + bang + 1, &off)) {
+			if (g_sec_err[0] == '?') {
+				g_sec_err = "zip-entry";
+			}
+			ag_close(fd);
+			return -1;
+		}
+		*base = off;
+		return fd;
+	}
+}
+
+/*
+ * ag_self_path 从 dladdr 取回本库自己的路径。
  *
  * maps 的每一行形如：
  *   7f8e4c0000-7f8e4c1000 r-xp ... /data/app/.../lib/arm64/libapkguard.so
@@ -539,32 +787,32 @@ static int ag_intact(void) {
 	ag_sha256 sh;
 	uint8_t got[32];
 	uint64_t toff = 0, tsize = 0, roff = 0, rsize = 0;
+	uint64_t base = 0;
 	int i;
 	/*
-	 * 以下三处是**已知的能力边界**，不是应该静默掉的分支：
+	 * 以下分支是**已知的能力边界**，不是应该静默掉的分支：
 	 *
-	 * 「定位不到自身文件」在现代 Android 上是常态——native 库默认**从 APK 内部
-	 * 直接加载**（extractNativeLibs=false），此时 /proc/self/maps 里对应的是
-	 * base.apk 而不是 .so 自己的路径，本函数拿不到可打开的文件路径。
-	 * 旧实现直接 return 1（当作完整），于是 C6/D4 在整类设备上**静默失效**。
+	 * 库直接打包在 APK 内（extractNativeLibs=false）时，dladdr 给出的是
+	 * "…/base.apk!/lib/<abi>/libxxx.so"——本函数自己解析 ZIP 把条目数据找出来
+	 * （见 ag_self_open）。只有「压缩条目 / ZIP64 / 定位失败」等少数情形才会
+	 * 走到降级分支：那时返回完整 + 打一次日志，不误杀应用（把它判成篡改会让
+	 * 应用直接起不来，而这是设备特性不是攻击），但让缺口在 logcat 里可见。
 	 *
-	 * 现在改为「返回完整 + 打一行日志」：不误杀应用（把它判成篡改会让应用
-	 * 直接起不来，而这是设备特性不是攻击），但让降级在 logcat 里可见。
-	 * 真正的修法是「基于内存镜像（PT_LOAD）而不是磁盘文件做摘要」——那需要在
-	 * 运行时读已映射的段，属后续工作；在那之前必须让用户看得见这个缺口。
+	 * 日志用 ONCE 变体：D4 的看门狗每 3 秒调一次本函数，逐次打印会把 logcat
+	 * 刷屏（实测每进程每 3 秒一行），反而让这个提示被无视。
 	 */
 	if (!ag_self_path(path, (int)sizeof(path))) {
-		AG_LOG("C6: 无法定位自身文件（native 库可能直接从 APK 加载），自校验跳过");
+		AG_LOG_ONCE("C6: 无法定位自身文件，自校验跳过");
 		return 1;
 	}
-	fd = ag_open(path, 0);
+	fd = ag_self_open(path, &base);
 	if (fd < 0) {
-		AG_LOG("C6: 打开自身文件失败（%s），自校验跳过", path);
+		AG_LOG_ONCE("C6: 打开自身文件失败（%s，原因 %s），自校验跳过", path, g_sec_err);
 		return 1;
 	}
-	if (!ag_find_section(fd, ".text", &toff, &tsize) ||
-	    !ag_find_section(fd, ".rodata", &roff, &rsize)) {
-		AG_LOG("C6: 自身文件缺少 .text/.rodata 节名，自校验跳过");
+	if (!ag_find_section(fd, base, ".text", &toff, &tsize) ||
+	    !ag_find_section(fd, base, ".rodata", &roff, &rsize)) {
+		AG_LOG_ONCE("C6: 自身文件缺少 .text/.rodata 节名（原因 %s），自校验跳过", g_sec_err);
 		ag_close(fd);
 		return 1;
 	}
