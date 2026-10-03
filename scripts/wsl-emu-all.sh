@@ -26,6 +26,9 @@ EXTRA="-channels emu -package-shrink -manifest-pad-mb 8 -so-encrypt -lib-name li
 # 全部 41 个已实现项（A7/B5/B6/B7/C3 未实现，启用会被拒绝）。
 ALL="A1,A2,A3,A4,A5,A6,A8,A9,A10,A11,A12,A13,A14,A15,A16,A17,A18,A19,A20,B1,B2,B3,B4,B8,C1,C2,C4,C5,C6,C7,D1,D2,D3,D4,D5,E1,E2,E3,E4,E5,E6"
 NODETECT="A1,A2,A3,A4,A5,A6,A8,A9,A10,A11,A12,A13,A14,A15,A16,A17,A18,A19,A20,B1,B2,B3,B4,B8,C1,C2,C4,C5,C6,C7,D1,D4,D5,E1,E2,E3,E4,E5,E6"
+# PORTABLE：去掉 D2/D3（检测到 Root/模拟器即终止）与 D5（绑定到采样的那台设备）。
+# 这两个变体在**别的设备上会被自己拦住**，所以对外分发要用这一份。
+PORTABLE="A1,A2,A3,A4,A5,A6,A8,A9,A10,A11,A12,A13,A14,A15,A16,A17,A18,A19,A20,B1,B2,B3,B4,B8,C1,C2,C4,C5,C6,C7,D1,D4,E1,E2,E3,E4,E5,E6"
 
 # D5 的绑定值：由采集版在目标设备上自报（Android 8+ 的 ANDROID_ID 按签名作用域化，
 # adb 取不到应用内看到的值）。三个应用用同一张测试证书签名，故共用同一个值。
@@ -45,13 +48,21 @@ build() {  # $1=app $2=标签 $3=功能项
         -enable "$feats" $EXTRA -bind-device "$BIND" -seed "$app" \
         >"$OUT/$app-$tag.log" 2>&1
   local rc=$?
-  echo "  rc=$rc  -> $app-$tag-emu.apk"
+  if [ "${PORTABLE_TAG:-}" = "1" ] && [ "$tag" = "PORTABLE" ]; then
+    # E4 会追加渠道后缀；PORTABLE 想留一个不带后缀的干净名字，移动一下。
+    [ -f "$OUT/$app-$tag-emu.apk" ] && mv "$OUT/$app-$tag-emu.apk" "$OUT/$app-$tag.apk"
+    echo "  rc=$rc  -> $app-$tag.apk"
+  else
+    echo "  rc=$rc  -> $app-$tag-emu.apk"
+  fi
   [ $rc -ne 0 ] && tail -6 "$OUT/$app-$tag.log"
 }
 
 for app in dhizuku termux rustdesk; do
   build "$app" ALL "$ALL"
   build "$app" NODETECT "$NODETECT"
+  # PORTABLE 不要 -emu 后缀：文件名里的 emu 表示「D5 按模拟器采样绑定」，它没有绑定。
+  PORTABLE_TAG=1 build "$app" PORTABLE "$PORTABLE"
 done
 
 echo
