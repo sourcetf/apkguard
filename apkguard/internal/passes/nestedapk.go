@@ -87,9 +87,18 @@ func (n *nestedDecoyAPK) Run(_ context.Context, art *pipeline.Artifact, opts *co
 
 	pipeline.Add(art, zipx.NewStored(name, blob))
 
-	art.Note("A17 嵌套 APK 诱饵：在 %s 植入一个结构完整的假 APK（%d 条目、%d 字节、包名 %q，含合法 Manifest/arsc/classes*.dex）；"+
-		"它与真载荷同一目录树、命名同构，按「assets 最大条目」或「PK 形态」抓载荷的自动化脱壳脚本会先拿到它，解包后得到一个看起来完全正常的假应用",
-		name, entries, len(blob), pkg)
+	// 诱饵的目录树与 B8 用同一个种子推导，因此**只有同时启用 B8** 时，
+	// 它才真的和真载荷待在同一个目录树里；B8 关闭时那棵树里没有真载荷，
+	// 「同构诱饵」的迷惑效果不成立。如实分开描述，避免报告夸大能力。
+	if opts.IsEnabled("B8") {
+		art.Note("A17 嵌套 APK 诱饵：在 %s 植入一个结构完整的假 APK（%d 条目、%d 字节、包名 %q，含合法 Manifest/arsc/classes*.dex）；"+
+			"它与真载荷同一目录树、命名同构，按「assets 最大条目」或「PK 形态」抓载荷的自动化脱壳脚本会先拿到它，解包后得到一个看起来完全正常的假应用",
+			name, entries, len(blob), pkg)
+	} else {
+		art.Note("A17 嵌套 APK 诱饵：在 %s 植入一个结构完整的假 APK（%d 条目、%d 字节、包名 %q，含合法 Manifest/arsc/classes*.dex）；"+
+			"**本次未启用 B8，该目录树里没有真载荷**——诱饵本身仍能被脱壳脚本抓到并解出一个假应用，但「与真载荷同构、无法用排除法区分」的效果需要同时启用 B8 才成立",
+			name, entries, len(blob), pkg)
+	}
 	art.Stat("A17.bytes", fmt.Sprint(len(blob)))
 	art.Stat("A17.entries", fmt.Sprint(entries))
 	art.Stat("A17.name", name)
