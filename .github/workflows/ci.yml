@@ -127,18 +127,18 @@ jobs:
           # 未实现的功能项必须是显式错误，而不是静默跳过——
           # 否则使用者会以为自己拿到了 VMP/反射化等防护，实际完全没有。
           #
-          # 断言必须匹配**错误文案**而不是功能项 ID：`-enable A7` 的输出里
-          # 「启用功能项: …A7…」这一行也含 A7，只 grep ID 会把「根本没校验」
+          # 断言必须匹配**错误文案**而不是功能项 ID：`-enable B6` 的输出里
+          # 「启用功能项: …B6…」这一行也含 B6，只 grep ID 会把「根本没校验」
           # 误判成「已报错」（旧版对 A6 就是这么一条空断言，把 A6 换成任意
           # 已实现项也照样通过）。这里锁定错误正文。
-          echo "-- 未实现的功能项应被拒绝（用确定未实现的 A7）"
+          echo "-- 未实现的功能项应被拒绝（用确定未实现的 B6 = VMP）"
           printf 'x' > /tmp/fake.apk
-          out="$("$BIN" -in /tmp/fake.apk -enable A7 2>&1 || true)"
+          out="$("$BIN" -in /tmp/fake.apk -enable B6 2>&1 || true)"
           echo "$out" | head -3
-          if echo "$out" | grep -qE '尚未实现.*A7'; then
+          if echo "$out" | grep -qE '尚未实现.*B6'; then
             echo "   正确报错"
           else
-            echo "::error::启用未实现的 A7 没有按要求报错"; exit 1
+            echo "::error::启用未实现的 B6 没有按要求报错"; exit 1
           fi
 
           echo "-- 缺密钥库时应报错"
