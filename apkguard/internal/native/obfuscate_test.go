@@ -44,6 +44,10 @@ var expectedPlaintext = map[string]string{
 	"ag_s_log_nopath":   "C6: 无法定位自身文件，自校验跳过",
 	"ag_s_log_openfail": "C6: 打开自身文件失败（%s，原因 %s），自校验跳过",
 	"ag_s_log_nosec":    "C6: 自身文件缺少 .text/.rodata 节名（原因 %s），自校验跳过",
+	// AES-SIV（RFC 5297）KDF 的两条域串（密文常量在 aes_tables.h）。
+	// 与 internal/pack/siv.go 的 sivMacDomain/sivCTRDomain 必须一致。
+	"ag_s_siv_mac": "apkguard/siv/mac",
+	"ag_s_siv_ctr": "apkguard/siv/ctr",
 }
 
 // prebuiltSensitiveASCII 是不应再出现在 .so 可见串（strings 等价物）里的
@@ -66,6 +70,9 @@ var prebuiltSensitiveASCII = []string{
 	"gum",
 	"ddi",
 	"epic",
+	// AES-SIV KDF 域串：必须以密文形态存在（aes_tables.h 的 AG_DEFSTR）。
+	"apkguard/siv/mac",
+	"apkguard/siv/ctr",
 }
 
 // prebuiltSensitiveUTF8 是中文日志片段：UTF-8 字节序列足够长，直接全文件匹配。
@@ -217,6 +224,8 @@ func TestPrebuiltExportsJNISymbols(t *testing.T) {
 		"Java_com_apkguard_nativebridge_Native_hooked",
 		"Java_com_apkguard_nativebridge_Native_intact",
 		"Java_com_apkguard_nativebridge_Native_watch",
+		// B3 载荷解密入口：DEX 壳统一调用它，缺失即 UnsatisfiedLinkError。
+		"Java_com_apkguard_nativebridge_Native_sivDecrypt",
 	}
 	for _, l := range libs {
 		f, err := elf.NewFile(bytes.NewReader(l.Data))

@@ -321,7 +321,7 @@ func TestVMPTranslateAndPack(t *testing.T) {
 	if !ok {
 		t.Fatal("artifact 中缺少共享载荷密钥")
 	}
-	plain, err := pack.Decrypt(en.Raw, key)
+	plain, err := pack.DecryptNamed(en.Raw, key, "B6.vmp") // B6 载荷的 SIV AD 固定为 "B6.vmp"
 	if err != nil {
 		t.Fatalf("载荷解密失败: %v", err)
 	}

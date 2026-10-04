@@ -159,9 +159,9 @@ func TestShellChainOnSample(t *testing.T) {
 		}
 	}
 
-	// ---- 4) 载荷可被还原为原始 DEX ----
+	// ---- 4) 载荷可被还原为原始 DEX（SIV 的 AD = 原始 DEX 名） ----
 	for _, p := range payloads.Items {
-		plain, err := pack.Decrypt(p.Blob, payloads.Key)
+		plain, err := pack.DecryptNamed(p.Blob, payloads.Key, p.Name)
 		if err != nil {
 			t.Fatalf("解密载荷 %s 失败: %v", p.Asset, err)
 		}
@@ -701,7 +701,7 @@ func TestC1PayloadKeyComesFromNativeDerivation(t *testing.T) {
 		t.Fatal("未找到载荷清单")
 	}
 	for _, p := range payloads.Items {
-		plain, err := pack.Decrypt(p.Blob, derived)
+		plain, err := pack.DecryptNamed(p.Blob, derived, p.Name)
 		if err != nil {
 			t.Fatalf("用 native 派生密钥解密载荷 %s 失败: %v（说明 B1 未使用派生密钥）", p.Asset, err)
 		}

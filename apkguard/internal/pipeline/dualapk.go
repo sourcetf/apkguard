@@ -7,8 +7,9 @@ package pipeline
 //
 //	[宿主 APK] 包名由 seed 派生
 //	   ├ AndroidManifest.xml：REQUEST_INSTALL_PACKAGES + INTERNET、launcher activity
-//	   ├ classes.dex：宿主自己的解密/落地/安装逻辑（不含任何 dalvik/system/*）
-//	   └ assets/<随机名>.zip：AES-256-CBC(原应用 APK)，运行时落地到
+//	   ├ classes.dex：宿主自己的解密/落地/安装逻辑 + native 桥接类（不含任何 dalvik/system/*）
+//	   ├ lib/<abi>/libapkguard.so ×3：守卫库（AES-SIV 解密只能由原生库完成）
+//	   └ assets/<随机名>.zip：AES-256-SIV(原应用 APK)，运行时落地到
 //	     getExternalFilesDir()/plugins/<随机名>.apk 后进入 PackageInstaller 会话
 //
 // 为什么放在 Sink 而不是普通 Pass：插件必须是**已签名**的完整 APK，而签名
@@ -30,6 +31,7 @@ import (
 	"apkguard/internal/axml"
 	"apkguard/internal/config"
 	"apkguard/internal/dex"
+	"apkguard/internal/native"
 	"apkguard/internal/pack"
 	"apkguard/internal/zipx"
 )
@@ -115,13 +117,14 @@ func buildDualAPKHost(pluginAPK []byte, art *Artifact, opts *config.Options, ali
 	// 插件密钥：与 B1/C1 的载荷密钥**域分离**，只服务于 B9 的插件容器。
 	// 宿主 DEX 内联这把密钥（以字节数组构造，不在字符串池里留明文），
 	// 因此插件密文的可读性只取决于宿主 DEX 的反编译难度——与样本同一模型，
-	// 但加密是 AES-256-CBC 而非单字节 XOR。
+	// 但加密已从样本的单字节 XOR 换成 AES-256-SIV（RFC 5297）。
 	key, err := dualAPKPluginKey(opts)
 	if err != nil {
 		return nil, err
 	}
-	iv := pack.IVFromSeed(material + "|apkguard/b9/iv")
-	blob, err := pack.Encrypt(pluginAPK, key, iv)
+	// ad 绑定宿主 assets 条目名（载荷逻辑名）：与宿主 DEX 里解密时
+	// 现算的 ad 必须逐字节一致，否则 SIV 校验失败。
+	blob, err := pack.EncryptNamed(pluginAPK, key, assetKey)
 	if err != nil {
 		return nil, fmt.Errorf("插件加密失败: %w", err)
 	}
@@ -139,9 +142,9 @@ func buildDualAPKHost(pluginAPK []byte, art *Artifact, opts *config.Options, ali
 		ActClass:   actClass,
 		AssetKey:   assetKey,
 		PluginFile: pluginFile,
-		// 必须读入完整 blob（IV‖密文）：decrypt 从首 16 字节取 IV，再对
-		// 其余部分做 doFinal。少读一个分组就是「最后一个密文块丢失」，
-		// 在设备上表现为 BadPaddingException/解密失败（结构校验看不出来）。
+		// 必须读入完整 blob（SIV 标签‖密文）：decrypt 把它整体交给
+		// Native.sivDecrypt。少读尾部就是「密文被截断」，在设备上表现为
+		// SIV 校验失败（结构校验看不出来）。
 		PluginSize: len(blob),
 		PluginDrop: 0,
 		Key:        key,
@@ -151,6 +154,14 @@ func buildDualAPKHost(pluginAPK []byte, art *Artifact, opts *config.Options, ali
 	})
 	if err != nil {
 		return nil, fmt.Errorf("宿主 DEX 生成失败: %w", err)
+	}
+
+	// 宿主必须自带守卫库：AES-SIV 解密只能由 native 库完成（JCA 没有 SIV）。
+	// 3 个 ABI 全量嵌入——宿主是完全由我们生成的新应用，不存在「应用自带
+	// ABI 集合」的约束（与 C1 只补已有 ABI 的规则不同）。
+	libs, err := native.Prebuilt()
+	if err != nil {
+		return nil, fmt.Errorf("B9 宿主守卫库缺失: %w", err)
 	}
 
 	stamp, err := opts.UnifiedStamp()
@@ -166,6 +177,9 @@ func buildDualAPKHost(pluginAPK []byte, art *Artifact, opts *config.Options, ali
 		zipx.NewStoredAt("classes.dex", hostDex, tm, dt),
 		zipx.NewStoredAt("assets/"+assetKey, blob, tm, dt),
 	)
+	for _, l := range libs {
+		archive.Entries = append(archive.Entries, zipx.NewStoredAt(l.Entry, l.Data, tm, dt))
+	}
 	host, err := zipx.WriteChecked(archive, alignOpts)
 	if err != nil {
 		return nil, fmt.Errorf("宿主归档写出失败: %w", err)
@@ -174,11 +188,12 @@ func buildDualAPKHost(pluginAPK []byte, art *Artifact, opts *config.Options, ali
 	sum := sha256.Sum256(pluginAPK)
 	actName := strings.TrimSuffix(strings.TrimPrefix(actClass, "L"+slash+"/"), ";")
 	art.Note("B9 双 APK 投放器：产物改为宿主 APK（包名 %s，launcher %s.%s，%d 字节）；"+
-		"原应用（包名 %s，%d 字节，sha256 %s）已签名后经 AES-256-CBC 加密为宿主条目 assets/%s（%d 字节，IV 由 seed 派生，密钥以字节数组内联在宿主 DEX）；"+
+		"原应用（包名 %s，%d 字节，sha256 %s）已签名后经 AES-256-SIV 加密为宿主条目 assets/%s（%d 字节，ad=条目名，密钥以字节数组内联在宿主 DEX）；"+
+		"宿主自带 %d 个 ABI 的守卫库并由桥接类 <clinit> loadLibrary，解密由 Native.sivDecrypt 完成；"+
 		"宿主启动后解密落地到 getExternalFilesDir()/plugins/%s，再用 PackageInstaller 会话（SESSION，MODE_FULL_INSTALL）调起系统安装器——"+
 		"需要 REQUEST_INSTALL_PACKAGES，首次安装必须由用户在系统界面确认；宿主是独立包名，不会覆盖升级原应用",
 		hostPkg, hostPkg, actName, len(host),
-		pluginPkg, len(pluginAPK), hex.EncodeToString(sum[:8]), assetKey, len(blob), pluginFile)
+		pluginPkg, len(pluginAPK), hex.EncodeToString(sum[:8]), assetKey, len(blob), len(libs), pluginFile)
 	art.Stat("B9.host_pkg", hostPkg)
 	art.Stat("B9.host_bytes", fmt.Sprint(len(host)))
 	art.Stat("B9.plugin_pkg", pluginPkg)
@@ -187,6 +202,7 @@ func buildDualAPKHost(pluginAPK []byte, art *Artifact, opts *config.Options, ali
 	art.Stat("B9.asset", "assets/"+assetKey)
 	art.Stat("B9.blob_bytes", fmt.Sprint(len(blob)))
 	art.Stat("B9.host_dex_bytes", fmt.Sprint(len(hostDex)))
+	art.Stat("B9.host_libs", fmt.Sprint(len(libs)))
 	return host, nil
 }
 
@@ -499,31 +515,26 @@ func dualAPKLe32(vals ...uint32) []byte {
 
 // 宿主代码引用的类型描述符。
 const (
-	dualAPKCtxDesc      = "Landroid/content/Context;"
-	dualAPKFileDesc     = "Ljava/io/File;"
-	dualAPKAmDesc       = "Landroid/content/res/AssetManager;"
-	dualAPKInDesc       = "Ljava/io/InputStream;"
-	dualAPKFosDesc      = "Ljava/io/FileOutputStream;"
-	dualAPKOsDesc       = "Ljava/io/OutputStream;"
-	dualAPKByteArrDesc  = "[B"
-	dualAPKStrDesc      = "Ljava/lang/String;"
-	dualAPKIntentDesc   = "Landroid/content/Intent;"
-	dualAPKClassDesc    = "Ljava/lang/Class;"
-	dualAPKPmDesc       = "Landroid/content/pm/PackageManager;"
-	dualAPKPiDesc       = "Landroid/content/pm/PackageInstaller;"
-	dualAPKSpDesc       = "Landroid/content/pm/PackageInstaller$SessionParams;"
-	dualAPKSessDesc     = "Landroid/content/pm/PackageInstaller$Session;"
-	dualAPKPendDesc     = "Landroid/app/PendingIntent;"
-	dualAPKSenderDesc   = "Landroid/content/IntentSender;"
-	dualAPKParcelable   = "Landroid/os/Parcelable;"
-	dualAPKCharSeqDesc  = "Ljava/lang/CharSequence;"
-	dualAPKToastDesc    = "Landroid/widget/Toast;"
-	dualAPKBundleDesc   = "Landroid/os/Bundle;"
-	dualAPKKeyIface     = "Ljava/security/Key;"
-	dualAPKAlgoSpecDesc = "Ljava/security/spec/AlgorithmParameterSpec;"
-	dualAPKCipherDesc   = "Ljavax/crypto/Cipher;"
-	dualAPKSecretKey    = "Ljavax/crypto/spec/SecretKeySpec;"
-	dualAPKIvSpecDesc   = "Ljavax/crypto/spec/IvParameterSpec;"
+	dualAPKCtxDesc     = "Landroid/content/Context;"
+	dualAPKFileDesc    = "Ljava/io/File;"
+	dualAPKAmDesc      = "Landroid/content/res/AssetManager;"
+	dualAPKInDesc      = "Ljava/io/InputStream;"
+	dualAPKFosDesc     = "Ljava/io/FileOutputStream;"
+	dualAPKOsDesc      = "Ljava/io/OutputStream;"
+	dualAPKByteArrDesc = "[B"
+	dualAPKStrDesc     = "Ljava/lang/String;"
+	dualAPKIntentDesc  = "Landroid/content/Intent;"
+	dualAPKClassDesc   = "Ljava/lang/Class;"
+	dualAPKPmDesc      = "Landroid/content/pm/PackageManager;"
+	dualAPKPiDesc      = "Landroid/content/pm/PackageInstaller;"
+	dualAPKSpDesc      = "Landroid/content/pm/PackageInstaller$SessionParams;"
+	dualAPKSessDesc    = "Landroid/content/pm/PackageInstaller$Session;"
+	dualAPKPendDesc    = "Landroid/app/PendingIntent;"
+	dualAPKSenderDesc  = "Landroid/content/IntentSender;"
+	dualAPKParcelable  = "Landroid/os/Parcelable;"
+	dualAPKCharSeqDesc = "Ljava/lang/CharSequence;"
+	dualAPKToastDesc   = "Landroid/widget/Toast;"
+	dualAPKBundleDesc  = "Landroid/os/Bundle;"
 )
 
 // 宿主类的访问标志。
@@ -539,7 +550,7 @@ type dualAPKDexSpec struct {
 	ActClass   string // Activity 类描述符
 	AssetKey   string // AssetManager.open 用的相对路径
 	PluginFile string // 落地文件名
-	PluginSize int    // 密文字节数（含 IV）
+	PluginSize int    // 密文字节数（含 16 字节 SIV 标签）
 	PluginDrop int    // 解密时尾部忽略的字节数（0：无 MAC）
 	Key        [pack.KeySize]byte
 	TextUpdate string
@@ -603,11 +614,23 @@ func dualAPKBuildHostDex(sp dualAPKDexSpec) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	decM, err := dualAPKDecryptCode()
+	decM, err := dualAPKDecryptCode(sp.AssetKey)
 	if err != nil {
 		return nil, err
 	}
 	status, err := dualAPKStatusCode(sp)
+	if err != nil {
+		return nil, err
+	}
+	// 宿主解密走 Native.sivDecrypt，需要桥接类：<clinit> 负责
+	// System.loadLibrary("apkguard")（宿主自带 3 个 ABI 的守卫库），
+	// 同时声明 sivDecrypt 这个 native 方法。类描述符与 JNI 符号名固定，
+	// 不能随宿主包名变化。
+	bridgeAdd, err := dex.NativeBridgeAddition(&dex.NativeBridgeSpec{
+		Class:       dex.NativeBridgeClass,
+		LibName:     dex.NativeLibName,
+		NeedDecrypt: true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -639,6 +662,9 @@ func dualAPKBuildHostDex(sp dualAPKDexSpec) ([]byte, error) {
 			},
 		},
 	}}
+	// 桥接类追加进同一份宿主 DEX：宿主不再依赖任何 javax.crypto 类。
+	add.Methods = append(add.Methods, bridgeAdd.Methods...)
+	add.Classes = append(add.Classes, bridgeAdd.Classes...)
 	return dex.Build(add)
 }
 
@@ -729,6 +755,16 @@ func dualAPKRunCode(self string) (*dex.CodeBlob, error) {
 	a.IfNez(0, "end")
 	a.Const4(0, 1)
 	a.SPut(0, dex.FieldSpec{Class: self, Name: "s", Type: "Z"})
+	// 解密由 Native.sivDecrypt 完成，库必须在首次解密之前加载。桥接类的
+	// <clinit> 也会加载同一份（字符串池去重），这里显式调用让「库缺失」
+	// 以 UnsatisfiedLinkError 在启动时立刻暴露。
+	a.ConstString(0, dex.NativeLibName)
+	if err := a.InvokeStatic([]int{0}, dex.MethodSpec{
+		Class: "Ljava/lang/System;", Name: "loadLibrary",
+		Proto: dex.ProtoSpec{Ret: "V", Params: []string{dualAPKStrDesc}},
+	}); err != nil {
+		return nil, err
+	}
 	if err := a.InvokeStatic([]int{3}, dex.MethodSpec{
 		Class: self, Name: "drop",
 		Proto: dex.ProtoSpec{Ret: dualAPKByteArrDesc, Params: []string{dualAPKCtxDesc}},
@@ -1088,70 +1124,81 @@ func dualAPKReadCode() (*dex.CodeBlob, error) {
 	return dualAPKAssemble(6, 2, 4, a, nil)
 }
 
-// dualAPKDecryptCode 生成 decrypt(byte[],byte[],int)byte[]：IV‖AES-256-CBC(PKCS5)。
-func dualAPKDecryptCode() (*dex.CodeBlob, error) {
+// dualAPKDecryptCode 生成 decrypt(byte[],byte[],int)byte[]：AES-256-SIV
+// （RFC 5297），解密由宿主自带的守卫库完成。
+//
+// 等价 Java：
+//
+//	static byte[] decrypt(byte[] blob, byte[] key, int drop) {
+//	    int n = blob.length - drop;
+//	    byte[] in = new byte[n];
+//	    System.arraycopy(blob, 0, in, 0, n);
+//	    byte[] ad = AD.getBytes("UTF-8");      // 宿主 assets 条目名
+//	    byte[] out = Native.sivDecrypt(key, ad, in);
+//	    if (out == null) System.exit(1);       // 校验失败绝不静默继续
+//	    return out;
+//	}
+//
+// ad 必须与 buildDualAPKHost 里 pack.Encrypt 使用的 ad 逐字节一致。
+// null 返回值（SIV 校验失败、参数非法）按旧版 BadPaddingException 的
+// 可见行为硬终止，而不是把 null 传给下游。
+func dualAPKDecryptCode(ad string) (*dex.CodeBlob, error) {
+	// registers=11、ins=3：入参 blob/key/drop 落在 v8/v9/v10（最后 3 个寄存器）。
 	const (
-		rIv   = 0
-		rCp   = 1
-		rSks  = 2
-		rIvs  = 3
-		rT0   = 4
-		rT1   = 5
-		rBlob = 6
-		rKey  = 7
-		rDrop = 8
+		rIn   = 0
+		rAd   = 1
+		rOut  = 2
+		rT0   = 3
+		rT1   = 4
+		rBlob = 8
+		rKey  = 9
+		rDrop = 10
 	)
-	getInstance := dex.MethodSpec{Class: dualAPKCipherDesc, Name: "getInstance",
-		Proto: dex.ProtoSpec{Ret: dualAPKCipherDesc, Params: []string{dualAPKStrDesc}}}
-	cipherInit := dex.MethodSpec{Class: dualAPKCipherDesc, Name: "init",
-		Proto: dex.ProtoSpec{Ret: "V", Params: []string{"I", dualAPKKeyIface, dualAPKAlgoSpecDesc}}}
-	doFinal := dex.MethodSpec{Class: dualAPKCipherDesc, Name: "doFinal",
-		Proto: dex.ProtoSpec{Ret: dualAPKByteArrDesc, Params: []string{dualAPKByteArrDesc, "I", "I"}}}
-	sksInit := dex.MethodSpec{Class: dualAPKSecretKey, Name: "<init>",
-		Proto: dex.ProtoSpec{Ret: "V", Params: []string{dualAPKByteArrDesc, dualAPKStrDesc}}}
-	ivInit := dex.MethodSpec{Class: dualAPKIvSpecDesc, Name: "<init>",
-		Proto: dex.ProtoSpec{Ret: "V", Params: []string{dualAPKByteArrDesc}}}
+	strGetBytes := dex.MethodSpec{Class: dualAPKStrDesc, Name: "getBytes",
+		Proto: dex.ProtoSpec{Ret: dualAPKByteArrDesc, Params: []string{dualAPKStrDesc}}}
 	arraycopy := dex.MethodSpec{Class: "Ljava/lang/System;", Name: "arraycopy",
 		Proto: dex.ProtoSpec{Ret: "V", Params: []string{"Ljava/lang/Object;", "I", "Ljava/lang/Object;", "I", "I"}}}
+	sivDecrypt := dex.MethodSpec{Class: dex.NativeBridgeClass, Name: dex.NativeDecrypt,
+		Proto: dex.ProtoSpec{Ret: dualAPKByteArrDesc,
+			Params: []string{dualAPKByteArrDesc, dualAPKByteArrDesc, dualAPKByteArrDesc}}}
+	exitM := dex.MethodSpec{Class: "Ljava/lang/System;", Name: "exit",
+		Proto: dex.ProtoSpec{Ret: "V", Params: []string{"I"}}}
 
 	a := dex.NewAsm()
-	a.Const16(rT0, int16(pack.BlockSize))
-	if err := a.NewArray(rIv, rT0, dualAPKByteArrDesc); err != nil {
+	// n = blob.length - drop；in = new byte[n]
+	a.ArrayLength(rT1, rBlob)
+	a.SubInt(rT1, rT1, rDrop)
+	if err := a.NewArray(rIn, rT1, dualAPKByteArrDesc); err != nil {
+		return nil, err
+	}
+	// System.arraycopy(blob, 0, in, 0, n)
+	a.Const4(rT0, 0)
+	if err := a.InvokeStatic([]int{rBlob, rT0, rIn, rT0, rT1}, arraycopy); err != nil {
+		return nil, err
+	}
+	// ad = AD.getBytes("UTF-8")
+	a.ConstString(rAd, ad)
+	a.ConstString(rT0, "UTF-8")
+	if err := a.InvokeVirtual([]int{rAd, rT0}, strGetBytes); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rAd)
+	// out = Native.sivDecrypt(key, ad, in)
+	if err := a.InvokeStatic([]int{rKey, rAd, rIn}, sivDecrypt); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rOut)
+	// if (out == null) System.exit(1)
+	a.IfEqz(rOut, "fail")
+	a.ReturnObject(rOut)
+	a.Label("fail")
+	a.Const4(rT0, 1)
+	if err := a.InvokeStatic([]int{rT0}, exitM); err != nil {
 		return nil, err
 	}
 	a.Const4(rT0, 0)
-	a.Const16(rT1, int16(pack.BlockSize))
-	if err := a.InvokeStatic([]int{rBlob, rT0, rIv, rT0, rT1}, arraycopy); err != nil {
-		return nil, err
-	}
-	a.ConstString(rT0, "AES/CBC/PKCS5Padding")
-	if err := a.InvokeStatic([]int{rT0}, getInstance); err != nil {
-		return nil, err
-	}
-	a.MoveResultObject(rCp)
-	a.NewInstance(rSks, dualAPKSecretKey)
-	a.ConstString(rT0, "AES")
-	if err := a.InvokeDirect([]int{rSks, rKey, rT0}, sksInit); err != nil {
-		return nil, err
-	}
-	a.NewInstance(rIvs, dualAPKIvSpecDesc)
-	if err := a.InvokeDirect([]int{rIvs, rIv}, ivInit); err != nil {
-		return nil, err
-	}
-	a.Const16(rT0, 2) // Cipher.DECRYPT_MODE
-	if err := a.InvokeVirtual([]int{rCp, rT0, rSks, rIvs}, cipherInit); err != nil {
-		return nil, err
-	}
-	a.Const16(rT0, int16(pack.BlockSize))
-	a.ArrayLength(rT1, rBlob)
-	a.SubInt(rT1, rT1, rT0)
-	a.SubInt(rT1, rT1, rDrop)
-	if err := a.InvokeVirtual([]int{rCp, rBlob, rT0, rT1}, doFinal); err != nil {
-		return nil, err
-	}
-	a.MoveResultObject(rT1)
-	a.ReturnObject(rT1)
-	return dualAPKAssemble(9, 3, 5, a, nil)
+	a.ReturnObject(rT0)
+	return dualAPKAssemble(11, 3, 5, a, nil)
 }
 
 // dualAPKStatusCode 生成 status(Context,Intent)V：处理安装器回传的状态。

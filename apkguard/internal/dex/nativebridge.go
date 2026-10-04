@@ -19,6 +19,13 @@ type NativeBridgeSpec struct {
 	LibName string
 	// NeedDerive 为 true 时声明 derive([B)[B（C1 需要）。
 	NeedDerive bool
+	// NeedDecrypt 为 true 时声明 sivDecrypt([B[B[B)[B。
+	//
+	// 载荷加密改为 AES-256-SIV（RFC 5297）后，解密只能由原生库完成
+	// （javax.crypto 在 Android 全版本上都没有 SIV），因此**任何**需要
+	// 解密载荷的链路（B1/B3/B5/B6/B8、C2）都必须声明它；C1 启用与否
+	// 只决定密钥来源，不决定解密方式。
+	NeedDecrypt bool
 	// NeedDebug 为 true 时声明 debugged()Z（C4 需要）。
 	NeedDebug bool
 	// NeedHooked 为 true 时声明 hooked()Z（C5 需要）。
@@ -35,8 +42,19 @@ type NativeBridgeSpec struct {
 
 // 桥接类的 native 方法名。
 const (
+	// NativeDerive 返回载荷密钥：SHA-256(种子 ‖ 签名摘要)。
+	NativeDerive = "derive"
+	// NativeDecrypt 用 AES-256-SIV（RFC 5297）解密载荷：
+	// sivDecrypt(key32, ad, blob) -> 明文，校验失败返回 null。
+	//
+	// key32 是 32 字节主密钥（C1 时由 derive 派生，否则内联在字节码里）；
+	// ad 是载荷逻辑名的 UTF-8 字节（原始 DEX 名 / 原始库名）；
+	// blob 是 [SIV 16 字节][AES-CTR 密文]，密文长度 == 明文长度（无填充）。
+	NativeDecrypt = "sivDecrypt"
 	// NativeHooked 返回是否检测到注入/Hook 框架。
 	NativeHooked = "hooked"
+	// NativeDebugged 返回是否检测到调试器。
+	NativeDebugged = "debugged"
 	// NativeIntact 返回自身代码与常量是否未被篡改。
 	NativeIntact = "intact"
 	// NativeWatch 启动运行期周期性复检（D4）。
@@ -53,12 +71,8 @@ const (
 	NativeLibName = native.LibName
 )
 
-// 桥接类方法名。
+// sig 是 Java 实现的方法（不是 native），单独列在这里。
 const (
-	// NativeDerive 返回载荷密钥：SHA-256(种子 ‖ 签名摘要)。
-	NativeDerive = "derive"
-	// NativeDebugged 返回是否检测到调试器。
-	NativeDebugged = "debugged"
 	// NativeSig 返回本 APK 签名证书的 SHA-256。
 	NativeSig = "sig"
 )
@@ -71,6 +85,7 @@ const (
 //	public class Native {
 //	    static { System.loadLibrary("apkguard"); }
 //	    public static native byte[] derive(byte[] sig);
+//	    public static native byte[] sivDecrypt(byte[] key, byte[] ad, byte[] blob);
 //	    public static native boolean debugged();
 //	    public static byte[] sig(Context ctx) { ...取签名证书的 SHA-256... }
 //	}
@@ -81,7 +96,7 @@ func NativeBridgeAddition(spec *NativeBridgeSpec) (Addition, error) {
 	if spec.LibName == "" {
 		return Addition{}, fmt.Errorf("dex: native 库名为空")
 	}
-	if !spec.NeedDerive && !spec.NeedDebug && !spec.NeedHooked && !spec.NeedIntact && !spec.NeedWatch {
+	if !spec.NeedDerive && !spec.NeedDecrypt && !spec.NeedDebug && !spec.NeedHooked && !spec.NeedIntact && !spec.NeedWatch {
 		return Addition{}, fmt.Errorf("dex: native 桥接类 %s 没有任何用途", spec.Class)
 	}
 
@@ -134,6 +149,15 @@ func NativeBridgeAddition(spec *NativeBridgeSpec) (Addition, error) {
 			Access: accPublic | accStatic | accNative,
 		})
 		addMethods = append(addMethods, MethodSpec{Class: spec.Class, Name: NativeDerive, Proto: protoBytesBytes})
+	}
+	if spec.NeedDecrypt {
+		// sivDecrypt([B[B[B)[B：载荷解密唯一的实现路径（AES-SIV 不在 JCA 里）。
+		proto := ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, descByteArray}}
+		methods = append(methods, ClassMethod{
+			Name: NativeDecrypt, Proto: proto,
+			Access: accPublic | accStatic | accNative,
+		})
+		addMethods = append(addMethods, MethodSpec{Class: spec.Class, Name: NativeDecrypt, Proto: proto})
 	}
 	for _, nm := range []struct {
 		need bool

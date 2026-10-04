@@ -31,7 +31,7 @@ B5/B6/B7/C3/B9 默认关闭，需显式开启，落地设计见
 
 - `-rename-libraries`：A1 连第三方库（androidx/Kotlin stdlib 等）一起改名；
 - `-dual-apk`：B9 双 APK 投放器——产物是**宿主 APK**（包名由 seed 派生、与插件不同），
-  原应用在签名后整体 AES-256-CBC 加密为宿主 `assets/*.zip`，运行时解密落地到
+  原应用在签名后整体 **AES-SIV（RFC 5297）** 加密为宿主 `assets/*.zip`，运行时由守卫库解密落地到
   `getExternalFilesDir()/plugins/` 并调起系统安装器（需 `REQUEST_INSTALL_PACKAGES`，
   首次需用户确认安装；宿主与插件是两个独立安装的包，无法覆盖升级原应用）。
   宿主 Manifest/DEX 全部手工合成（不依赖 Android 构建链），宿主 DEX 不含任何

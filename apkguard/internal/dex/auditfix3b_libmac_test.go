@@ -84,9 +84,9 @@ func TestAuditfix3bLoaderLibMACTamperFails(t *testing.T) {
 		label  string
 		mutate func([]byte)
 	}{
-		{"密文字节", func(b []byte) { b[ivLen+20] ^= 0x01 }},   // IV(16) 之后的密文区
+		{"密文字节", func(b []byte) { b[ivLen+20] ^= 0x01 }},   // SIV 标签(16) 之后的密文区
 		{"tag 字节", func(b []byte) { b[len(b)-1] ^= 0x01 }}, // 尾部 HMAC
-		{"IV 字节", func(b []byte) { b[0] ^= 0x01 }},         // IV 必须被 MAC 覆盖
+		{"SIV 标签字节", func(b []byte) { b[0] ^= 0x01 }},      // SIV 标签必须被 MAC 覆盖
 	}
 	for _, tc := range tampers {
 		t.Run(tc.label, func(t *testing.T) {
@@ -128,8 +128,9 @@ func TestAuditfix3bLoaderLibMACTamperFails(t *testing.T) {
 // （否则即违反「关闭时产物与旧版逐字节一致」的承诺）。
 func TestAuditfix3bLibMACDisabledNoMACInstructions(t *testing.T) {
 	key := testPackKey
-	dexBlob := mustEncrypt(t, Empty(), key, testPackIV)
-	libBlob := mustEncrypt(t, auditfix3bLibPlain, key, auditfix3bLibIV)
+	// 未启用 MAC，但载荷名仍参与 SIV 的 ad，因此必须按同一个名字加密。
+	dexBlob := mustEncryptAd(t, Empty(), key, "classes.dex")
+	libBlob := mustEncryptAd(t, auditfix3bLibPlain, key, "libfoo.so")
 
 	ls := auditfix3bLibSpec(key, dexBlob, libBlob, "libfoo.so")
 	ls.MAC = false
@@ -162,13 +163,18 @@ func TestAuditfix3bLibMACDisabledNoMACInstructions(t *testing.T) {
 // （q/p/t，见 loader.go）。它们对所有载荷 unconditional 生成，但以 trailer
 // 魔数（ExtractPlanMagic）为判据，未启用 B5 的载荷走到即原样返回，属于
 // **行为等价**的字节变化；因此这里重新基线化 golden，而不是保留旧值。
-const auditfix3bLibGolden = "119c8c2e128370d43b2bb745740d69664995afc988f505d2bda3db6c6ffbd8d9"
+//
+// 2026-10（CBC→SIV）：解密从 javax.crypto 的 "AES/CBC/PKCS5Padding" 换成
+// Native.sivDecrypt，壳 DEX 指令流必然变化（新增 loadLibrary、getBytes、
+// sivDecrypt 调用与 null 终止分支），golden 随之下一次重新基线化。
+const auditfix3bLibGolden = "85b822110f62c2c4bfc9ec39c7ad3836a5995ae84482117d2e508f7918c0ac87"
 
 // TestAuditfix3bLibMACDisabledGolden 用 golden 摘要比对关闭 MAC 时的壳 DEX。
 func TestAuditfix3bLibMACDisabledGolden(t *testing.T) {
 	key := testPackKey
-	dexBlob := mustEncrypt(t, Empty(), key, testPackIV)
-	libBlob := mustEncrypt(t, auditfix3bLibPlain, key, auditfix3bLibIV)
+	// 未启用 MAC，但载荷名仍参与 SIV 的 ad，因此必须按同一个名字加密。
+	dexBlob := mustEncryptAd(t, Empty(), key, "classes.dex")
+	libBlob := mustEncryptAd(t, auditfix3bLibPlain, key, "libfoo.so")
 
 	ls := auditfix3bLibSpec(key, dexBlob, libBlob, "libfoo.so")
 	ls.MAC = false

@@ -25,7 +25,10 @@ type LoaderSpec struct {
 	Debug bool
 	// Class 是 Loader 类的描述符，形如 "Lcom/apkguard/shell/Loader;"。
 	Class string
-	// Key 是 AES-256 载荷密钥。
+	// Key 是 AES-256-SIV 的 32 字节主密钥。
+	//
+	// 解密本身不在 Java 层做（JCA 没有 SIV），而是把 key 原样交给
+	// Native.sivDecrypt；本字段只决定密钥从哪来。
 	Key [32]byte
 	// Items 是全部载荷，顺序即加载顺序。
 	Items []LoaderItem
@@ -37,6 +40,9 @@ type LoaderSpec struct {
 	// NativeKey 非空时（C1 生效）密钥不再内联在字节码里，改由该 native
 	// 桥接类在运行时派生：先取本 APK 的签名证书摘要，再交给 native 计算
 	// SHA-256(种子 ‖ 摘要)。种子只存在于 libapkguard.so 中，DEX 里没有密钥。
+	//
+	// 注意：无论它是否为空，载荷解密都统一走 Native.sivDecrypt（AES-SIV
+	// 在 JCA 里不存在）；本字段只切换「密钥来自 derive 还是内联常量」。
 	//
 	// 附带的安全性质：重打包必然更换签名证书，派生出的密钥随之不同，
 	// 密文载荷在密码学层面无法解开——不存在「跳过检测」的绕过路径。
@@ -77,12 +83,13 @@ type LoaderLibItem struct {
 	// 必须是原始文件名：System.loadLibrary 经 ClassLoader.findLibrary 在
 	// 库搜索路径里按 "lib<name>.so" 查找，改名会导致找不到。
 	//
-	// 启用 MAC（LoaderSpec.MAC）时它同时是 HMAC 的绑定输入，必须与打包侧
-	// C2 用来计算 tag 的原始库名逐字节一致（见 passes/soenc.go）。
+	// 启用 MAC（LoaderSpec.MAC）时它同时是 HMAC 的绑定输入；解密时它作为
+	// AES-SIV 的 ad（关联数据）传入。两者都必须与打包侧 C2 用的原始库名
+	// 逐字节一致（见 passes/soenc.go）。
 	Name string
 	// Abi 是原始 ABI 目录名，仅用于报告与排障。
 	Abi string
-	// Size 是载荷字节数（含前置 IV）。
+	// Size 是载荷字节数（含前置 SIV 标签）。
 	Size int
 }
 
@@ -95,7 +102,7 @@ type LoaderItem struct {
 	Asset string
 	// DexName 是解密后落地使用的文件名（同目录内必须唯一）。
 	DexName string
-	// Size 是载荷字节数（含前置 IV）。
+	// Size 是载荷字节数（含前置 SIV 标签）。
 	//
 	// 读取循环需要预知总长才能一次分配到位并避免反复扩容；
 	// 该值在加固时已知，因此可以直接内联为常量。
@@ -104,10 +111,12 @@ type LoaderItem struct {
 	// len(Blob)（B3 已如此）——若仍按旧格式少算 32，r() 会少读尾部字节，
 	// 表现为解密后 DEX 校验失败或 MAC 校验必然失败。
 	Size int
-	// Name 是原始 DEX 名（如 "classes.dex"），仅启用 MAC 时用于绑定校验。
+	// Name 是原始 DEX 名（如 "classes.dex"）。
 	//
-	// 必须是 Payload.Name 而不是容器化后的 Asset 名：B8 会重命名 Asset，
-	// 用 Asset 会让壳侧算出的 MAC 与打包时不一致。
+	// 它同时是 HMAC 的绑定输入与 AES-SIV 的 ad（关联数据），必须非空且
+	// 与打包侧 pack.Encrypt 用的 name 逐字节一致。必须是 Payload.Name
+	// 而不是容器化后的 Asset 名：B8 会重命名 Asset，用 Asset 会让壳侧
+	// 算出的 MAC/AD 与打包时不一致。
 	Name string
 }
 
@@ -120,26 +129,19 @@ const (
 	descStringB      = "Ljava/lang/StringBuilder;"
 	descClassLoader  = "Ljava/lang/ClassLoader;"
 	descDexCL        = "Ldalvik/system/DexClassLoader;"
-	descCipher       = "Ljavax/crypto/Cipher;"
 	descSecretKey    = "Ljavax/crypto/spec/SecretKeySpec;"
-	descIvSpec       = "Ljavax/crypto/spec/IvParameterSpec;"
 	descMac          = "Ljavax/crypto/Mac;"
 	descField        = "Ljava/lang/reflect/Field;"
 	descObjectArray  = "[Ljava/lang/Object;"
 	descClassArray   = "[Ljava/lang/Class;"
 	descFieldArray   = "[Ljava/lang/reflect/Field;"
 	descByteArray    = "[B"
-	// descKeyIface / descAlgoSpec 是 Cipher.init 的形参类型。
+	// descKeyIface 是 Mac.init 的形参类型。
 	//
-	// 必须按接口/抽象类书写：SecretKeySpec 实现 Key、IvParameterSpec 实现
-	// AlgorithmParameterSpec，若把方法引用写成具体类，Dalvik 校验器会因
-	// 方法签名不匹配而拒绝该调用点。
+	// 必须按接口书写：SecretKeySpec 实现 Key，若把方法引用写成具体类，
+	// Dalvik 校验器会因方法签名不匹配而拒绝该调用点。
 	descKeyIface = "Ljava/security/Key;"
-	descAlgoSpec = "Ljava/security/spec/AlgorithmParameterSpec;"
 )
-
-// Cipher 的工作模式常量（与 javax.crypto.Cipher 保持一致）。
-const cipherDecryptMode = 2
 
 // LoaderEntry 是 Loader 的对外入口方法名。
 const LoaderEntry = "a"
@@ -243,12 +245,13 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 
 	protoCtxCL := ProtoSpec{Ret: descClassLoader, Params: []string{descContext}}
 	protoInBytes := ProtoSpec{Ret: descByteArray, Params: []string{descInputStream, "I"}}
-	protoBytes2 := ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, "I"}}
+	// c(blob, key, drop, name)：name 是载荷逻辑名，作为 AES-SIV 的 ad。
+	protoDecrypt := ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, "I", descStringType}}
 	protoFileBytes := ProtoSpec{Ret: "V", Params: []string{descFile, descByteArray}}
 	protoCLI := ProtoSpec{Ret: "I", Params: []string{descClassLoader}}
 	protoObjStr := ProtoSpec{Ret: descObject, Params: []string{descObject, descStringType}}
 	protoObjStrObjBool := ProtoSpec{Ret: "Z", Params: []string{descObject, descStringType, descObject}}
-	// v(blob, key, name)：blob=IV‖密文‖tag，key=AES 密钥，name=原始 DEX 名。
+	// v(blob, key, name)：blob=SIV 标签‖密文‖tag，key=AES 密钥，name=原始 DEX 名。
 	protoMAC := ProtoSpec{Ret: "Z", Params: []string{descByteArray, descByteArray, descStringType}}
 	// q(byte[], int)：读小端 u32。p(byte[])：回填抽取计划并返回 file_size。
 	// t(File, byte[], int)：只写前 n 字节（截掉 trailer）。
@@ -259,7 +262,7 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 	methods := []ClassMethod{
 		{Name: nameEntry, Proto: protoCtxCL, Access: accPublic | accStatic, Code: entry},
 		{Name: nameRead, Proto: protoInBytes, Access: accPrivate | accStatic, Code: readAll},
-		{Name: nameDecrypt, Proto: protoBytes2, Access: accPrivate | accStatic, Code: decrypt},
+		{Name: nameDecrypt, Proto: protoDecrypt, Access: accPrivate | accStatic, Code: decrypt},
 		{Name: nameWrite, Proto: protoFileBytes, Access: accPrivate | accStatic, Code: writeAll},
 		{Name: nameInstall, Proto: protoCLI, Access: accPrivate | accStatic, Code: install},
 		{Name: nameGetF, Proto: protoObjStr, Access: accPrivate | accStatic, Code: getField},
@@ -272,7 +275,7 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 	regMethods := []MethodSpec{
 		{Class: ls.Class, Name: nameEntry, Proto: protoCtxCL},
 		{Class: ls.Class, Name: nameRead, Proto: protoInBytes},
-		{Class: ls.Class, Name: nameDecrypt, Proto: protoBytes2},
+		{Class: ls.Class, Name: nameDecrypt, Proto: protoDecrypt},
 		{Class: ls.Class, Name: nameWrite, Proto: protoFileBytes},
 		{Class: ls.Class, Name: nameInstall, Proto: protoCLI},
 		{Class: ls.Class, Name: nameGetF, Proto: protoObjStr},
@@ -319,13 +322,15 @@ func (ls *LoaderSpec) Desc() string {
 // 等价 Java：
 //
 //	static ClassLoader a(Context base) {
+//	    System.loadLibrary("apkguard");          // 解密由 native 完成
+//	    byte[] key = Native.derive(Native.sig(base)); // C1；否则为内联常量
 //	    File dir = base.getDir(TEMP_DIR, 0);
 //	    String opt = dir.getAbsolutePath();
 //	    StringBuilder sb = new StringBuilder();
 //	    for (每份载荷) {
 //	        InputStream in = base.getAssets().open(ASSET);
 //	        byte[] blob = r(in, SIZE);
-//	        byte[] dex = c(blob);
+//	        byte[] dex = c(blob, key, DROP, NAME);
 //	        File f = new File(dir, DEXNAME);
 //	        w(f, dex);
 //	        sb.append(f.getAbsolutePath()).append(File.pathSeparator);
@@ -335,6 +340,10 @@ func (ls *LoaderSpec) Desc() string {
 //	    i(cl);
 //	    return cl;
 //	}
+//
+// 库名与桥接类 <clinit> 里的 loadLibrary 实参是同一个字符串池项，
+// C7 改名时按值一并改写；这里显式加载的收益是让「库缺失」立刻以
+// UnsatisfiedLinkError 暴露。
 //
 // registers=16、ins=1 → 入参 base 落在 v15；v0..v14 为局部。
 func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
@@ -386,7 +395,7 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 	readM := MethodSpec{Class: ls.Class, Name: "r",
 		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descInputStream, "I"}}}
 	decM := MethodSpec{Class: ls.Class, Name: "c",
-		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, "I"}}}
+		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, "I", descStringType}}}
 	writeM := MethodSpec{Class: ls.Class, Name: "w",
 		Proto: ProtoSpec{Ret: "V", Params: []string{descFile, descByteArray}}}
 	// B5：p 回填抽取计划（返回 file_size），t 按 file_size 截断写盘。
@@ -403,6 +412,12 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 		Proto: ProtoSpec{Ret: "V", Params: []string{"I"}}}
 	// .so 落地后置只读（W^X，Android 10+ 对 targetSdk ≥ 29 的硬性要求）。
 	setROM := MethodSpec{Class: descFile, Name: "setReadOnly", Proto: ProtoSpec{Ret: "Z"}}
+	// 载荷解密改走 Native.sivDecrypt，必须先加载守卫库。桥接类的 <clinit>
+	// 也会加载同一份库（字符串池去重后是同一个值），这里显式加载让
+	// 「库缺失」在解密之前就以 UnsatisfiedLinkError 暴露，而不是以
+	// 难以定位的 NoSuchMethodError 形式出现。
+	loadLibM := MethodSpec{Class: descSystem, Name: "loadLibrary",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descStringType}}}
 
 	// 载荷密钥：要么由 native 派生（C1），要么内联在字节码里。
 	bridgeSig := MethodSpec{Class: ls.NativeKey, Name: NativeSig,
@@ -411,6 +426,11 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descByteArray}}}
 
 	a := NewAsm()
+	// System.loadLibrary("<库名>")：C7 会用 Rename 同步改写这个字符串。
+	a.ConstString(rT0, NativeLibName)
+	if err := a.InvokeStatic([]int{rT0}, loadLibM); err != nil {
+		return nil, err
+	}
 	if ls.NativeKey != "" {
 		// key = Native.derive(Native.sig(base))
 		if err := a.InvokeStatic([]int{rBase}, bridgeSig); err != nil {
@@ -472,9 +492,9 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 		a.MoveResultObject(rBlob)
 		// 启用 MAC 时先校验再解密：顺序不可颠倒。
 		//
-		// 若先解密再比对，攻击者就能从「填充是否合法」的差异里获得
-		// 填充 oracle；encrypt-then-MAC 的意义正在于让校验失败与密钥
-		// 错误在外部观察上不可区分（都走同一条终止路径）。
+		// 若先解密再比对，攻击者就能从「SIV 校验是否通过」的差异里获得
+		// 一次额外的判定信号；encrypt-then-MAC 的意义正在于让校验失败与
+		// 密钥错误在外部观察上不可区分（都走同一条终止路径）。
 		if ls.MAC {
 			a.ConstString(rT0, it.Name)
 			if err := a.InvokeStatic([]int{rBlob, rKey, rT0}, macM); err != nil {
@@ -483,16 +503,18 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 			a.MoveResult(rT1)
 			a.IfEqz(rT1, "mac_fail")
 		}
-		// dex = c(blob, key, drop)
+		// dex = c(blob, key, drop, name)
 		//
 		// 启用 MAC 时 blob 尾部有 32 字节 tag，必须把 drop 传给 c 让其排除，
-		// 否则 tag 会被当成 CBC 密文，填充校验失败。
+		// 否则 tag 会被当作 [SIV 标签‖密文] 的一部分，SIV 校验必然失败。
+		// name 是载荷逻辑名（原始 DEX 名），作为 AES-SIV 的 ad 绑定输入。
 		if ls.MAC {
 			a.Const16(rT2, int16(tagLen))
 		} else {
 			a.Const4(rT2, 0)
 		}
-		if err := a.InvokeStatic([]int{rBlob, rKey, rT2}, decM); err != nil {
+		a.ConstString(rT0, it.Name)
+		if err := a.InvokeStatic([]int{rBlob, rKey, rT2, rT0}, decM); err != nil {
 			return nil, err
 		}
 		a.MoveResultObject(rDex)
@@ -602,7 +624,7 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 			a.MoveResultObject(rLibBlob)
 			// 启用 MAC 时先校验再解密：与 DEX 载荷走同一条路径、同一个 v()，
 			// 绑定的是**原始库名**（it.Name）。顺序不可颠倒——先解密再比对
-			// 会从填充是否合法的差异里泄漏填充 oracle。
+			// 会从 SIV 校验是否通过的差异里泄漏一次额外的判定信号。
 			if ls.MAC {
 				a.ConstString(rT3, it.Name)
 				if err := a.InvokeStatic([]int{rLibBlob, rKey, rT3}, macM); err != nil {
@@ -611,16 +633,17 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 				a.MoveResult(rT2)
 				a.IfEqz(rT2, "mac_fail")
 			}
-			// so = c(blob, key, drop)：复用 DEX 的解密实现（同样是 IV‖AES-CBC）。
-			// 启用 MAC 时 blob 尾部有 32 字节 tag，drop 必须为 tagLen，否则 tag
-			// 会被当成 CBC 密文，填充校验必然失败；未启用时 drop 传 0，语义与
-			// 旧版逐字节一致。
+			// so = c(blob, key, drop, name)：复用 DEX 的解密实现（同样是
+			// [SIV 标签‖AES-CTR 密文]）。启用 MAC 时 blob 尾部有 32 字节 tag，
+			// drop 必须为 tagLen，否则 tag 会被当作密文的一部分，SIV 校验
+			// 必然失败；未启用时 drop 传 0。name 绑定原始库名。
 			if ls.MAC {
 				a.Const16(rT2, int16(tagLen))
 			} else {
 				a.Const4(rT2, 0)
 			}
-			if err := a.InvokeStatic([]int{rLibBlob, rKey, rT2}, decM); err != nil {
+			a.ConstString(rT3, it.Name)
+			if err := a.InvokeStatic([]int{rLibBlob, rKey, rT2, rT3}, decM); err != nil {
 				return nil, err
 			}
 			a.MoveResultObject(rLibSo)
@@ -852,102 +875,100 @@ func loaderReadAllCode() (*CodeBlob, error) {
 	return &CodeBlob{Registers: 6, Ins: 2, Outs: 4, Insns: insns, Patches: patches}, nil
 }
 
-// ---- 解密：c(byte[], byte[], int) -> byte[] ----
+// ---- 解密：c(byte[], byte[], int, String) -> byte[] ----
 //
 // 等价 Java：
 //
-//	static byte[] c(byte[] blob, byte[] key, int drop) {
-//	    byte[] iv = new byte[16];
-//	    System.arraycopy(blob, 0, iv, 0, 16);
-//	    Cipher cp = Cipher.getInstance("AES/CBC/PKCS5Padding");
-//	    cp.init(DECRYPT_MODE, new SecretKeySpec(key, "AES"), new IvParameterSpec(iv));
-//	    return cp.doFinal(blob, 16, blob.length - 16 - drop);
+//	static byte[] c(byte[] blob, byte[] key, int drop, String name) {
+//	    int n = blob.length - drop;
+//	    byte[] in = new byte[n];
+//	    System.arraycopy(blob, 0, in, 0, n);
+//	    byte[] ad = name.getBytes("UTF-8");
+//	    byte[] out = Native.sivDecrypt(key, ad, in);   // AES-256-SIV(RFC 5297)
+//	    if (out == null) { System.exit(1); return null; }  // 与解密失败同一处置
+//	    return out;
 //	}
 //
+// blob 布局是 [SIV 标签 16][AES-CTR 密文]，密文长度 == 明文长度（无填充）。
 // drop 是「载荷尾部需要忽略的字节数」：启用载荷 MAC 时尾部有 32 字节 tag，
-// 必须排除在 CBC 密文之外，否则填充校验必然失败（表现为解密后 DEX 校验失败）。
-// 未启用 MAC 与 C2 的 .so 载荷都传 0，语义与旧版完全一致。
+// 必须先排除，否则 SIV 校验必然失败。未启用 MAC 与 C2 的 .so 载荷都传 0。
+//
+// ad 是载荷逻辑名的 UTF-8 字节（原始 DEX 名 / 原始库名），与打包侧
+// pack.Encrypt 的 ad 逐字节一致；不同载荷的 SIV 密文无法互换。
+//
+// 解密必须由原生库完成：Android 的 javax.crypto 没有 AES-SIV 实现。
+// null 返回值（SIV 校验失败、参数非法）绝不能静默继续——按与旧版
+// BadPaddingException 相同的可见行为硬终止（System.exit(1)，与 MAC
+// 校验失败同一条路径）。
 //
 // 密钥由调用方传入而不是在此内联：C1 生效时它来自 native 派生，
 // 未启用时才是内联常量。这样解密路径本身与密钥来源解耦。
 //
-// registers=9、ins=3 → blob 在 v6、key 在 v7、drop 在 v8。
+// registers=11、ins=4 → blob 在 v7、key 在 v8、drop 在 v9、name 在 v10。
 func loaderDecryptCode() (*CodeBlob, error) {
 	const (
-		rIv   = 0
-		rCp   = 1
-		rSks  = 2
-		rIvs  = 3
-		rT0   = 4
-		rT1   = 5
-		rBlob = 6
-		rKey  = 7
-		rDrop = 8
+		rIn   = 0 // byte[]  [SIV 标签‖密文]
+		rAd   = 1 // byte[]  name.getBytes("UTF-8")
+		rOut  = 2 // byte[]
+		rT0   = 3
+		rT1   = 4
+		rBlob = 7
+		rKey  = 8
+		rDrop = 9
+		rName = 10
 	)
-	getInstance := MethodSpec{Class: descCipher, Name: "getInstance",
-		Proto: ProtoSpec{Ret: descCipher, Params: []string{descStringType}}}
-	cipherInit := MethodSpec{Class: descCipher, Name: "init",
-		Proto: ProtoSpec{Ret: "V", Params: []string{"I", descKeyIface, descAlgoSpec}}}
-	doFinal := MethodSpec{Class: descCipher, Name: "doFinal",
-		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, "I", "I"}}}
-	sksInit := MethodSpec{Class: descSecretKey, Name: "<init>",
-		Proto: ProtoSpec{Ret: "V", Params: []string{descByteArray, descStringType}}}
-	ivInit := MethodSpec{Class: descIvSpec, Name: "<init>",
-		Proto: ProtoSpec{Ret: "V", Params: []string{descByteArray}}}
+	strGetBytes := MethodSpec{Class: descString, Name: "getBytes",
+		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descStringType}}}
 	arraycopy := MethodSpec{Class: descSystem, Name: "arraycopy",
 		Proto: ProtoSpec{Ret: "V",
 			Params: []string{descObject, "I", descObject, "I", "I"}}}
+	sivDecrypt := MethodSpec{Class: NativeBridgeClass, Name: NativeDecrypt,
+		Proto: ProtoSpec{Ret: descByteArray,
+			Params: []string{descByteArray, descByteArray, descByteArray}}}
+	exitM := MethodSpec{Class: descSystem, Name: "exit",
+		Proto: ProtoSpec{Ret: "V", Params: []string{"I"}}}
 
 	a := NewAsm()
-	// iv = new byte[16]
-	a.Const16(rT0, int16(ivLen))
-	if err := a.NewArray(rIv, rT0, descByteArray); err != nil {
-		return nil, err
-	}
-	// System.arraycopy(blob, 0, iv, 0, 16)
-	a.Const4(rT0, 0)
-	a.Const16(rT1, int16(ivLen))
-	if err := a.InvokeStatic([]int{rBlob, rT0, rIv, rT0, rT1}, arraycopy); err != nil {
-		return nil, err
-	}
-	// cp = Cipher.getInstance("AES/CBC/PKCS5Padding")
-	a.ConstString(rT0, cipherAlg)
-	if err := a.InvokeStatic([]int{rT0}, getInstance); err != nil {
-		return nil, err
-	}
-	a.MoveResultObject(rCp)
-	// sks = new SecretKeySpec(key, "AES")
-	a.NewInstance(rSks, descSecretKey)
-	a.ConstString(rT0, keyAlg)
-	if err := a.InvokeDirect([]int{rSks, rKey, rT0}, sksInit); err != nil {
-		return nil, err
-	}
-	// ivs = new IvParameterSpec(iv)
-	a.NewInstance(rIvs, descIvSpec)
-	if err := a.InvokeDirect([]int{rIvs, rIv}, ivInit); err != nil {
-		return nil, err
-	}
-	// cp.init(DECRYPT_MODE, sks, ivs)
-	a.Const16(rT0, cipherDecryptMode)
-	if err := a.InvokeVirtual([]int{rCp, rT0, rSks, rIvs}, cipherInit); err != nil {
-		return nil, err
-	}
-	// return cp.doFinal(blob, 16, blob.length - 16 - drop)
-	a.Const16(rT0, int16(ivLen))
+	// n = blob.length - drop
 	a.ArrayLength(rT1, rBlob)
-	a.SubInt(rT1, rT1, rT0)
 	a.SubInt(rT1, rT1, rDrop)
-	if err := a.InvokeVirtual([]int{rCp, rBlob, rT0, rT1}, doFinal); err != nil {
+	// in = new byte[n]
+	if err := a.NewArray(rIn, rT1, descByteArray); err != nil {
 		return nil, err
 	}
-	a.MoveResultObject(rT1)
-	a.ReturnObject(rT1)
+	// System.arraycopy(blob, 0, in, 0, n)
+	a.Const4(rT0, 0)
+	if err := a.InvokeStatic([]int{rBlob, rT0, rIn, rT0, rT1}, arraycopy); err != nil {
+		return nil, err
+	}
+	// ad = name.getBytes("UTF-8")
+	a.ConstString(rT0, utf8Charset)
+	if err := a.InvokeVirtual([]int{rName, rT0}, strGetBytes); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rAd)
+	// out = Native.sivDecrypt(key, ad, in)
+	if err := a.InvokeStatic([]int{rKey, rAd, rIn}, sivDecrypt); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rOut)
+	// if (out == null) System.exit(1)
+	a.IfEqz(rOut, "fail")
+	a.ReturnObject(rOut)
+	a.Label("fail")
+	a.Const4(rT0, 1)
+	if err := a.InvokeStatic([]int{rT0}, exitM); err != nil {
+		return nil, err
+	}
+	// System.exit 在真机上不返回；这条 return 只为满足校验器的控制流要求。
+	a.Const4(rT0, 0)
+	a.ReturnObject(rT0)
 
 	insns, patches, err := a.Assemble()
 	if err != nil {
 		return nil, err
 	}
-	return &CodeBlob{Registers: 9, Ins: 3, Outs: 5, Insns: insns, Patches: patches}, nil
+	return &CodeBlob{Registers: 11, Ins: 4, Outs: 5, Insns: insns, Patches: patches}, nil
 }
 
 // ---- 载荷 MAC：v(byte[] blob, byte[] key, String name) -> boolean ----
@@ -955,7 +976,7 @@ func loaderDecryptCode() (*CodeBlob, error) {
 // 等价 Java：
 //
 //	static boolean v(byte[] blob, byte[] key, String name) {
-//	    if (blob.length < 16 + 32) return false;             // IV + Tag
+//	    if (blob.length < 16 + 32) return false;             // SIV 标签 + Tag
 //	    MessageDigest md = MessageDigest.getInstance("SHA-256");
 //	    md.update(key);
 //	    md.update("apkguard/payload-mac".getBytes());
@@ -963,7 +984,7 @@ func loaderDecryptCode() (*CodeBlob, error) {
 //	    Mac mac = Mac.getInstance("HmacSHA256");
 //	    mac.init(new SecretKeySpec(macKey, "HmacSHA256"));
 //	    mac.update(name.getBytes());
-//	    mac.update(blob, 0, blob.length - 32);               // 覆盖 IV‖密文
+//	    mac.update(blob, 0, blob.length - 32);               // 覆盖 SIV 标签‖密文
 //	    byte[] got = mac.doFinal();
 //	    int diff = 0;                                        // 常量时间比较
 //	    for (int i = 0; i < 32; i++)
@@ -972,7 +993,8 @@ func loaderDecryptCode() (*CodeBlob, error) {
 //	}
 //
 // 评审要点：
-//   - 先验 MAC 后解密（调用点在 entry 里位于 c() 之前），消除填充 oracle；
+//   - 先验 MAC 后解密（调用点在 entry 里位于 c() 之前），在 SIV 自身的
+//     认证之外再加一层与载荷名绑定的完整性保护；
 //   - 比较用「逐字节 XOR 累加再判 0」，不提前返回，避免 tag 前缀的定时侧信道；
 //   - 长度不足与 tag 不符都返回 false，不做差异化行为；
 //   - name 绑定的是**原始 DEX 名**（Payload.Name），不是容器化后的 Asset 名。
@@ -1122,14 +1144,14 @@ func loaderMACCode(self string) (*CodeBlob, error) {
 // 壳算出的 MAC/解密参数与打包时对不上——且只有真机启动才暴露。
 // 除本文件的解释器测试外，pack 侧另有对拍守卫测试钉住同一组值。
 const (
-	keyLen    = 32 // AES-256
-	ivLen     = 16 // CBC 分组长度
-	tagLen    = 32 // HMAC-SHA256 标签长度
-	cipherAlg = "AES/CBC/PKCS5Padding"
-	keyAlg    = "AES"
-	macAlg    = "HmacSHA256"
+	keyLen = 32 // AES-256-SIV 主密钥长度
+	ivLen  = 16 // SIV 认证标签长度（与原 CBC 的 IV/分组长度同为 16）
+	tagLen = 32 // HMAC-SHA256 标签长度
+	macAlg = "HmacSHA256"
 	// macDomain 必须与 pack.macDomain 逐字节一致。
 	macDomain = "apkguard/payload-mac"
+	// utf8Charset 必须与打包侧把载荷名转字节时用的字符集一致。
+	utf8Charset = "UTF-8"
 )
 
 // descSystem 是 java.lang.System 的描述符。

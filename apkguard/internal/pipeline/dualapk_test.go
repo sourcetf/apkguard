@@ -181,6 +181,36 @@ func TestDualAPKHostStructure(t *testing.T) {
 			t.Fatalf("宿主 DEX 不应引用 dalvik/system/*：%q", s)
 		}
 	}
+	// CBC→SIV：宿主不得再引用任何 JCA 加解密类型/算法串。
+	has := func(want string) bool {
+		for _, s := range strs {
+			if s == want {
+				return true
+			}
+		}
+		return false
+	}
+	if has("AES/CBC/PKCS5Padding") || has("javax/crypto/Cipher") || has("Ljavax/crypto/Cipher;") {
+		t.Fatalf("宿主 DEX 仍含 CBC/JCA-Cipher 引用，解密未切到 Native.sivDecrypt")
+	}
+	// 解密调用与库加载必须都在宿主 DEX 的字符串池里。
+	for _, want := range []string{dex.NativeDecrypt, "loadLibrary", dex.NativeLibName, dex.NativeBridgeClass} {
+		if !has(want) {
+			t.Fatalf("宿主 DEX 字符串池缺少 %q（sivDecrypt/loadLibrary 链路不完整）", want)
+		}
+	}
+
+	// ---- 宿主自带守卫库：3 个 ABI 全量嵌入 ----
+	libCount := 0
+	for _, e := range a.Entries {
+		n := e.NameString()
+		if strings.HasPrefix(n, "lib/") && strings.HasSuffix(n, "/libapkguard.so") {
+			libCount++
+		}
+	}
+	if libCount != 3 {
+		t.Fatalf("宿主应内嵌 3 个 ABI 的守卫库，实际 %d 个（条目: %v）", libCount, entryNames(a))
+	}
 
 	// ---- 插件解密：能还原出「被加密前的那份已签名插件 APK」----
 	pluginPlain, _ := art.Get(sharedKeyPluginAPK).([]byte)
@@ -195,7 +225,9 @@ func TestDualAPKHostStructure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取插件密文失败: %v", err)
 	}
-	got, err := pack.Decrypt(blob, key)
+	// SIV 的 ad 绑定宿主 assets 条目名（不带 assets/ 前缀的逻辑名）。
+	ad := strings.TrimPrefix(pluginEntry.NameString(), "assets/")
+	got, err := pack.DecryptNamed(blob, key, ad)
 	if err != nil {
 		t.Fatalf("插件密文解密失败: %v", err)
 	}
@@ -220,8 +252,8 @@ func TestDualAPKHostStructure(t *testing.T) {
 
 	// ---- 密文形态：高熵、无明文 ZIP 结构 ----
 	//
-	// 结构校验（STORED、能解回去）不能说明「静态不可读」：如果加密退化或 IV 前
-	// 留有明文，条目仍能解密成功。这里对密文本体做形态断言。
+	// 结构校验（STORED、能解回去）不能说明「静态不可读」：如果加密退化或
+	// SIV 标签前留有明文，条目仍能解密成功。这里对密文本体做形态断言。
 	if len(blob) <= pack.BlockSize {
 		t.Fatalf("插件密文过短: %d 字节", len(blob))
 	}
@@ -509,6 +541,21 @@ func TestDualAPKHostDexSemantics(t *testing.T) {
 	if !insnsContainConst4(hostMethod(t, f, "status"), -1) {
 		t.Fatalf("status 未使用 STATUS_PENDING_USER_ACTION=-1")
 	}
+	// decrypt 的入参寄存器基址：ins=3 时 blob/key/drop 在 registers-3..registers-1。
+	// 写错这一处会读到未初始化的局部寄存器，dex.Verify/Parse 全部照过，只有
+	// 真机执行才崩。这里用「第一条 array-length 的源寄存器」钉住入参基址。
+	{
+		ci := hostMethod(t, f, "decrypt")
+		base := int(ci.Registers) - int(ci.Ins)
+		l, err := dex.ParseInsns(ci.Insns)
+		if err != nil || l.ItemCount() == 0 {
+			t.Fatalf("解析 decrypt 字节码失败: %v", err)
+		}
+		w := l.ItemWords(0)
+		if len(w) < 1 || byte(w[0]&0xff) != 0x21 || int(w[0]>>12) != base {
+			t.Fatalf("decrypt 的首条 array-length 未以入参基址 v%d 为源（word=0x%04x）: SIV 解密会读到未初始化寄存器", base, w[0])
+		}
+	}
 	// 关键字符串必须都进池：ConstString 走 jumbo 补丁，索引错位会静默
 	// 指向别的字符串，结构校验发现不了。
 	strs, err := f.AllStrings()
@@ -517,7 +564,9 @@ func TestDualAPKHostDexSemantics(t *testing.T) {
 	}
 	want := map[string]bool{
 		"abcdefghijklmn.zip": true, "abcdefghijklmn.apk": true,
-		"plugins": true, "base.apk": true, "AES/CBC/PKCS5Padding": true,
+		"plugins": true, "base.apk": true,
+		// SIV 解密走 native：算法串不再是 JCA 的 CBC，而是原生方法名与库名。
+		dex.NativeDecrypt: true, "loadLibrary": true, dex.NativeLibName: true,
 	}
 	for _, s := range strs {
 		delete(want, s)

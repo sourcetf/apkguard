@@ -263,7 +263,7 @@ func TestExtractCodeChainRestoresOriginal(t *testing.T) {
 	restoredEntries := 0
 	withTrailer := 0
 	for _, p := range sp.Items {
-		dec, err := pack.Decrypt(p.Blob, sp.Key)
+		dec, err := pack.DecryptNamed(p.Blob, sp.Key, p.Name)
 		if err != nil {
 			t.Fatalf("载荷 %s 解密失败: %v", p.Asset, err)
 		}

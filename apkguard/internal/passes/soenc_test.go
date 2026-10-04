@@ -77,7 +77,7 @@ func TestSoEncRoundTrip(t *testing.T) {
 		if len(blob) >= 4 && string(blob[:4]) == "\x7fELF" {
 			t.Fatalf("载荷 %s 仍是明文 ELF", it.Asset)
 		}
-		got, err := pack.Decrypt(blob, sl.Key)
+		got, err := pack.DecryptNamed(blob, sl.Key, it.Name)
 		if err != nil {
 			t.Fatalf("解密载荷 %s 失败: %v", it.Asset, err)
 		}

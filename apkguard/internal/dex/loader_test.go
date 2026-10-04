@@ -2,13 +2,13 @@ package dex
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
+
+	"apkguard/internal/pack"
 )
 
 // 本文件验证 B3（ClassLoader 接管）注入的 Loader 类。
@@ -16,8 +16,8 @@ import (
 // 验证方式与 A2/A13 一致：把真实字节码送进测试解释器执行，断言其**行为**，
 // 而不是只看 DEX 结构是否自洽——结构合法但寄存器分配错误的壳代码同样能通过
 // Verify，却会在真机崩溃。这里为 Loader 用到的框架 API 建立一套模拟实现，
-// 其中 javax.crypto 直接用 Go 的标准库做**真实** AES-CBC 解密，
-// 因此「载荷被正确还原」这一点是被真正证明的，而不是被假定。
+// 其中 Native.sivDecrypt 直接用 internal/pack 的 AES-256-SIV 参照实现做
+// **真实**解密，因此「载荷被正确还原」这一点是被真正证明的，而不是被假定。
 
 // ---- 模拟运行时对象 ----
 
@@ -34,12 +34,6 @@ type fakeStream struct {
 type fakeField struct {
 	name string
 	val  any
-}
-
-// fakeCipher 模拟 javax.crypto.Cipher，内部用真实 AES-CBC 解密。
-type fakeCipher struct {
-	key []byte
-	iv  []byte
 }
 
 // fakeDigest 模拟 java.security.MessageDigest，内部用真实 SHA-256。
@@ -74,32 +68,21 @@ type loaderEnv struct {
 	exited bool
 	// exitCodes 记录 System.exit 的实参，便于断言与 D1 失败路径一致。
 	exitCodes []int
+	// loadedLibs 记录 System.loadLibrary 的实参（壳必须加载守卫库）。
+	loadedLibs []string
 }
 
 // loaderFields 是各模拟类的字段表：Java 类名 -> 字段。
 var loaderFields = map[string][]*fakeField{}
 
-// aesCBCDecrypt 用 Go 标准库做 AES-CBC 解密并去除 PKCS#7 填充。
-func aesCBCDecrypt(key, iv, data []byte) ([]byte, error) {
-	blk, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("构造 AES 失败: %w", err)
+// key32 把 fakeBytes 里的密钥转成 pack.Decrypt 需要的定长数组。
+func key32(b []byte) ([32]byte, error) {
+	var k [32]byte
+	if len(b) != 32 {
+		return k, fmt.Errorf("密钥长度不是 32: %d", len(b))
 	}
-	if len(data) == 0 || len(data)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("密文长度 %d 非法", len(data))
-	}
-	out := make([]byte, len(data))
-	cipher.NewCBCDecrypter(blk, iv).CryptBlocks(out, data)
-	n := int(out[len(out)-1])
-	if n == 0 || n > aes.BlockSize || n > len(out) {
-		return nil, fmt.Errorf("填充字节非法 (%d)", n)
-	}
-	for _, b := range out[len(out)-n:] {
-		if int(b) != n {
-			return nil, fmt.Errorf("填充内容不一致")
-		}
-	}
-	return out[:len(out)-n], nil
+	copy(k[:], b)
+	return k, nil
 }
 
 // installLoaderMocks 注册 Loader 所需的全部框架 API 模拟。
@@ -173,61 +156,63 @@ func installLoaderMocks(env *loaderEnv) func() {
 	}
 	h["Ljava/io/InputStream;->close()V"] = noop
 
-	// ---- 密码学（真实 AES-CBC）----
-	h["Ljavax/crypto/Cipher;->getInstance(Ljava/lang/String;)Ljavax/crypto/Cipher;"] =
+	// ---- 载荷解密（真实 AES-256-SIV，与 .so 的 C 实现同规范）----
+	//
+	// 壳不再调用 javax.crypto 的 CBC，而是统一走 Native.sivDecrypt。这里用
+	// internal/pack 的 SIV 参照实现做真解密：端到端测试（打包加密 → 解释器
+	// 跑壳 → 得到明文）因此仍然是被真正证明的。
+	h[NativeBridgeClass+"->sivDecrypt([B[B[B)[B"] =
 		func(in *interp, regs []int) (int32, any, error) {
-			alg, ok := in.objs[regs[0]].(*fakeStr)
+			keyB, ok := in.objs[regs[0]].(*fakeBytes)
 			if !ok {
-				return 0, nil, errf("Cipher.getInstance 的实参不是字符串")
+				return 0, nil, errf("sivDecrypt 的密钥不是 byte[]")
 			}
-			if alg.s != cipherAlg {
-				return 0, nil, errf("Cipher 算法不符: %s", alg.s)
+			adB, ok := in.objs[regs[1]].(*fakeBytes)
+			if !ok {
+				return 0, nil, errf("sivDecrypt 的 ad 不是 byte[]")
 			}
-			return 0, &fakeCipher{}, nil
+			blob, ok := in.objs[regs[2]].(*fakeBytes)
+			if !ok {
+				return 0, nil, errf("sivDecrypt 的密文不是 byte[]")
+			}
+			k, err := key32(keyB.b)
+			if err != nil {
+				return 0, nil, err
+			}
+			plain, err := pack.DecryptNamed(blob.b, k, string(adB.b))
+			if err != nil {
+				// 与真 native 一致：SIV 校验失败返回 null，由壳走硬终止路径。
+				return 0, nil, nil
+			}
+			return 0, &fakeBytes{b: plain}, nil
 		}
-	h["Ljavax/crypto/Cipher;->init(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V"] =
+	// ad 必须是负载名的 UTF-8 字节：壳用 getBytes("UTF-8") 显式指定字符集。
+	h["Ljava/lang/String;->getBytes(Ljava/lang/String;)[B"] =
 		func(in *interp, regs []int) (int32, any, error) {
-			cp, ok := in.objs[regs[0]].(*fakeCipher)
+			s, ok := in.objs[regs[0]].(*fakeStr)
 			if !ok {
-				return 0, nil, errf("init 的接收者不是 Cipher")
+				return 0, nil, errf("String.getBytes 的接收者不是字符串")
 			}
-			if in.regs[regs[1]] != cipherDecryptMode {
-				return 0, nil, errf("Cipher 模式不是解密: %d", in.regs[regs[1]])
-			}
-			sks, ok := in.objs[regs[2]].(*fakeObj)
+			cs, ok := in.objs[regs[1]].(*fakeStr)
 			if !ok {
-				return 0, nil, errf("init 的密钥不是 SecretKeySpec")
+				return 0, nil, errf("String.getBytes 的字符集不是字符串")
 			}
-			ivs, ok := in.objs[regs[3]].(*fakeObj)
-			if !ok {
-				return 0, nil, errf("init 的 IV 不是 IvParameterSpec")
+			if cs.s != utf8Charset {
+				return 0, nil, errf("String.getBytes 的字符集应为 %s，实际 %s", utf8Charset, cs.s)
 			}
-			cp.key, _ = sks.aux.([]byte)
-			cp.iv, _ = ivs.aux.([]byte)
-			if len(cp.key) != 32 || len(cp.iv) != 16 {
-				return 0, nil, errf("密钥/IV 长度不符 key=%d iv=%d", len(cp.key), len(cp.iv))
+			return 0, &fakeBytes{b: []byte(s.s)}, nil
+		}
+	// 守卫库必须在首次解密之前加载：库名会被 C7 改名并同步改写，
+	// 这里只记录实参，具体值由 C7 的测试断言。
+	h["Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V"] =
+		func(in *interp, regs []int) (int32, any, error) {
+			s, ok := in.objs[regs[0]].(*fakeStr)
+			if !ok || s.s == "" {
+				return 0, nil, errf("System.loadLibrary 的库名不是非空字符串")
 			}
+			env.loadedLibs = append(env.loadedLibs, s.s)
 			return 0, nil, nil
 		}
-	h["Ljavax/crypto/Cipher;->doFinal([BII)[B"] = func(in *interp, regs []int) (int32, any, error) {
-		cp, ok := in.objs[regs[0]].(*fakeCipher)
-		if !ok {
-			return 0, nil, errf("doFinal 的接收者不是 Cipher")
-		}
-		buf, ok := in.objs[regs[1]].(*fakeBytes)
-		if !ok {
-			return 0, nil, errf("doFinal 的输入不是 byte[]")
-		}
-		off, n := int(in.regs[regs[2]]), int(in.regs[regs[3]])
-		if off < 0 || n < 0 || off+n > len(buf.b) {
-			return 0, nil, errf("doFinal 的区间非法")
-		}
-		plain, err := aesCBCDecrypt(cp.key, cp.iv, buf.b[off:off+n])
-		if err != nil {
-			return 0, nil, err
-		}
-		return 0, &fakeBytes{b: plain}, nil
-	}
 	h["Ljavax/crypto/spec/SecretKeySpec;-><init>([BLjava/lang/String;)V"] =
 		func(in *interp, regs []int) (int32, any, error) {
 			o, ok := in.objs[regs[0]].(*fakeObj)
@@ -237,19 +222,6 @@ func installLoaderMocks(env *loaderEnv) func() {
 			b, ok := in.objs[regs[1]].(*fakeBytes)
 			if !ok {
 				return 0, nil, errf("SecretKeySpec 的密钥不是 byte[]")
-			}
-			o.aux = append([]byte(nil), b.b...)
-			return 0, nil, nil
-		}
-	h["Ljavax/crypto/spec/IvParameterSpec;-><init>([B)V"] =
-		func(in *interp, regs []int) (int32, any, error) {
-			o, ok := in.objs[regs[0]].(*fakeObj)
-			if !ok {
-				return 0, nil, errf("IvParameterSpec 构造的接收者类型不对")
-			}
-			b, ok := in.objs[regs[1]].(*fakeBytes)
-			if !ok {
-				return 0, nil, errf("IvParameterSpec 的 IV 不是 byte[]")
 			}
 			o.aux = append([]byte(nil), b.b...)
 			return 0, nil, nil
@@ -720,7 +692,7 @@ func TestLoaderDecryptRoundTrip(t *testing.T) {
 	if !strings.Contains(env.dexPath, "/ag/d0.dex") {
 		t.Fatalf("DexClassLoader 的 dexPath 不含落地文件: %q", env.dexPath)
 	}
-	t.Logf("B3：载荷 AES-CBC 解密还原成功（%d 字节），dexPath=%s", len(got), env.dexPath)
+	t.Logf("B3：载荷 AES-256-SIV 解密还原成功（%d 字节），dexPath=%s", len(got), env.dexPath)
 }
 
 // TestLoaderMarksDexReadOnly 验证落地的 DEX 被标记为只读。
@@ -1152,37 +1124,36 @@ var (
 	}
 )
 
-// mustEncrypt 用与 internal/pack 一致的算法把明文加密为「IV ‖ 密文」。
+// mustEncrypt 用 internal/pack 的 AES-256-SIV 参照实现加密载荷（ad 为空串）。
 //
-// 这里不直接调用 pack.Encrypt 是为了让本测试自带参照实现：
-// 若 go 侧实现与 Dalvik 侧壳代码同时出错，仍能与这里的独立实现对照出来。
+// SIV 不需要 IV，输出由 (key, ad, 明文) 唯一确定；iv 形参仅保留以兼容
+// 既有调用点（多数测试的 LoaderItem 不带 Name，ad 即空串）。
+// 需要非空 ad 的测试用 mustEncryptAd，且 LoaderItem/LoaderLibItem.Name
+// 必须与之逐字节一致，否则壳侧 SIV 校验会失败。
 func mustEncrypt(t *testing.T, plain []byte, key [32]byte, iv [16]byte) []byte {
 	t.Helper()
-	blk, err := aes.NewCipher(key[:])
-	if err != nil {
-		t.Fatalf("构造 AES 失败: %v", err)
-	}
-	n := aes.BlockSize - len(plain)%aes.BlockSize
-	padded := make([]byte, len(plain)+n)
-	copy(padded, plain)
-	for i := len(plain); i < len(padded); i++ {
-		padded[i] = byte(n)
-	}
-	out := make([]byte, 16, 16+len(padded))
-	copy(out, iv[:])
-	body := make([]byte, len(padded))
-	cipher.NewCBCEncrypter(blk, iv[:]).CryptBlocks(body, padded)
-	return append(out, body...)
+	_ = iv // SIV 无 IV
+	return mustEncryptAd(t, plain, key, "")
 }
 
-// mustEncryptMAC 是用 Go 参照实现产出的「IV ‖ 密文 ‖ HMAC-SHA256」载荷。
+// mustEncryptAd 指定 ad（载荷逻辑名）做 AES-256-SIV 加密。
+func mustEncryptAd(t *testing.T, plain []byte, key [32]byte, ad string) []byte {
+	t.Helper()
+	blob, err := pack.EncryptNamed(plain, key, ad)
+	if err != nil {
+		t.Fatalf("SIV 加密失败: %v", err)
+	}
+	return blob
+}
+
+// mustEncryptMAC 产出「SIV 标签‖密文‖HMAC-SHA256」载荷。
 //
-// 与 mustEncrypt 同理，这里自带独立实现（而不是调用 internal/pack），
-// 以便壳侧字节码与 pack 实现同时出错时仍能对照出来。域分离串与
-// loader.go 的 macDomain 必须一致。
+// MAC 部分仍用独立实现（域分离串与 loader.go 的 macDomain 必须一致），
+// 而密文本体交给 pack 的 SIV 实现，保证「打包 → 壳」两侧对的是同一规范。
 func mustEncryptMAC(t *testing.T, plain []byte, key [32]byte, iv [16]byte, name string) []byte {
 	t.Helper()
-	body := mustEncrypt(t, plain, key, iv)
+	_ = iv // SIV 无 IV
+	body := mustEncryptAd(t, plain, key, name)
 	mkSum := sha256.Sum256(append(append([]byte(nil), key[:]...), []byte("apkguard/payload-mac")...))
 	mac := hmac.New(sha256.New, mkSum[:])
 	mac.Write([]byte(name))
@@ -1394,9 +1365,9 @@ func TestLoaderMACRoundTrip(t *testing.T) {
 
 // TestLoaderMACTamperFails 验证篡改载荷任意关键字节都会让壳在解密前硬终止。
 //
-// 这是 MAC 存在的全部意义所在：没有它，CBC 的单字节篡改可能仍通过填充校验
-// 并被加载。三个子用例分别覆盖密文区、tag 区与 IV 区，外加「换一个 name」
-// （证明 MAC 绑定了载荷身份，而不是只绑定字节）。
+// 这是 MAC 存在的全部意义所在：它要求壳在解密**之前**就检出篡改。三个子用例
+// 分别覆盖密文区、tag 区与 SIV 标签区，外加「换一个 name」（证明 MAC 绑定了
+// 载荷身份，而不是只绑定字节）。
 func TestLoaderMACTamperFails(t *testing.T) {
 	key := testPackKey
 	plain := bytes.Repeat([]byte{0x33}, 200)
@@ -1407,9 +1378,9 @@ func TestLoaderMACTamperFails(t *testing.T) {
 		label  string
 		mutate func([]byte)
 	}{
-		{"密文字节", func(b []byte) { b[20] ^= 0x01 }},         // IV(16) 之后的密文区
+		{"密文字节", func(b []byte) { b[20] ^= 0x01 }},         // SIV 标签(16) 之后的密文区
 		{"tag 字节", func(b []byte) { b[len(b)-1] ^= 0x01 }}, // 尾部 HMAC
-		{"IV 字节", func(b []byte) { b[0] ^= 0x01 }},         // IV 必须被 MAC 覆盖
+		{"SIV 标签字节", func(b []byte) { b[0] ^= 0x01 }},      // SIV 标签必须被 MAC 覆盖
 	}
 	for _, tc := range tampers {
 		t.Run(tc.label, func(t *testing.T) {
@@ -1496,10 +1467,10 @@ func TestLoaderMACDisabledNoMACInstructions(t *testing.T) {
 func TestLoaderLibDecryptAndSearchPath(t *testing.T) {
 	key := testPackKey
 	dexPlain := Empty()
-	dexBlob := mustEncrypt(t, dexPlain, key, testPackIV)
+	// 载荷名同时是 SIV 的 ad（绑定输入），加密与壳侧必须用同一个名字。
+	dexBlob := mustEncryptAd(t, dexPlain, key, "classes.dex")
 	libPlain := []byte("\x7fELF\x02\x01\x01\x00libfoo-for-c2-test")
-	libIV := [16]byte{0xaa, 0xbb, 0xcc, 0xdd, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
-	libBlob := mustEncrypt(t, libPlain, key, libIV)
+	libBlob := mustEncryptAd(t, libPlain, key, "libfoo.so")
 
 	ls := &LoaderSpec{
 		Class: "Lcom/apkguard/shell/Loader;", Key: key, TempDir: "ag",

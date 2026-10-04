@@ -69,8 +69,8 @@ func TestEncryptDexE2E(t *testing.T) {
 		if _, err := dex.Parse(e.Raw); err == nil {
 			t.Fatalf("载荷 %s 竟然仍是合法 DEX（未被加密）", p.Asset)
 		}
-		// ③ 用清单中的密钥必须能还原出原始明文
-		got, err := pack.Decrypt(p.Blob, sp.Key)
+		// ③ 用清单中的密钥 + 原始 DEX 名（SIV 的 AD）必须能还原出原始明文
+		got, err := pack.DecryptNamed(p.Blob, sp.Key, p.Name)
 		if err != nil {
 			t.Fatalf("载荷 %s 解密失败: %v", p.Asset, err)
 		}
@@ -234,9 +234,9 @@ func TestPackMACB1(t *testing.T) {
 	if !bytes.Equal(got, real) {
 		t.Fatal("带 MAC 载荷还原结果与原始 DEX 不一致")
 	}
-	// 不带 tag 的旧式 Decrypt 必须失败（否则说明 tag 没被排除在 CBC 之外）。
-	if _, err := pack.Decrypt(it.Blob, sp.Key); err == nil {
-		t.Fatal("未剥离 tag 时 Decrypt 不应成功")
+	// 不带 tag 的 DecryptNamed 必须失败（否则说明 tag 没被排除在 SIV 密文之外）。
+	if _, err := pack.DecryptNamed(it.Blob, sp.Key, it.Name); err == nil {
+		t.Fatal("未剥离 tag 时 DecryptNamed 不应成功")
 	}
 	// 空操作缺陷已修：必须有统计与 Note 证据。
 	if art.Stats["B1.mac"] != "1" {
@@ -280,8 +280,8 @@ func TestPackNoMACCompatDisabled(t *testing.T) {
 	if !bytes.Equal(it.Blob, want[0].Blob) {
 		t.Fatal("未启用 MAC 的产物格式与旧版不一致")
 	}
-	if got, err := pack.Decrypt(it.Blob, sp.Key); err != nil || !bytes.Equal(got, real) {
-		t.Fatal("未启用 MAC 时解密行为应不变")
+	if got, err := pack.DecryptNamed(it.Blob, sp.Key, it.Name); err != nil || !bytes.Equal(got, real) {
+		t.Fatal("未启用 MAC 时应能按原始 DEX 名解密")
 	}
 	if art.Stats["B1.mac"] != "0" {
 		t.Fatalf("B1.mac 应为 0: %v", art.Stats)

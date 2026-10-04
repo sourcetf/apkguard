@@ -30,13 +30,13 @@ Java 层 `System.loadLibrary` 调用点仍可静态看到库名。C2 只解决
 - `lib/<abi>/` 下业务 .so 数量：**N → 0**（若同时启用 C1，则只剩
   `libapkguard.so` 这 1 个由加固工具自己注入的库）。
 - assets 下新增密文载荷数：**= 原 .so 总数**；每个载荷体积 ≈ 原 .so + 16 字节 IV
-  （复用 `internal/pack` 的 `IV ‖ AES-256-CBC(PKCS7)` 格式，与 B1 一致）。
+  （复用 `internal/pack` 的 `[SIV 16B] ‖ AES-256-CTR` 格式，与 B1 一致）。
 - 静态工具判定：`file` 对载荷输出 `data`（非 `ELF`）；`readelf` 报
   `Not an ELF file`。
 - 启动开销：每个 .so 多一次「读 assets + AES 解密 + 写私有目录」，
   典型 5~30 ms/库（视体积），且只在首次启动；后续可做「已存在且校验通过则跳过」。
 - 体积增量：≈ 0（原 .so 从 `lib/` 移除，密文写入 assets，密文与原文等长；
-  AES-CBC 填充最多 +16 字节）。**注意**：若原 .so 是压缩存放，移除后
+  SIV 无填充、密文与明文等长，只多 16 字节标签）。**注意**：若原 .so 是压缩存放，移除后
   assets 密文按 STORED 存，体积可能略微增大。
 
 ---
@@ -48,7 +48,7 @@ Java 层 `System.loadLibrary` 调用点仍可静态看到库名。C2 只解决
 #### (a) 整文件加密（推荐首期）
 
 **做法**：把 `lib/<abi>/*.so` 从 APK 移除，逐个用 `pack.Encrypt`
-（AES-256-CBC，`IV ‖ 密文`）加密后作为 `assets/` 条目存放；壳在
+（AES-SIV，`[SIV] ‖ 密文`）加密后作为 `assets/` 条目存放；壳在
 `attachBaseContext` 的最早时机把每个库解密写到应用私有目录
 （如 `<dataDir>/app_ag/lib/`），把该目录（可再拼上原 `nativeLibraryDir`）
 作为 `DexClassLoader` 的 `librarySearchPath`，随后 B3 照常接管 ClassLoader。
@@ -213,7 +213,7 @@ RustDesk 启动失败，且无法用 `librarySearchPath` 挽救。**这一条必
 - **整文件加密 (a) 天然保持**：加密只改变字节内容，不改变文件长度、
   不改变任何 ELF 偏移与 `p_align`。原库是 0x4000 就是 0x4000。
 - **数据段加密 (b) 也保持**：原地加密不改变布局，前提是**绝不允许改动
-  文件大小/段偏移**（只做等长异或/流加密）。若用 AES-CBC 这种会填充的算法
+  文件大小/段偏移**（只做等长异或/流加密）。若用会填充的算法（如 CBC）
   直接原地加密，长度会变，段偏移全废——(b) 若实施，必须用**等长**变换
   （CTR/异或密钥流），这是硬约束。
 - **必须警惕的既有缺口**：Android 15（API 35）起，16KB 页设备要求所有

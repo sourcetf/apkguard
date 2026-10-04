@@ -139,13 +139,13 @@ func (e *encryptDex) Run(_ context.Context, art *pipeline.Artifact, opts *config
 	plainTotal := pack.TotalPlain(payloads)
 	blobTotal := pack.TotalBlob(payloads)
 	if opts.PayloadMAC {
-		art.Note("B1 DEX 整体加密：%d 个 DEX → %d 份 AES-256-CBC 载荷（%d → %d 字节），明文 DEX 已移除；"+
+		art.Note("B1 DEX 整体加密：%d 个 DEX → %d 份 AES-256-SIV 载荷（%d → %d 字节），明文 DEX 已移除；"+
 			"每份载荷尾部附 32 字节 HMAC-SHA256（encrypt-then-MAC，绑定原始 DEX 名），壳解密前先校验；载荷名 %s",
 			len(payloads), len(payloads), plainTotal, blobTotal, assetSample(payloads))
 		art.Stat("B1.mac", "1")
 		art.Stat("B1.mac_bytes", fmt.Sprint(pack.TagSize*len(payloads)))
 	} else {
-		art.Note("B1 DEX 整体加密：%d 个 DEX → %d 份 AES-256-CBC 载荷（%d → %d 字节），明文 DEX 已移除；载荷名 %s",
+		art.Note("B1 DEX 整体加密：%d 个 DEX → %d 份 AES-256-SIV 载荷（%d → %d 字节），明文 DEX 已移除；载荷名 %s",
 			len(payloads), len(payloads), plainTotal, blobTotal, assetSample(payloads))
 		art.Stat("B1.mac", "0")
 	}

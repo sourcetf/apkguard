@@ -158,7 +158,7 @@
 
 1. **完整双 APK（路线 A，PackageInstaller 二次安装）：已实现（可选，默认关闭），不作为
    默认架构。** 实现与样本同一模型但不依赖任何 Android 构建链：宿主 Manifest/宿主 DEX 全部
-   手工合成，原应用在**签名之后**整体以 AES-256-CBC（IV 由 seed 派生，密钥以字节数组内联在
+   手工合成，原应用在**签名之后**整体以 AES-SIV（RFC 5297，密钥以字节数组内联在
    宿主 DEX）加密进 `assets/<随机名>.zip`，宿主启动后解密落地到
    `getExternalFilesDir()/plugins/`，再用 `PackageInstaller` 会话调起系统安装器；宿主 DEX
    不引用任何 `dalvik/system/*`。代价依旧存在且必须由使用者显式承担：需要

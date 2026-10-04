@@ -389,6 +389,14 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		return fmt.Errorf("B3 已启用但没有任何加密载荷：请检查 B1 是否真的产生了载荷")
 	}
 
+	// 载荷解密改走 Native.sivDecrypt（AES-256-SIV）后，解密只能由守卫库
+	// 完成，因此 B1/B5/B6/B8/C2 这些需要解密载荷的链路必须带守卫库与
+	// native 桥接类。C1 启用时由 C1 负责注入（它注册在 B3 之后）；
+	// 这里补 C1 未启用的组合，两者互斥，不会重复注入。
+	if err := ensurePayloadGuard(art, info, opts); err != nil {
+		return err
+	}
+
 	entry := pipeline.Find(art, info.EntryName)
 	if entry == nil {
 		return fmt.Errorf("未找到 B2 注入的壳 DEX 条目 %s", info.EntryName)
@@ -826,26 +834,46 @@ func (d *nativeKeyDerive) Run(_ context.Context, art *pipeline.Artifact, opts *c
 	}
 	_ = digest // 密钥由 B1 自行派生（同一纯函数），此处只需校验摘要可得
 
-	// 注入原生库。
-	//
-	// **只补 APK 已经支持的 ABI**：系统是从「lib/<abi>/ 下有没有文件」来判断
-	// 一个应用支持哪些架构的。若给一个只有 arm64 库的 APK 补上 armeabi-v7a
-	// 的 libapkguard.so，系统就会认为它支持 32 位 ARM，放它装到这类设备上——
-	// 而应用自己的 32 位库并不存在，装上就是一启动就崩。
-	//
-	// 反过来，APK 完全没有原生库时（纯 Java 应用）不存在这个问题，
-	// 此时由我们决定支持哪些架构，补齐全部 ABI 即可。
-	libs, err := native.Prebuilt()
+	// 注入守卫库与桥接类（ABI 选择见 embedGuardLibs 的注释）。
+	added, target, err := embedGuardLibs(art)
 	if err != nil {
 		return err
 	}
+	if err := injectNativeBridge(art, info, opts, true); err != nil {
+		return err
+	}
+
+	art.Note("C1 密钥 native 派生：载荷密钥改由 libapkguard.so 派生（种子仅在 native 层，且混入签名摘要），已注入 %d 个 ABI 的原生库与桥接类 %s",
+		added, dex.NativeBridgeJavaName)
+	art.Stat("C1.libs", fmt.Sprint(added))
+	art.Stat("C1.bytes", fmt.Sprint(native.TotalSize(target)))
+	art.Stat("C1.bridge", dex.NativeBridgeJavaName)
+	return nil
+}
+
+// ---- 守卫库与 native 桥接类的共用注入逻辑 ----
+
+// embedGuardLibs 把预编译守卫库按产物支持的 ABI 补进 lib/，返回本次真正
+// 新增的库个数与目标库列表。
+//
+// ABI 选择规则（与 C1 历史行为一致，不可简化）：
+//
+//   - **只补 APK 已经支持的 ABI**：系统是从「lib/<abi>/ 下有没有文件」来判断
+//     一个应用支持哪些架构的。若给一个只有 arm64 库的 APK 补上 armeabi-v7a
+//     的守卫库，系统就会认为它支持 32 位 ARM，放它装到这类设备上——而应用
+//     自己的 32 位库并不存在，装上就是一启动就崩。
+//   - APK 完全没有原生库时（纯 Java 应用）不存在这个问题，补齐全部 ABI。
+//   - ABI 选择优先用 C2 记录的原生库 ABI 集合：C2 把业务 .so 移出 lib/ 后，
+//     abisOf 会返回空集合，于是走「完全没有原生库」分支、给全部 3 个 ABI
+//     都注入。C2 在移除前把原集合写入 Shared，这里优先读取；否则回退扫描。
+//
+// 幂等：已存在的条目跳过，重复调用不会产生重名条目。
+func embedGuardLibs(art *pipeline.Artifact) (int, []native.AbiLib, error) {
+	libs, err := native.Prebuilt()
+	if err != nil {
+		return 0, nil, err
+	}
 	target := libs
-	// ABI 选择优先用 C2 记录的原生库 ABI 集合：C2 把业务 .so 移出 lib/ 后，
-	// abisOf 会返回空集合，于是走「APK 完全没有原生库」分支、给全部 3 个
-	// ABI 都注入 libapkguard.so。后果是一个只支持 arm64 的应用被系统判定
-	// 为也支持 armeabi-v7a，可能被装到 32 位设备上而业务库不存在，一装就崩。
-	//
-	// C2 在移除前把原集合写入 Shared，这里优先读取；否则回退到扫描 lib/。
 	own := abisOf(art)
 	if c2 := soAbisOf(art); len(c2) > 0 {
 		own = c2
@@ -858,7 +886,7 @@ func (d *nativeKeyDerive) Run(_ context.Context, art *pipeline.Artifact, opts *c
 			}
 		}
 		if len(target) == 0 {
-			return fmt.Errorf("APK 自带原生库的 ABI（%s）不在预编译库覆盖范围内（%s），无法注入",
+			return 0, nil, fmt.Errorf("APK 自带原生库的 ABI（%s）不在预编译库覆盖范围内（%s），无法注入",
 				strings.Join(abiNames(own), "、"), native.AbiNames())
 		}
 	}
@@ -870,30 +898,51 @@ func (d *nativeKeyDerive) Run(_ context.Context, art *pipeline.Artifact, opts *c
 		pipeline.Add(art, zipx.NewStored(l.Entry, l.Data))
 		added++
 	}
+	return added, target, nil
+}
 
-	// 注入桥接类（提供 derive/sig，并负责 loadLibrary）。
+// injectNativeBridge 往壳 DEX 注入 native 桥接类（loadLibrary + sig，
+// needDerive 时再加 derive，sivDecrypt 始终声明）。
+//
+// sivDecrypt 必须始终声明：载荷解密只能由守卫库完成（JCA 没有 AES-SIV），
+// 与密钥是否由 native 派生无关。
+func injectNativeBridge(art *pipeline.Artifact, info *shellInfo, opts *config.Options, needDerive bool) error {
 	bridge := &dex.NativeBridgeSpec{
-		Class:      dex.NativeBridgeClass,
-		LibName:    dex.NativeLibName,
-		NeedDerive: true,
-		NeedDebug:  opts.IsEnabled("C4"),
-		NeedHooked: opts.IsEnabled("C5"),
-		NeedIntact: opts.IsEnabled("C6"),
-		NeedWatch:  opts.IsEnabled("D4"),
+		Class:       dex.NativeBridgeClass,
+		LibName:     dex.NativeLibName,
+		NeedDecrypt: true,
+		NeedDerive:  needDerive,
+		NeedDebug:   opts.IsEnabled("C4"),
+		NeedHooked:  opts.IsEnabled("C5"),
+		NeedIntact:  opts.IsEnabled("C6"),
+		NeedWatch:   opts.IsEnabled("D4"),
 	}
 	add, err := dex.NativeBridgeAddition(bridge)
 	if err != nil {
 		return err
 	}
-	if err := injectShellClass(art, info, add); err != nil {
+	return injectShellClass(art, info, add)
+}
+
+// ensurePayloadGuard 在未启用 C1 时保证「解密载荷所需」的守卫库与桥接类存在。
+//
+// CBC 换成 SIV 后，解密唯一路径是 Native.sivDecrypt，因此 B1/B5/B6/B8/C2
+// 这些需要解密载荷的链路都必须带守卫库。C1 启用时由 C1 注入（它注册在
+// B3 之后），这里只补 C1 未启用的组合——两者互斥，桥接类不会重复定义。
+func ensurePayloadGuard(art *pipeline.Artifact, info *shellInfo, opts *config.Options) error {
+	if info.NativeKey != "" {
+		return nil // C1 会注入（含 derive）
+	}
+	added, _, err := embedGuardLibs(art)
+	if err != nil {
 		return err
 	}
-
-	art.Note("C1 密钥 native 派生：载荷密钥改由 libapkguard.so 派生（种子仅在 native 层，且混入签名摘要），已注入 %d 个 ABI 的原生库与桥接类 %s",
+	if err := injectNativeBridge(art, info, opts, false); err != nil {
+		return err
+	}
+	art.Note("B3 载荷解密走 Native.sivDecrypt（AES-256-SIV）：已注入 %d 个 ABI 的守卫库与桥接类 %s",
 		added, dex.NativeBridgeJavaName)
-	art.Stat("C1.libs", fmt.Sprint(added))
-	art.Stat("C1.bytes", fmt.Sprint(native.TotalSize(target)))
-	art.Stat("C1.bridge", dex.NativeBridgeJavaName)
+	art.Stat("B3.guard_libs", fmt.Sprint(added))
 	return nil
 }
 

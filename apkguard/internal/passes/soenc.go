@@ -17,8 +17,8 @@ import (
 
 // ---- C2 SO 加壳（整文件加密） ----
 //
-// 做法：把 lib/<abi>/*.so 从 APK 移除，逐个用 pack.Encrypt（AES-256-CBC，
-// 「IV ‖ 密文」）加密后存进 assets/；壳（B3 的 Loader）在 attachBaseContext
+// 做法：把 lib/<abi>/*.so 从 APK 移除，逐个用 pack.EncryptNamed（AES-256-SIV，
+// 「SIV 标签 ‖ CTR 密文」，AD 绑定原始库名）加密后存进 assets/；壳（B3 的 Loader）在 attachBaseContext
 // 里把它们解密落地到应用私有目录，并把该目录并入库搜索路径。
 //
 // 完整性：启用 -payload-mac 时，库载荷追加与 B1 **同规格**的
@@ -53,7 +53,7 @@ type soItem struct {
 	Entry string
 	// Asset 是加密载荷在 APK 中的条目名。
 	Asset string
-	// Size 是载荷字节数（含前置 IV；启用 -payload-mac 时还含尾部 32 字节 tag）。
+	// Size 是载荷字节数（含前置 16 字节 SIV 标签；启用 -payload-mac 时还含尾部 32 字节 tag）。
 	Size int
 	// Plain 是原始 .so 字节数，用于报告。
 	Plain int
@@ -263,13 +263,15 @@ func (e *encryptNativeLibs) Run(_ context.Context, art *pipeline.Artifact, opts 
 		}
 		used[asset] = true
 
-		blob, err := pack.Encrypt(data, key, pack.IVFromSeed(opts.Seed+"/so/"+t.abi+"/"+t.name))
+		// SIV 的 AD 绑定原始库名（与壳侧 c(blob,key,drop,name) 传入的 it.Name 一致）；
+		// 未启用 MAC 时名字绑定由 SIV 自身保证，启用时外层 HMAC 还会再绑定一次。
+		blob, err := pack.EncryptNamed(data, key, t.name)
 		if err != nil {
 			return fmt.Errorf("加密 %s 失败: %w", t.entry.NameString(), err)
 		}
 		if opts.PayloadMAC {
 			// 与 B1 完全同规格的 encrypt-then-MAC：tag = HMAC-SHA256(macKey,
-			// 原始库名 ‖ IV‖密文)，追加在密文尾部。
+			// 原始库名 ‖ SIV‖密文)，追加在密文尾部。
 			//
 			// 绑定**原始库名**（t.name，如 "libfoo.so"）而不是 assets 条目名：
 			// 与 B1 绑定原始 DEX 名同理，改名后的合法产物在校验侧仍能对上，

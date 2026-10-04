@@ -4,20 +4,25 @@
 // 密码学与命名这两件可独立验证的事，不涉及 Manifest 改写与 ClassLoader 接管
 // （那些在 passes 层完成）。
 //
-// 算法选择说明：采用 AES-256-CBC + PKCS#7，而不是 GCM。原因是壳需要在
-// Android 5.0+ 全版本上运行，而 javax.crypto 的 "AES/GCM/NoPadding" 在
-// 早期版本上存在兼容问题；CBC 是 Android 全版本都稳定可用的模式。
-// 完整性校验默认由外层 APK 签名（E1）保证；可选的载荷 MAC（PayloadMAC）
-// 用 HMAC-SHA256 做 encrypt-then-MAC 的纵深防御，见下文 TagSize/MAC。
-// 之所以不改成 GCM：本包的 IV 由 IVFromSeed 确定性派生，同一 seed 下
-// 每次加固的 IV 完全相同，而 GCM 在同一密钥下复用 IV 会灾难性地泄漏
-// 认证密钥（比 CBC 可延展性更糟）；改用 GCM 必须引入随机 IV，会打破
-// 「产物可复现」的既有承诺。HMAC-SHA256 自 API 1 起可用，不抬高 minAPI。
+// 算法选择说明：载荷加密采用 **AES-256-SIV**（RFC 5297，AES-SIV-CMAC-512），
+// 输出为「SIV 标签(16B) ‖ AES-CTR 密文」，密文长度与明文相同（无填充），
+// 详见 siv.go。
+//
+// 为什么是 SIV 而不是 GCM/OCB：（1）本方案承诺「同一 seed + 同一输入产出
+// 逐字节相同的产物」且有测试钉住，因此 nonce/IV 必须是确定性派生甚至根本
+// 不存在——而 GCM/OCB 在同一密钥下复用 nonce 会灾难性地泄漏认证密钥（GHASH
+// 密钥可被恢复），确定性 nonce 对它们是致命伤；（2）SIV 恰好是为「nonce 可
+// 预测/可能复用」的场景设计的（nonce-misuse resistant）：即使重复，也只泄漏
+// 「相同明文 + 相同 AD」这一事实，完整性不受影响；（3）SIV 自带完整性——
+// 解密时重算 S2V 并常量时间比较，篡改密文/标签/AD 一律失败，不再依赖填充
+// 校验这种非完整性检查。可选的载荷 MAC（PayloadMAC）继续保留：HMAC-SHA256
+// 对「name ‖ SIV‖密文」做 encrypt-then-MAC，作为外层纵深防御并绑定逻辑名。
+//
+// 密钥：主密钥 32 字节（Key(secret) 派生，C1 生效时来自 native），再域分离
+// 成 K1（S2V/CMAC）与 K2（CTR）各 32 字节，见 sivDeriveKeys。
 package pack
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -27,9 +32,9 @@ import (
 
 // 密码学参数。
 const (
-	// KeySize 是 AES-256 的密钥长度。
+	// KeySize 是 AES-256 的密钥长度（SIV 的两把子密钥各自再由它派生）。
 	KeySize = 32
-	// BlockSize 是 AES 的分组长度，也是 IV 长度。
+	// BlockSize 是 AES 的分组长度，也是 SIV 标签长度。
 	BlockSize = 16
 	// TagSize 是 HMAC-SHA256 校验标签的长度。
 	TagSize = 32
@@ -67,7 +72,10 @@ func RandomKey() ([KeySize]byte, error) {
 	return k, nil
 }
 
-// RandomIV 生成一个随机 IV（用于需要不可预测性的场景）。
+// RandomIV 生成一个随机 IV（CBC 时代的遗留辅助，载荷加密已不使用）。
+//
+// 仅保留给仍按「IV 参数」调用 Encrypt 的调用方（该参数已被忽略），
+// 以及需要随机字节的其它场景。
 func RandomIV() ([BlockSize]byte, error) {
 	var iv [BlockSize]byte
 	if _, err := rand.Read(iv[:]); err != nil {
@@ -78,8 +86,8 @@ func RandomIV() ([BlockSize]byte, error) {
 
 // IVFromSeed 由种子确定性地派生 IV。
 //
-// 加固产物必须可复现（便于排查问题），因此默认走这条路径；
-// IV 不需要保密，可预测性不影响 CBC 的安全性前提。
+// SIV 不需要 IV，载荷路径已不再使用本函数；保留是因为仍有调用方把它
+// 传给 Encrypt 的 iv 参数（该参数现被忽略），避免无谓的跨包改动。
 func IVFromSeed(seed string) [BlockSize]byte {
 	sum := sha256.Sum256([]byte("apkguard/iv/" + seed))
 	var iv [BlockSize]byte
@@ -87,69 +95,47 @@ func IVFromSeed(seed string) [BlockSize]byte {
 	return iv
 }
 
-// pkcs7Pad 按 PKCS#7 填充到分组长度整数倍。
-func pkcs7Pad(data []byte, blockSize int) []byte {
-	n := blockSize - len(data)%blockSize
-	out := make([]byte, len(data)+n)
-	copy(out, data)
-	for i := len(data); i < len(out); i++ {
-		out[i] = byte(n)
-	}
-	return out
-}
-
-// pkcs7Unpad 去除 PKCS#7 填充。
-func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
-	if len(data) == 0 || len(data)%blockSize != 0 {
-		return nil, fmt.Errorf("pack: 密文长度 %d 不是分组长度 %d 的整数倍", len(data), blockSize)
-	}
-	n := int(data[len(data)-1])
-	if n == 0 || n > blockSize || n > len(data) {
-		return nil, fmt.Errorf("pack: 填充字节非法 (%d)", n)
-	}
-	for _, b := range data[len(data)-n:] {
-		if int(b) != n {
-			return nil, fmt.Errorf("pack: 填充内容不一致")
-		}
-	}
-	return data[:len(data)-n], nil
-}
-
-// Encrypt 用 AES-256-CBC 加密，返回「IV ‖ 密文」。
+// Encrypt 用 AES-256-SIV 加密，返回「SIV 标签(16B) ‖ AES-CTR 密文」。
 //
-// IV 前置存放，使解密方无需额外传递参数——壳只需要一个 assets 条目即可完成解密。
+// 密文长度等于明文长度（不做任何填充）；解密必须校验 SIV（见 Decrypt）。
+// iv 参数是 CBC 时代的遗物，为兼容既有调用方而保留并被**忽略**：SIV 不需要
+// IV/nonce，同一 key + 同一明文永远得到逐字节相同的密文（确定性的可复现保证）。
+//
+// 本函数使用**零长度 AD 组件**（等价于 EncryptNamed(name="")），S2V 组件为
+// ["", 明文]；需要把载荷与逻辑名绑定时用 EncryptNamed——载荷路径
+// （Make/MakeMAC/C2）正是走那条路径。壳侧统一以 ad 字节数组为参数
+// （无名字时传空数组）即可与两侧对上。
 func Encrypt(plain []byte, key [KeySize]byte, iv [BlockSize]byte) ([]byte, error) {
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, fmt.Errorf("pack: 构造 AES 失败: %w", err)
-	}
-	padded := pkcs7Pad(plain, BlockSize)
-	out := make([]byte, BlockSize+len(padded))
-	copy(out, iv[:])
-	cipher.NewCBCEncrypter(block, iv[:]).CryptBlocks(out[BlockSize:], padded)
-	return out, nil
+	_ = iv // 保留参数仅为签名兼容；SIV 不使用 IV
+	return EncryptNamed(plain, key, "")
 }
 
-// Decrypt 解密 Encrypt 的产物（「IV ‖ 密文」）。
+// EncryptNamed 与 Encrypt 相同，但把逻辑名 name 作为 S2V 的 AD 组件。
 //
-// 该函数是壳侧解密逻辑的参考实现：壳在 Dalvik 层用 javax.crypto 做同样的事，
-// 测试通过它来验证「加密结果确实能被正确还原」。
+// 绑定名字使不同载荷的密文无法互换、也无法在不知道名字的情况下伪造：
+// 即使外层 HMAC 被关闭，SIV 校验也会拒绝用错误名字解密。
+// name 取「原始逻辑名」——B1/B6 的 Payload.Name（原始 DEX 名）、
+// C2 的原始库名，而不是容器化/B8 改名后的 assets 条目名。
+func EncryptNamed(plain []byte, key [KeySize]byte, name string) ([]byte, error) {
+	k1, k2 := sivDeriveKeys(key)
+	return sivSeal(k1[:], k2[:], [][]byte{[]byte(name), plain})
+}
+
+// Decrypt 解密 Encrypt 的产物（「SIV 标签(16B) ‖ CTR 密文」）。
+//
+// 该函数是壳侧解密逻辑的参考实现（壳在 Dalvik/native 层做同样的事）：
+// 先用标签作 CTR 计数器初值解出明文，再重算 S2V 并常量时间比较，不一致
+// 返回错误——不存在「只解密不校验」的用法。
 func Decrypt(blob []byte, key [KeySize]byte) ([]byte, error) {
-	if len(blob) < BlockSize*2 {
-		return nil, fmt.Errorf("pack: 密文过短 (%d 字节)", len(blob))
-	}
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return nil, fmt.Errorf("pack: 构造 AES 失败: %w", err)
-	}
-	iv := blob[:BlockSize]
-	body := blob[BlockSize:]
-	if len(body)%BlockSize != 0 {
-		return nil, fmt.Errorf("pack: 密文长度 %d 非法", len(body))
-	}
-	out := make([]byte, len(body))
-	cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, body)
-	return pkcs7Unpad(out, BlockSize)
+	return DecryptNamed(blob, key, "")
+}
+
+// DecryptNamed 解密 EncryptNamed 的产物（AD = 逻辑名）。
+//
+// 与 EncryptNamed 配对；DecryptMAC 内部也走这条路径（先验 HMAC 再验 SIV）。
+func DecryptNamed(blob []byte, key [KeySize]byte, name string) ([]byte, error) {
+	k1, k2 := sivDeriveKeys(key)
+	return sivOpen(k1[:], k2[:], [][]byte{[]byte(name)}, blob)
 }
 
 // MacKey 从 AES 密钥做域分离派生出 HMAC-SHA256 的密钥。
@@ -172,8 +158,9 @@ func MacKey(key [KeySize]byte) [32]byte {
 // B8（载荷容器化）在 B1 之后会重命名 Asset，若用 Asset 做 MAC 输入，
 // 容器化后的合法产物在壳侧算出的 MAC 与打包时不一致，会启动即失败。
 //
-// body 是「IV ‖ 密文」，即 Encrypt 的完整产物；tag 追加在它之后，
-// 形成 encrypt-then-MAC 布局，使壳可以先验 MAC 再解密，消除 CBC 填充 oracle。
+// body 是「SIV 标签 ‖ 密文」，即 Encrypt/EncryptNamed 的完整产物；tag 追加
+// 在它之后，形成 encrypt-then-MAC 布局，使壳可以先验 MAC 再解密。SIV 本身
+// 已能检测篡改，这层 HMAC 是纵深防御并额外绑定逻辑名。
 func MAC(body []byte, key [KeySize]byte, name string) []byte {
 	mk := MacKey(key)
 	m := hmac.New(sha256.New, mk[:])
@@ -197,9 +184,9 @@ func VerifyMAC(blob []byte, key [KeySize]byte, name string) bool {
 
 // DecryptMAC 是「先验 MAC 再解密」的参考实现，供测试与跨语言对拍。
 //
-// 它与壳侧 loader.go 的 v + c 两步严格对应：先校验 (name ‖ IV‖密文) 的
-// HMAC-SHA256，通过后才做 AES-256-CBC 解密。任何字节被改动（含 IV 与 tag）
-// 都会在第一步失败。
+// 它与壳侧 loader.go 的 v + c 两步严格对应：先校验 (name ‖ SIV‖密文) 的
+// HMAC-SHA256，通过后才做 AES-SIV 解密（SIV 自身还会再校验一次标签）。
+// name 同时参与 HMAC 与 S2V 的 AD：改 name、改 tag 或改任何密文字节都会失败。
 func DecryptMAC(blob []byte, key [KeySize]byte, name string) ([]byte, error) {
 	if len(blob) < BlockSize+TagSize {
 		return nil, fmt.Errorf("pack: 带 MAC 的载荷过短 (%d 字节)", len(blob))
@@ -207,12 +194,13 @@ func DecryptMAC(blob []byte, key [KeySize]byte, name string) ([]byte, error) {
 	if !VerifyMAC(blob, key, name) {
 		return nil, fmt.Errorf("pack: 载荷 MAC 校验失败")
 	}
-	return Decrypt(blob[:len(blob)-TagSize], key)
+	return DecryptNamed(blob[:len(blob)-TagSize], key, name)
 }
 
 // Dex 是一份待加密的 DEX。
 type Dex struct {
-	// Name 是原始 DEX 的条目名（如 "classes.dex"），仅用于报告与命名派生。
+	// Name 是原始 DEX 的条目名（如 "classes.dex"）：用于报告、载荷名派生，
+	// 并作为 SIV 的 AD 与（启用 MAC 时）HMAC 的绑定输入。
 	Name string
 	// Data 是 DEX 明文。
 	Data []byte
@@ -224,7 +212,8 @@ type Payload struct {
 	Asset string
 	// Name 是原始 DEX 名。
 	Name string
-	// Blob 是「IV ‖ 密文」，启用 MAC 时尾部再追加 TagSize 字节的 HMAC。
+	// Blob 是「SIV 标签(16B) ‖ CTR 密文」，启用 MAC 时尾部再追加
+	// TagSize 字节的 HMAC。密文与明文等长，无填充。
 	Blob []byte
 	// Plain 是明文长度，用于报告压缩/膨胀比。
 	Plain int
@@ -254,19 +243,19 @@ func AssetName(seed, dexName string) string {
 	return "assets/" + word + "_" + hex.EncodeToString(sum[2:6]) + ext
 }
 
-// Make 为一批 DEX 生成加密载荷（不含 MAC，格式为「IV ‖ 密文」）。
+// Make 为一批 DEX 生成加密载荷（不含 MAC，格式为「SIV 标签 ‖ CTR 密文」）。
 //
 // 每个 DEX 生成一份独立载荷（B4 需要「按需加载」的粒度）；载荷名由
 // seed 与 DEX 名共同派生，因此同一输入的产物完全可复现。
 //
-// PayloadMAC 关闭时必须走这条路径：Blob 与旧版产物逐字节一致，
-// 不追加任何尾部字节，壳侧也不会生成 MAC 相关指令。
+// S2V 的 AD 绑定原始 DEX 名（d.Name），与 DecryptNamed / DecryptMAC 的
+// name 参数一致。
 func Make(dexes []Dex, key [KeySize]byte, seed string) ([]Payload, error) {
 	return makePayloads(dexes, key, seed, false)
 }
 
 // MakeMAC 与 Make 相同，但为每份载荷追加 HMAC-SHA256 标签，
-// 格式变为「IV ‖ 密文 ‖ Tag」（encrypt-then-MAC）。
+// 格式变为「SIV 标签 ‖ CTR 密文 ‖ Tag」（encrypt-then-MAC）。
 //
 // 每份载荷因此多 32 字节（B3 的 LoaderItem.Size 直接取 len(Blob)，自动含 tag）。
 func MakeMAC(dexes []Dex, key [KeySize]byte, seed string) ([]Payload, error) {
@@ -288,12 +277,12 @@ func makePayloads(dexes []Dex, key [KeySize]byte, seed string, withMAC bool) ([]
 		}
 		used[name] = true
 
-		blob, err := Encrypt(d.Data, key, IVFromSeed(seed+"/"+d.Name))
+		blob, err := EncryptNamed(d.Data, key, d.Name)
 		if err != nil {
 			return nil, err
 		}
 		if withMAC {
-			// encrypt-then-MAC：tag 覆盖 name 与「IV ‖ 密文」整体。
+			// encrypt-then-MAC：tag 覆盖 name 与「SIV‖密文」整体。
 			//
 			// 这段字节序是壳侧 v 的输入（先 name 后 body），改动顺序会
 			// 让合法产物在真机上启动即终止，且只有装机才能发现。

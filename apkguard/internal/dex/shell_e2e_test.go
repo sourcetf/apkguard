@@ -116,7 +116,7 @@ func buildFullShellOpts(t *testing.T, debug bool) *fullShellFixture {
 	merge(devAdd)
 	brAdd, err := NativeBridgeAddition(&NativeBridgeSpec{
 		Class: NativeBridgeClass, LibName: NativeLibName,
-		NeedDerive: true, NeedDebug: true, NeedHooked: true, NeedIntact: true,
+		NeedDerive: true, NeedDecrypt: true, NeedDebug: true, NeedHooked: true, NeedIntact: true,
 	})
 	if err != nil {
 		t.Fatalf("构造桥接类失败: %v", err)

@@ -316,6 +316,22 @@ static void ag_sha256_final(ag_sha256 *s, uint8_t out[32]) {
 }
 
 /* ------------------------------------------------------------------ */
+/* AES-SIV（RFC 5297）解密                                             */
+/* ------------------------------------------------------------------ */
+/*
+ * 实现在 siv.h：AES-128/256 加密方向（T 表来自 aes_tables.h）、CMAC、
+ * S2V（多组件 AD）、CTR、KDF（两条域串以密文形态存放）与生产入口
+ * ag_siv_decrypt。只依赖上面的 ag_sha256 与 C3 的串解密原语，不需要
+ * AES 逆密码（CMAC/CTR 都只用 E_K）。
+ *
+ * JNI 入口 Native.sivDecrypt(key32, ad, blob) 见本文件 AG_JNI 小节；
+ * 宿主自测（RFC 4493/5297 官方向量 + Go 互操作 + 4 MB 计时）在
+ * AG_HOST_TEST 小节调用 ag_siv_selftest()。
+ */
+#include "aes_tables.h"
+#include "siv.h"
+
+/* ------------------------------------------------------------------ */
 /* C1：密钥派生                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -1327,6 +1343,91 @@ Java_com_apkguard_nativebridge_Native_derive(JNIEnv *env, jclass cls, jbyteArray
 	return out;
 }
 
+/*
+ * B3：载荷解密入口。Java 侧签名（与 DEX 字节码逐字一致）：
+ *
+ *     public static native byte[] sivDecrypt(byte[] key32, byte[] ad, byte[] blob);
+ *
+ * key32 = 32 字节主密钥；ad = 载荷逻辑名的 UTF-8 字节（允许空数组，语义仍是
+ * 「一个 AD 组件」，与 Go 侧 EncryptNamed(name="") 完全对应）；blob =
+ * [SIV 16 字节][AES-CTR 密文]。返回明文（len(blob)-16 字节，允许 0）；
+ * 任何失败（长度非法、malloc 失败、SIV 校验失败）返回 null——壳按
+ * System.exit(1) 硬终止，不做「解密失败照常继续」的降级。
+ *
+ * 线程安全：全部中间状态在栈/本次 malloc 的堆内存里，没有静态缓冲。
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_com_apkguard_nativebridge_Native_sivDecrypt(JNIEnv *env, jclass cls, jbyteArray jKey, jbyteArray jAd, jbyteArray jBlob) {
+	uint8_t key[32];
+	jbyte *kb = 0, *ab = 0, *bb = 0;
+	jsize klen, alen = 0, blen;
+	uint8_t *pt;
+	uint32_t ptlen = 0;
+	jbyteArray out;
+	(void)cls;
+
+	if (jKey == 0 || jBlob == 0) {
+		return 0;
+	}
+	klen = (*env)->GetArrayLength(env, jKey);
+	if (klen != 32) {
+		return 0;
+	}
+	blen = (*env)->GetArrayLength(env, jBlob);
+	if (blen < 16) {
+		return 0;
+	}
+	kb = (*env)->GetByteArrayElements(env, jKey, 0);
+	if (kb == 0) {
+		return 0;
+	}
+	memcpy(key, kb, 32);
+	(*env)->ReleaseByteArrayElements(env, jKey, kb, JNI_ABORT);
+	if (jAd != 0) {
+		alen = (*env)->GetArrayLength(env, jAd);
+		if (alen < 0) {
+			alen = 0;
+		}
+	}
+	if (alen > 0) {
+		ab = (*env)->GetByteArrayElements(env, jAd, 0);
+		if (ab == 0) {
+			ag_wipe(key, (uint32_t)sizeof(key));
+			return 0;
+		}
+	}
+	bb = (*env)->GetByteArrayElements(env, jBlob, 0);
+	if (bb == 0) {
+		if (ab != 0) {
+			(*env)->ReleaseByteArrayElements(env, jAd, ab, JNI_ABORT);
+		}
+		ag_wipe(key, (uint32_t)sizeof(key));
+		return 0;
+	}
+	pt = ag_siv_decrypt(key, (const uint8_t *)ab, (uint32_t)alen,
+	                    (const uint8_t *)bb, (uint32_t)blen, &ptlen);
+	(*env)->ReleaseByteArrayElements(env, jBlob, bb, JNI_ABORT);
+	if (ab != 0) {
+		(*env)->ReleaseByteArrayElements(env, jAd, ab, JNI_ABORT);
+	}
+	ag_wipe(key, (uint32_t)sizeof(key));
+	if (pt == 0) {
+		return 0;
+	}
+	out = (*env)->NewByteArray(env, (jsize)ptlen);
+	if (out == 0) {
+		ag_wipe(pt, ptlen > 0 ? ptlen : 1);
+		free(pt);
+		return 0;
+	}
+	if (ptlen > 0) {
+		(*env)->SetByteArrayRegion(env, out, 0, (jsize)ptlen, (const jbyte *)pt);
+	}
+	ag_wipe(pt, ptlen > 0 ? ptlen : 1);
+	free(pt);
+	return out;
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_apkguard_nativebridge_Native_debugged(JNIEnv *env, jclass cls) {
 	(void)env;
@@ -1594,6 +1695,9 @@ int main(void) {
 	encdec("ag_s_log_nopath", ag_s_log_nopath_enc, ag_s_log_nopath_len, AG_SALT_LOG_NOPATH);
 	encdec("ag_s_log_openfail", ag_s_log_openfail_enc, ag_s_log_openfail_len, AG_SALT_LOG_OPENFAIL);
 	encdec("ag_s_log_nosec", ag_s_log_nosec_enc, ag_s_log_nosec_len, AG_SALT_LOG_NOSEC);
+	/* AES-SIV KDF 的两条域串（密文常量在 aes_tables.h，明文只在 Go 测试里）。 */
+	encdec("ag_s_siv_mac", ag_s_siv_mac_enc, ag_s_siv_mac_len, AG_SALT_SIV_MAC);
+	encdec("ag_s_siv_ctr", ag_s_siv_ctr_enc, ag_s_siv_ctr_len, AG_SALT_SIV_CTR);
 
 	/*
 	 * C3：不透明谓词恒定性。边界值 + 100 万组 LCG 输入，任一时刻谓词
@@ -1645,6 +1749,13 @@ int main(void) {
 	 * 「解析 → 结构校验 → dispatch 循环 → 回调运行时」这条链的语义正确。
 	 */
 	bad += ag_vm_selftest();
+
+	/*
+	 * B3：AES-SIV 解密的宿主断言——RFC 4493 CMAC、RFC 5297 A.1/A.2
+	 * 官方向量（含中间量与逐字节篡改）、Go 侧 EncryptNamed 的 AES-256
+	 * 互操作向量、边界往返与 4 MB 性能计时。
+	 */
+	bad += ag_siv_selftest();
 
 	printf(bad ? "RESULT FAIL\n" : "RESULT OK\n");
 	return bad;

@@ -14,11 +14,12 @@ import (
 // 本文件覆盖 C2（SO 加壳）库载荷接入 -payload-mac 的打包侧行为：
 // 开启时追加与 B1 同规格的 HMAC-SHA256（绑定原始库名），关闭时字节不变。
 
-// auditfix3bEncrypt 用与 C2 相同的参数与 IV 派生规则独立算出「IV‖密文」，
-// 便于断言开启 MAC 只是在其尾部追加 tag、关闭 MAC 时与之逐字节一致。
+// auditfix3bEncrypt 用与 C2 相同的参数独立算出「SIV 标签‖CTR 密文」
+// （SIV 的 AD 绑定原始库名），便于断言开启 MAC 只是在其尾部追加 tag、
+// 关闭 MAC 时与之逐字节一致。
 func auditfix3bEncrypt(t *testing.T, data []byte, seed, abi, name string, key [32]byte) []byte {
 	t.Helper()
-	blob, err := pack.Encrypt(data, key, pack.IVFromSeed(seed+"/so/"+abi+"/"+name))
+	blob, err := pack.EncryptNamed(data, key, name)
 	if err != nil {
 		t.Fatalf("参照加密失败: %v", err)
 	}
@@ -55,15 +56,16 @@ func TestAuditfix3bSoEncPayloadMAC(t *testing.T) {
 		t.Fatalf("读取载荷失败: %v", err)
 	}
 
-	// ① tag 是「在 IV‖密文之后追加」的，不是别的格式。
+	// ① tag 是「在 SIV‖密文之后追加」的，不是别的格式。
 	body := auditfix3bEncrypt(t, data, opts.Seed, it.Abi, it.Name, sl.Key)
 	if len(blob) != len(body)+pack.TagSize {
 		t.Fatalf("带 MAC 载荷长度应为 %d（含 %d 字节 tag），实际 %d", len(body)+pack.TagSize, pack.TagSize, len(blob))
 	}
 	if !bytes.Equal(blob[:len(body)], body) {
-		t.Fatal("tag 未追加在 IV‖密文之后（加密结果本身被改动）")
+		t.Fatal("tag 未追加在 SIV‖密文之后（加密结果本身被改动）")
 	}
-	// ② 壳侧的 VerifyMAC/DecryptMAC 参考实现必须接受它。
+	// ② 壳侧的 VerifyMAC/DecryptMAC 参考实现必须接受它（SIV 的 AD 与 MAC
+	// 的绑定输入都是原始库名，两处必须一致）。
 	if !pack.VerifyMAC(blob, sl.Key, it.Name) {
 		t.Fatal("库载荷未带合法 MAC：C2 未接入 -payload-mac")
 	}
