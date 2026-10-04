@@ -60,6 +60,7 @@ type cliConfig struct {
 	packageShrink      bool
 	keepRules          string
 	renameResourceIDs  bool
+	renameLibraries    bool
 	obfStringMin       int
 	obfStringSingleRef bool
 	seed               string
@@ -91,6 +92,13 @@ type cliConfig struct {
 	splitCount       int
 	extractRatio     int
 	debugShell       bool
+
+	// 本轮新增：A1 库改名 / B9 双 APK / B5·B6·B7 方法数上限 / B7 NDK 路径
+	dualAPK        bool
+	extractMethods int
+	vmpMethods     int
+	dex2cMethods   int
+	ndkPath        string
 
 	channels string
 	jobs     int
@@ -129,6 +137,8 @@ func registerFlags(fs *flag.FlagSet, c *cliConfig) {
 	fs.StringVar(&c.keepRules, "keep-rules", "", "A1 保留白名单文件（每行一条，支持 * 通配）")
 	fs.BoolVar(&c.renameResourceIDs, "rename-resource-ids", true,
 		"A1 把 aapt 生成的资源 ID 类（R/R$Type）与字段一起改名，static_values 中的资源 ID 常量保持原样（对齐参考样本）。默认开启，用 -rename-resource-ids=false 关闭；应急可用环境变量 APKGUARD_KEEP_RCLASS_IDS=1 强制关闭")
+	fs.BoolVar(&c.renameLibraries, "rename-libraries", false,
+		"A1 把第三方库（androidx/Kotlin stdlib 等）也纳入改名。默认关闭：库代码改名可能破坏反射/序列化/ServiceLoader 等按类名查找的机制，开启前请用目标应用回归")
 	fs.IntVar(&c.obfStringMin, "obf-string-min", 0, "A2 仅加密长度不小于该值的字符串")
 	fs.BoolVar(&c.obfStringSingleRef, "obf-string-single-ref", false,
 		"A2 只加密恰好被 1 条 const-string 引用的字符串（对齐参考样本的选择性加密分布；会降低保护强度：多引用串将留明文，仅为形态对齐，不建议常规使用）")
@@ -161,7 +171,13 @@ func registerFlags(fs *flag.FlagSet, c *cliConfig) {
 	fs.BoolVar(&c.soEncrypt, "so-encrypt", false, "C2 原生库整体加密存 assets，启动时解密到私有目录再加载")
 	fs.StringVar(&c.shellPkg, "shell-pkg", "com.apkguard.shell", "B2/B3 壳类所在包名")
 	fs.IntVar(&c.splitCount, "split-count", 0, "B4 拆分 DEX 个数（0=按原样）")
-	fs.IntVar(&c.extractRatio, "extract-ratio", 0, "B5 抽取方法比例（1~100）")
+	fs.IntVar(&c.extractRatio, "extract-ratio", 0, "B5 抽取方法比例（1~100；B5 的开关是 -extract-methods，本项只调节从候选中选取的比例）")
+	fs.BoolVar(&c.dualAPK, "dual-apk", false,
+		"B9 双 APK 投放器：产物是宿主，原应用整体加密为插件放进宿主 assets，运行时落地并调起系统安装器。默认关闭：需 REQUEST_INSTALL_PACKAGES，首次需用户在系统安装界面确认，且换包名无法覆盖升级原应用")
+	fs.IntVar(&c.extractMethods, "extract-methods", 0, "B5 函数抽取的方法数上限，0=关闭；建议先用小值试（如 10~50）")
+	fs.IntVar(&c.vmpMethods, "vmp-methods", 0, "B6 VMP 虚拟化的方法数上限，0=关闭；建议先用小值试")
+	fs.IntVar(&c.dex2cMethods, "dex2c-methods", 0, "B7 Dex2C 转 C 的方法数上限，0=关闭；建议先用小值试")
+	fs.StringVar(&c.ndkPath, "ndk-path", "", "B7 编译生成的 C 用到的 NDK 根目录（留空自动探测常见位置）")
 	fs.BoolVar(&c.debugShell, "debug-shell", false, "排障：壳启动时逐步弹 Toast 报告进度（含 ClassLoader 接管回读校验）")
 
 	fs.StringVar(&c.sigHash, "sig-hash", "", "D1 签名证书的 SHA-256（十六进制；留空则取密钥库中的证书）")
@@ -444,6 +460,7 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		NamePrefix:        c.namePrefix,
 		PackageShrink:     c.packageShrink,
 		RenameResourceIDs: c.renameResourceIDs,
+		RenameLibraries:   c.renameLibraries,
 		ObfStringMin:      c.obfStringMin,
 
 		ObfStringSingleRefOnly: c.obfStringSingleRef,
@@ -476,6 +493,12 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		SplitCount:        c.splitCount,
 		ExtractRatio:      c.extractRatio,
 		DebugShell:        c.debugShell,
+
+		DualAPK:        c.dualAPK,
+		ExtractMethods: c.extractMethods,
+		VMPMethods:     c.vmpMethods,
+		Dex2CMethods:   c.dex2cMethods,
+		NDKPath:        c.ndkPath,
 
 		Jobs: c.jobs,
 	}
@@ -648,5 +671,5 @@ func printFeatures() {
 		}
 		fmt.Println()
 	}
-	fmt.Println("提示：启用【尚未实现】的功能项会被拒绝，以免静默地少做防护。")
+	fmt.Println("提示：本轮起全部功能项均已实现；若未来新增项带【尚未实现】标记，启用它会被拒绝，以免静默地少做防护。")
 }

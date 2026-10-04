@@ -81,9 +81,10 @@ type Feature struct {
 	Note    string    `json:"note"`
 	// Implemented 表示该功能项**已有实际实现**。
 	//
-	// 设计文档共罗列 46 项能力，但并非全部落地。这个字段的作用是让
-	// 「启用了一个还没实现的功能项」变成显式错误，而不是静默地什么都不做——
-	// 后者会让使用方以为自己拿到了 Root 检测、反调试等防护，实际却完全没有。
+	// 设计文档共罗列 47 项能力，本轮起全部落地（见 implementedIDs）。
+	// 这个字段仍然保留：它让「启用了一个已注册但还没实现的功能项」变成显式错误，
+	// 而不是静默地什么都不做——后者会让使用方以为自己拿到了 Root 检测、反调试等
+	// 防护，实际却完全没有。新增功能项定义而实现尚未跟上时，靠它自动兜底。
 	Implemented bool `json:"implemented"`
 }
 
@@ -101,10 +102,12 @@ var implementedIDs = map[FeatureID]bool{
 	"A14": true, "E1": true, "E2": true, "E3": true, "E4": true, "E5": true, "E6": true,
 	// 阶段3 L2 一代壳
 	"B1": true, "B2": true, "B3": true, "B4": true, "B8": true,
+	// 阶段4/长期：函数抽取、VMP、Dex2C、双 APK 投放器（本轮落地）
+	"B5": true, "B6": true, "B7": true, "B9": true,
 	// 阶段2/3 运行时防护
 	"D1": true, "D2": true, "D3": true,
 	// 阶段4 L3 native 防护（已落地的部分）
-	"C1": true, "C2": true, "C4": true, "C5": true, "C6": true, "C7": true,
+	"C1": true, "C2": true, "C3": true, "C4": true, "C5": true, "C6": true, "C7": true,
 	"D4": true, "D5": true,
 }
 
@@ -210,18 +213,22 @@ func All() []Feature {
 			Desc: "按功能维度将业务 DEX 拆分为多个分别加密",
 			Note: "单点 dump 无法获得完整代码"},
 		{ID: "B5", Name: "函数抽取", Group: GroupPack, Stage: StageL3, Risk: RiskDangerous, Default: false,
-			Desc: "清空方法 CodeItem，运行时由 native 按需回填到内存",
-			Note: "需 hook ArtMethod，Android 每个大版本结构都变"},
+			Desc: "清空选中方法的 CodeItem，运行时由 native 按需回填到内存（-extract-methods 指定方法数上限，0=关闭）",
+			Note: "已实现（按需开启，覆盖率为子集）：-extract-methods>0 时按确定性优先级从可安全抽取的候选里选至多该数量；需 hook ArtMethod，Android 每个大版本结构都变"},
 		{ID: "B6", Name: "VMP 虚拟化", Group: GroupPack, Stage: StageLong, Risk: RiskDangerous, Default: false,
-			Desc: "将关键方法字节码翻译为自定义指令集，由私有 VM 解释器执行",
-			Note: "防护强度最高，工程复杂度极高"},
+			Desc: "将关键方法字节码翻译为自定义指令集，由私有 VM 解释器执行（-vmp-methods 指定方法数上限，0=关闭）",
+			Note: "已实现（按需开启，覆盖率为子集）：-vmp-methods>0 时虚拟化至多该数量的方法；防护强度最高，对性能与兼容性的影响也最大"},
 		{ID: "B7", Name: "Dex2C / Java2C", Group: GroupPack, Stage: StageLong, Risk: RiskDangerous, Default: false,
-			Desc: "将 Java 方法编译期翻译为 C，编译成 SO 通过 JNI 注册调用",
-			Note: "需处理多 ABI、JNI 桥接、GC 交互，工程复杂度极高"},
+			Desc: "将 Java 方法编译期翻译为 C，编译成 SO 通过 JNI 注册调用（-dex2c-methods 指定方法数上限，-ndk-path 指定 NDK 根目录）",
+			Note: "已实现（按需开启，覆盖率为子集）：-dex2c-methods>0 时翻译至多该数量的方法；生成的 C 用 -ndk-path 指定的 NDK 交叉编译（留空自动探测常见位置）"},
 
 		{ID: "B8", Name: "载荷容器化", Group: GroupPack, Stage: StageL2, Risk: RiskSafe, Default: false,
 			Desc: "把加密载荷移入容器目录树，并植入同构的诱饵容器（高熵 .dat + 假包名配置）",
 			Note: "对抗「按 assets 顶层逐个解密」的自动化脚本；需先启用 B1"},
+
+		{ID: "B9", Name: "双 APK 投放器", Group: GroupPack, Stage: StageL3, Risk: RiskDangerous, Default: false,
+			Desc: "产物改为「宿主 + 插件」双 APK：原应用整体加密为插件放进宿主 assets，宿主落地后调起系统安装器（对齐参考样本 sample.apk 的架构）",
+			Note: "需 REQUEST_INSTALL_PACKAGES 权限；受 Android 10+ 后台安装限制，首次需用户确认安装界面；换包名，无法覆盖升级原应用"},
 
 		// ---- Native 防护类 ----
 		{ID: "C1", Name: "密钥 native 派生", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
@@ -232,7 +239,7 @@ func All() []Feature {
 			Note: "检测到 native 自加载框架（Flutter/RN/Unity）会整体跳过并给出提示——这类框架用 android_dlopen_ext 从 APK 按偏移加载，移走 lib/ 会让应用启动即崩；C2 开启时 lib/ 下不再有明文 .so"},
 		{ID: "C3", Name: "OLLVM 混淆", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
 			Desc: "对 native 代码应用控制流平坦化、虚假控制流、指令替换",
-			Note: "需外部 OLLVM 工具链"},
+			Note: "已实现（按需开启，覆盖率为子集）：不依赖外部 LLVM——在守卫库的 C 源码层做控制流平坦化、不透明谓词与字符串加密"},
 		{ID: "C4", Name: "反调试", Group: GroupNative, Stage: StageL3, Risk: RiskSafe, Default: false,
 			Desc: "ptrace 自占用、读 TracerPid、检测 SIGTRAP 与调试端口",
 			Note: "gdb/IDA/lldb 无法 attach"},
@@ -427,6 +434,60 @@ type Options struct {
 	// 因此不默认开启。开启后请自行在目标设备上验证安装与启动。
 	ZipLocalFlagDecoy bool `json:"zip_local_decoy"`
 
+	// ---- 本轮新增开关：A1 库改名 / B9 双 APK / B5·B6·B7 方法数上限 ----
+	//
+	// 这组字段与其它普通 bool/int 字段一样是**零值语义**：Go 零值（JSON 里缺键）
+	// 即「关闭」，默认关闭无需任何额外处理。CLI 侧的默认值由 registerFlags 的
+	// flag 默认值（false / 0 / ""）提供，Web 侧由控件的默认未勾选 / value=0 提供。
+
+	// RenameLibraries 让 A1 把第三方库（androidx、Kotlin stdlib、Google Play
+	// Services 等）也纳入类/成员改名，而不只改应用自有包。
+	//
+	// 默认关闭。边界：库代码改名后，反射、序列化、注解处理与库自身按类名/
+	// 清单文件名查找的机制（如 kotlinx 的 ServiceLoader 清单、资源名拼接）
+	// 都可能断链；且库是公开代码，改名对攻击者的额外阻力有限，整体风险大于收益。
+	// 开启前必须用目标应用回归（建议配合 E3/E6 自检，先用小包试）。
+	RenameLibraries bool `json:"rename_libraries"`
+
+	// DualAPK 让产物改为 B9「双 APK 投放器」：输出的宿主 APK 不含业务代码，
+	// 原应用整体（Manifest/资源/DEX）加密为插件放进宿主 assets，宿主启动后
+	// 把插件落地到磁盘并调起系统安装器安装。
+	//
+	// 默认关闭。边界：产物需要 REQUEST_INSTALL_PACKAGES 权限；受 Android 10+
+	// 后台安装限制，首次安装必须由用户在系统安装界面确认；宿主换包名，
+	// 无法覆盖升级原应用（是「安装第二个应用」而不是「升级原应用」）。
+	DualAPK bool `json:"dual_apk"`
+
+	// ExtractMethods 是 B5 函数抽取的方法数上限。
+	//
+	// 默认 0 = 关闭 B5。大于 0 时才从「可安全抽取的候选方法」里按确定性优先级
+	// 选取至多这么多方法，运行时由 native 按需回填代码。覆盖率是候选集合的一个
+	// 子集（try/synchronized/构造器等不安全方法一律排除，不同应用的候选集不同）。
+	// 建议先用小值（如 10~50）验证启动与主要功能，再逐步放大。
+	ExtractMethods int `json:"extract_methods"`
+
+	// VMPMethods 是 B6 VMP 虚拟化的方法数上限。
+	//
+	// 默认 0 = 关闭 B6。大于 0 时把至多这么多关键方法的字节码翻译为私有 VM
+	// 指令，由解释器执行。覆盖率是候选方法的一个子集；防护强度最高，同时
+	// 对性能与兼容性的影响也最大，建议先用小值试。
+	VMPMethods int `json:"vmp_methods"`
+
+	// Dex2CMethods 是 B7 Dex2C（Java2C）翻译的方法数上限。
+	//
+	// 默认 0 = 关闭 B7。大于 0 时把至多这么多 Java 方法编译期翻译为 C，
+	// 经 NDK 交叉编译成 SO 后用 JNI RegisterNatives 替换原实现。覆盖率是
+	// 候选方法的一个子集（需排除 try/synchronized/虚调用等难以翻译的形态）。
+	Dex2CMethods int `json:"dex2c_methods"`
+
+	// NDKPath 是 B7 编译生成的 C 代码所用的 Android NDK 根目录。
+	//
+	// 默认空串 = 自动探测常见位置（ANDROID_NDK_HOME / ANDROID_NDK_ROOT、
+	// $ANDROID_HOME/ndk/<版本> 等）。仅在 B7 启用（Dex2CMethods>0）时使用；
+	// 编译需要的 NDK 在产物流程里扮演外部工具链角色，指定无效路径时应显式报错
+	// 而不是产出「没有 Dex2C 的 Dex2C 产物」。
+	NDKPath string `json:"ndk_path"`
+
 	// 加壳参数
 	DexKey   string `json:"dex_key"`   // B1 加密密钥（留空自动生成）
 	DecoyPkg string `json:"decoy_pkg"` // B8 诱饵配置里的假包名（留空用默认）
@@ -447,7 +508,7 @@ type Options struct {
 	SOEncrypt    bool   `json:"so_encrypt"`
 	ShellPkg     string `json:"shell_pkg"`     // B2/B3 壳类所在包名
 	SplitCount   int    `json:"split_count"`   // B4 拆分 DEX 个数（0=按原样）
-	ExtractRatio int    `json:"extract_ratio"` // B5 抽取方法比例（1~100）
+	ExtractRatio int    `json:"extract_ratio"` // B5 抽取方法比例（1~100）；B5 的开关是 ExtractMethods（0=关闭），本项只调节从候选里选取的比例
 
 	// DebugShell 让壳在启动的每个关键步骤后弹 Toast 报告进度（排障用）。
 	//
@@ -552,8 +613,13 @@ func (o *Options) Validate() error {
 		"B8": {{"B1", "载荷容器化需要先有加密载荷"}},
 		// C2 把 lib/<abi>/*.so 整体移进 assets，应用再也拿不到这些库，
 		// 必须由壳在启动时解密到私有目录、并把该目录并入类加载器的库搜索路径。
-		"C2":  {{"B1", "原生库加密需要壳的解密载荷机制"}, {"B2", "需要壳 Application 提供最早执行时机"}, {"B3", "需要 ClassLoader 接管（库搜索路径由它承载）"}},
-		"B5":  {{"B1", "函数抽取需要 DEX 加密作为基础"}},
+		"C2": {{"B1", "原生库加密需要壳的解密载荷机制"}, {"B2", "需要壳 Application 提供最早执行时机"}, {"B3", "需要 ClassLoader 接管（库搜索路径由它承载）"}},
+		// B5 的抽取计划随 B1 载荷加密运输；回填由 B3 生成的 Loader 在解密后、
+		// 落盘前对内存字节流执行，因此三者缺一不可——只有 B1 而没有壳链路时，
+		// 产物里的方法体永远是 stub、静默返回默认值。
+		"B5": {{"B1", "函数抽取需要 DEX 加密作为基础"},
+			{"B2", "回填驱动挂在壳 Application 的启动链路上"},
+			{"B3", "回填由 ClassLoader 接管生成的 Loader 在解密后执行"}},
 		"B6":  {{"B2", "VMP 需要壳 Application"}, {"B3", "VMP 需要 ClassLoader 接管"}},
 		"B7":  {{"B2", "Dex2C 需要壳 Application"}, {"B3", "Dex2C 需要 ClassLoader 接管"}},
 		"A11": {{"A5", "资源路径全量扁平化是资源混淆的完整形态，需先启用资源混淆"}},
@@ -605,8 +671,9 @@ func (o *Options) Validate() error {
 
 	// 未实现的功能项不允许启用。
 	//
-	// 这是最重要的一条校验：设计文档罗列的 46 项能力并非全部落地，
-	// 而「启用后什么都不做」是最危险的失败模式——使用方会以为自己拿到了
+	// 这是最重要的一条校验：设计文档罗列的 47 项能力截至本轮已全部落地，
+	// 但这条检查保留——它兜住「注册表里新增了功能项、实现尚未跟上」的未来状态。
+	// 「启用后什么都不做」是最危险的失败模式：使用方会以为自己拿到了
 	// Root 检测、反调试、签名校验等防护，实际产物里一个都没有。
 	// 宁可让命令失败，也不能静默地产出一个防护与预期不符的 APK。
 	var unimplemented []string
@@ -621,12 +688,11 @@ func (o *Options) Validate() error {
 			strings.Join(unimplemented, "、")))
 	}
 
-	// 已废弃 / 尚未实现的能力：必须显式拒绝，绝不能静默忽略。
+	// 已废弃的能力：必须显式拒绝，绝不能静默忽略。
 	//
 	//   - LibStripSections：实测 Android 动态链接器会校验 ELF 节头表，
 	//     清零会让 dlopen 直接失败；见 passes/libdisguise.go 的说明。
 	//   - LibFakeName：只有 C7 才能消费它，单独设置会「开关打开了但什么都没发生」。
-	//   - ExtractRatio：B5（函数抽取）未实现，且不属于已实现集合；单独设置同样静默无效。
 	if o.LibStripSections {
 		errs = append(errs,
 			"-lib-strip-sections 已废弃：Android 的动态链接器会校验 ELF 节头表"+
@@ -637,9 +703,6 @@ func (o *Options) Validate() error {
 		errs = append(errs,
 			"已指定 -lib-name，但未启用 C7（原生库伪装）：请用 -enable C7 启用后再指定假库名，"+
 				"否则改名不会发生")
-	}
-	if o.ExtractRatio != 0 {
-		errs = append(errs, "B5（函数抽取）尚未实现，-extract-ratio 不可用")
 	}
 
 	// 参数范围
@@ -659,6 +722,11 @@ func (o *Options) Validate() error {
 	}
 	if o.FakeDexCount < 0 || o.JunkTopCount < 0 || o.JunkDirCount < 0 || o.ClassPadCount < 0 {
 		errs = append(errs, "数量类参数不能为负")
+	}
+	// B5/B6/B7 的方法数上限：0 表示关闭，负数没有意义（三者的选择逻辑都按
+	// 「上限 > 0 才启用」判定，负值会被当成「已启用」却选不出任何方法）。
+	if o.ExtractMethods < 0 || o.VMPMethods < 0 || o.Dex2CMethods < 0 {
+		errs = append(errs, "B5/B6/B7 的方法数上限不能为负（0=关闭）")
 	}
 	if o.SplitCount < 0 {
 		errs = append(errs, "B4 拆分个数不能为负")

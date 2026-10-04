@@ -43,6 +43,7 @@ func Registry() *pipeline.Registry {
 	// A20 花指令填充与 A6 同族（都改写方法体），紧跟其后。它只插入 nop 与
 	// 不可达前向跳转、不写任何寄存器，因此不存在 A6 那种宽值类型冲突。
 	r.Register(&nopFill{})
+	r.Register(&vmpMethods{})
 	// A19 只往字符串池追加垃圾串、不触碰指令流，放在混淆段末尾即可。
 	r.Register(&strJunk{})
 	// 注：A6 已在上方注册（见 r.Register(&controlFlow{})），此处不再重复。
@@ -75,6 +76,8 @@ func Registry() *pipeline.Registry {
 	// lib/ 被移走后 abisOf 会返回空，那会让 C1 给全部 ABI 都注入）。
 	r.Register(&encryptNativeLibs{})
 	r.Register(&splitDex{})
+	r.Register(&dex2c{})
+	r.Register(&extractCode{})
 	r.Register(&encryptDex{})
 	// B8 必须排在 B1 之后（要读加密载荷清单）、B3 之前（要改载荷条目名，
 	// 而 B3 生成 Loader 时会把这些名字内联进字节码）。
@@ -115,6 +118,12 @@ func Registry() *pipeline.Registry {
 	r.Register(&channelMark{})
 	r.Register(&compatCheck{})
 	r.Register(&metaUnify{})
+
+	// B9 双 APK 投放器：`-enable B9` 时把 opts.DualAPK 置真并做前置校验；
+	// 真正的「宿主 + 加密插件」封装在 sink 收尾阶段完成（必须在 E1 签名之后，
+	// 因为插件必须是已签名的完整 APK），因此这里排在 A14 之后、A15 之前即可。
+	// A15 仍保持注册表最后一位（顺序契约测试有断言）。
+	r.Register(&dualAPK{})
 
 	// A15 必须排在**最后**：它会把 Manifest 膨胀到数百 MB，
 	// 而 B2（改 android:name）、E6（读 minSdk）、A14 都不再需要读它；
@@ -740,12 +749,37 @@ func (z *zipPathAttack) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		}
 	}
 
-	art.Note("A12 ZIP 路径攻击：前缀滥用 %d 条、绝对路径 %d 条、重名 %d 条；其中 %d 条与 A10 共用同一份 176B 载荷（样本 323 条共用载荷族）",
-		p1, p2, p3, p1+p2)
+	// ④ 归一化近重名：每个基础路径生成 4 个变体，变体之间只在分隔符与冗余斜杠上
+	//    不同——`\`、`//`、`\/`、`///`，归一化（`\`→`/`、折叠连续 `/`）后落进
+	//    同一路径（对齐样本的 /resources.arsc//.xml 一族，最大一组 13 条）。
+	//
+	//    与 ③（精确重名）的关键差别：中央目录里的精确名互不相同，apksigner
+	//    不会报 Duplicate entry，**启用签名（E1）时也照常生效**。基础路径首段
+	//    是核心文件名，但精确名一律带 /<叶名> 后缀，绝不与真实核心文件同名；
+	//    变体名经 add 与全部既有条目（含 A10/A12 其他族）精确去重。数量固定，
+	//    不随 ZipAtkCount 变化（它属于 A12 的默认内容，不是可调强度的攻击面）。
+	nearGroups, nearAdded := 0, 0
+	for _, base := range nearDupBases {
+		added := 0
+		for _, name := range nearDupVariants(base) {
+			if _, ok := add(name, payload); ok {
+				nearAdded++
+				added++
+			}
+		}
+		if added >= 2 {
+			nearGroups++
+		}
+	}
+
+	art.Note("A12 ZIP 路径攻击：前缀滥用 %d 条、绝对路径 %d 条、重名 %d 条、归一化近重名 %d 组/共 %d 条（变体仅分隔符与冗余斜杠不同，中央目录精确名唯一，启用签名时也生效）；其中 %d 条与 A10 共用同一份 176B 载荷（样本 323 条共用载荷族）",
+		p1, p2, p3, nearGroups, nearAdded, p1+p2+nearAdded)
 	art.Stat("A12.prefix", fmt.Sprint(p1))
 	art.Stat("A12.absolute", fmt.Sprint(p2))
 	art.Stat("A12.dup", fmt.Sprint(p3))
-	art.Stat("A12.shared", fmt.Sprint(p1+p2))
+	art.Stat("A12.neardup", fmt.Sprint(nearAdded))
+	art.Stat("A12.neardup_groups", fmt.Sprint(nearGroups))
+	art.Stat("A12.shared", fmt.Sprint(p1+p2+nearAdded))
 	return nil
 }
 

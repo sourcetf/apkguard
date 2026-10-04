@@ -15,7 +15,7 @@ type RenameConfig struct {
 	// ObfuscateFields 为 true 时同时重命名字段。
 	ObfuscateFields bool
 	// RenameResourceIDs 为 true 时，aapt 生成的资源 ID 类（简单名为 R 或
-	// R$<Type>，且静态 int 字段带资源段常量）参与类名与字段名混淆。
+	// R$<Type>，且静态字段带资源段常量）参与类名与字段名混淆。
 	//
 	// 为什么可以安全改名：DEX 对 R 类字段的引用走 field_ids 的显式引用，
 	// 改名由既有的字段引用改写通道（planFields + 重建重排）统一完成；字段的
@@ -24,9 +24,11 @@ type RenameConfig struct {
 	//
 	// 放行仍是保守的（宁少勿多）：
 	//   - Landroid/...（平台 R）与一切命中原有 keep 规则的类照旧保留；
-	//   - 只有「至少一个 static int 字段的 static_values 常量落在
-	//     0x7f/0x01 资源段」的 R$Type 才放行；R$styleable 这类纯下标
-	//     常量类不放行；
+	//   - R$Type 需至少一个 static 字段满足下列之一才放行：
+	//     a) static int 字段的 static_values 常量落在 0x7f/0x01 资源段；
+	//     b) static int[] 字段（R$styleable 的形态）的 static_values 是数组，
+	//     元素全部为数值型且 ≥90% 落在资源段——数组必须逐字节原样保留；
+	//     非数值元素会让重建走索引重映射、无法保证逐字节，因此直接判不满足；
 	//   - 外层 R 只有在本 DEX 内全部 R$Type 都放行时才一起放行；
 	//   - 字段名若出现在 const-string、注解等非字段引用处，整个类不改
 	//     （引用完整性无法确认，见 resourceFieldNamesSafe）；
@@ -36,6 +38,22 @@ type RenameConfig struct {
 	// 默认 false（dex 库 API 保持旧行为）；A1 pass 默认打开，可用环境变量
 	// APKGUARD_KEEP_RCLASS_IDS=1 一键关闭。
 	RenameResourceIDs bool
+	// RenameLibraries 为 true 时，第三方库类（androidx/、android/support/、
+	// kotlin/、kotlinx/、com/google/ 等）也参与类名混淆。
+	//
+	// 默认 false：库类保留原名（仅应用自身与其余非前缀类改名），避免破坏
+	// 库内部的反射、序列化与热修复约定。开启后这些库类与其内部引用会被
+	// 一起改写，但以下护栏**无论开关如何**都保持：
+	//   - 平台前缀一律保留：java/、javax/、jdk/、sun/、dalvik/、libcore/、
+	//     org/apache/、org/json/、org/w3c/、org/xml/、org/xmlpull/；
+	//   - 类名出现在 const-string / 其它 DEX 的字符串常量里的反射类；
+	//   - 清单声明的组件类、含 native 方法的类、Android 组件/入口类；
+	//   - 内部类（名字含 '$'）与其外层类照旧成对保留。
+	//
+	// 风险提示：开启后产物与依赖「反射 / 序列化 / 热修复」的框架
+	// （Gson、Kotlin 反射、Tinker/Patch 类名匹配等）兼容风险上升，
+	// 这是设计取舍，应按需开启。
+	RenameLibraries bool
 	// ShrinkPackage 为 true 时，新类名不再保留原包前缀，而是落到**默认包**
 	// （如 Lcom/foo/Bar; -> La;）。
 	//
@@ -199,19 +217,52 @@ var keepFieldNames = []string{
 	"CREATOR", "INSTANCE", "serialVersionUID", "Companion", "TAG",
 }
 
-// javaPrefixes 是必须保留的包前缀。
+// platformPrefixes 是**永远**必须保留的平台包前缀（RenameLibraries 也不能放行）。
 //
-// 这些类由 JDK / Android 框架 / 主流三方库提供，通常不在本 DEX 中定义，
-// 但会被本 DEX 引用；改名会破坏运行时链接。
-var javaPrefixes = []string{
-	"Ljava/", "Ljavax/", "Ljdk/", "Lsun/", "Ldalvik/", "Lorg/w3c/",
-	"Lorg/xml/", "Lorg/json/", "Lorg/apache/", "Lorg/xmlpull/",
-	"Landroid/", "Landroidx/", "Lcom/google/", "Lkotlin/", "Lkotlinx/",
+// 这些类由 JDK / Android 运行时提供，名字由系统按名解析或与 ART 约定绑定，
+// 改名必然破坏运行时链接。
+var platformPrefixes = []string{
+	"Ljava/", "Ljavax/", "Ljdk/", "Lsun/", "Ldalvik/", "Llibcore/",
+	"Lorg/w3c/", "Lorg/xml/", "Lorg/json/", "Lorg/apache/", "Lorg/xmlpull/",
+	"Landroid/",
+}
+
+// libraryPrefixes 是「第三方库」包前缀：默认保留（保守），
+// RenameConfig.RenameLibraries 打开时放行参与混淆。
+//
+// 注意 Landroid/support/：它同时命中 Landroid/（平台）与库前缀，判定顺序上
+// 库前缀优先——只有 RenameLibraries 打开时才放行 support 库；关掉时照旧保留。
+var libraryPrefixes = []string{
+	"Landroidx/", "Landroid/support/", "Lcom/google/", "Lkotlin/", "Lkotlinx/",
 	"Lorg/jetbrains/", "Lokhttp3/", "Lokio/", "Lretrofit2/", "Lio/reactivex/",
 	"Lorg/slf4j/", "Lcom/squareup/", "Lcom/bumptech/", "Lcom/facebook/",
 	"Lio/flutter/", "Lcom/tencent/", "Lcom/alibaba/", "Lcom/taobao/",
 	"Lcom/umeng/", "Lcom/baidu/", "Lcom/iflytek/", "Lcom/amap/", "Lcom/qq/",
 	"Lorg/bouncycastle/", "Lcom/nostra13/", "Lorg/greenrobot/",
+}
+
+// prefixKeepReason 返回类因平台/三方库前缀而必须保留的原因；空串表示可改名。
+//
+// 判定顺序：库前缀优先于平台前缀。这样 Landroid/support/... 在
+// RenameLibraries 打开时会走「库，放行」分支，而真正的平台类
+// （Landroid/app/Activity;、Ljava/lang/String; 等）在任何配置下都保留。
+func (r *Renamer) prefixKeepReason(desc string) string {
+	if hasAnyPrefix(desc, libraryPrefixes) {
+		if r.cfg.RenameLibraries {
+			return ""
+		}
+		return "三方库类（未开启 RenameLibraries）"
+	}
+	if hasAnyPrefix(desc, platformPrefixes) {
+		return "平台类（系统按名解析）"
+	}
+	return ""
+}
+
+// keptByPrefix 是 prefixKeepReason 的布尔形式，供放行候选预筛使用
+// （与 keepReason 同一套语义，避免两处规则分叉）。
+func (r *Renamer) keptByPrefix(desc string) bool {
+	return r.prefixKeepReason(desc) != ""
 }
 
 // Renamer 依据 DEX 的引用关系计算重命名映射。
@@ -530,8 +581,8 @@ func (r *Renamer) keepReason(ci *ClassInfo, extra, reflected, hasInner map[strin
 		return "清单中的组件类"
 	case r.isKeptClass(ci.Desc):
 		return "命中保留规则"
-	case hasAnyPrefix(ci.Desc, javaPrefixes):
-		return "平台/三方库类"
+	case r.keptByPrefix(ci.Desc):
+		return r.prefixKeepReason(ci.Desc)
 	case ci.Access&accAnnotation != 0:
 		return "注解类（按名称反射读取）"
 	case reflected[ci.Desc]:
@@ -615,6 +666,11 @@ type encodedInt struct {
 	OK bool
 	// Raw 是该 encoded_value 的原始字节（含头字节），用于逐字节比对。
 	Raw []byte
+	// IsArray 表示该值是否为 encoded_array（VALUE_ARRAY）。
+	IsArray bool
+	// Elems 仅当 IsArray 时非 nil：按位置给出数组元素的视图。
+	// R$styleable 的 static_values 就是「元素为资源 ID 的 int[]」。
+	Elems []encodedInt
 }
 
 // encodedArrayInts 解析一个 encoded_array，逐位置返回取值视图。
@@ -674,18 +730,21 @@ func decodeEncodedInt(d []byte, p int) (encodedInt, int, error) {
 			}
 		}
 		return encodedInt{Val: int64(u), OK: true, Raw: d[start : p+n]}, p + n, nil
-	case 0x1c: // array：递归跳过全部元素
+	case 0x1c: // array：逐元素解析（元素视图供资源 ID 比例判据统计）
 		size, np, err := ULEB128(d, p)
 		if err != nil {
 			return encodedInt{}, p, err
 		}
 		p = np
+		elems := make([]encodedInt, 0, size)
 		for i := uint32(0); i < size; i++ {
-			if _, p, err = decodeEncodedInt(d, p); err != nil {
+			var ev encodedInt
+			if ev, p, err = decodeEncodedInt(d, p); err != nil {
 				return encodedInt{}, p, err
 			}
+			elems = append(elems, ev)
 		}
-		return encodedInt{Raw: d[start:p]}, p, nil
+		return encodedInt{Raw: d[start:p], IsArray: true, Elems: elems}, p, nil
 	case 0x1d: // annotation：type_idx + size + (name_idx, value)*
 		_, np, err := ULEB128(d, p)
 		if err != nil {
@@ -720,22 +779,31 @@ func decodeEncodedInt(d []byte, p int) (encodedInt, int, error) {
 }
 
 // hasResourceIDClassCandidate 廉价预筛：本 DEX 是否定义了名字像 R/R$Type
-// 且不属于平台/三方库前缀的类。没有候选时完全不执行静态值解析与整文件扫描。
+// 且不属于当前生效的保留前缀（平台恒保留；库前缀仅在未开启 RenameLibraries
+// 时保留）的类。没有候选时完全不执行静态值解析与整文件扫描。
 func (r *Renamer) hasResourceIDClassCandidate() bool {
 	for i := range r.infos {
 		d := r.infos[i].Desc
-		if isResourceIDClassDesc(d) && !hasAnyPrefix(d, javaPrefixes) {
+		if isResourceIDClassDesc(d) && !r.keptByPrefix(d) {
 			return true
 		}
 	}
 	return false
 }
 
-// hasResourceIDStaticField 判断类是否带「资源 ID 常量」：至少一个 static int
-// 字段在 static_values 中的取值落在 Android 资源 ID 区间。
+// hasResourceIDStaticField 判断类是否带「资源 ID 常量」，满足任一形态即可：
+//
+//	a) 至少一个 static int 字段的 static_values 取值落在资源段（R$string 等）；
+//	b) 至少一个 static int[] 字段的 static_values 是数组，元素全部为数值型且
+//	   ≥90% 落在资源段（R$styleable 的形态：数组元素就是资源 ID 序列）。
 //
 // static_values 的第 i 个值对应按 field_idx 升序的第 i 个静态字段；
 // ClassInfos 给出的 StaticFields 就是该顺序，按位置对齐即可。
+//
+// 为什么要求数组元素「全部为数值型」：重建器对数组逐元素重映射，数值型原样
+// 复制（逐字节不变），而字符串/类型等含索引的取值会被重新映射——一旦数组里
+// 混入这类元素，就无法保证「逐元素逐字节不变」这条硬约束，因此判不满足
+// （比例条件自然也就不成立）。
 func (r *Renamer) hasResourceIDStaticField(ci *ClassInfo) bool {
 	di, ok := r.defOf[ci.Desc]
 	if !ok {
@@ -751,14 +819,39 @@ func (r *Renamer) hasResourceIDStaticField(ci *ClassInfo) bool {
 		return false
 	}
 	for k, fl := range ci.StaticFields {
-		if fl.Type != "I" || k >= len(vals) {
+		if k >= len(vals) {
 			continue
 		}
-		if vals[k].OK && isAndroidResourceID(vals[k].Val) {
+		v := vals[k]
+		switch {
+		case fl.Type == "I" && v.OK && isAndroidResourceID(v.Val):
+			return true
+		case fl.Type == "[I" && resourceIDArrayDominant(v):
 			return true
 		}
 	}
 	return false
+}
+
+// resourceIDArrayDominant 判断一个 encoded_array 是否「以资源 ID 为主」：
+// 元素必须全部是数值型，且至少 90% 落在 Android 资源 ID 区间。
+//
+// 空数组不算满足（没有可证明的资源 ID 证据）；比例用整数乘法比较，
+// 避免浮点误差：in*100 >= n*90。
+func resourceIDArrayDominant(v encodedInt) bool {
+	if !v.IsArray || len(v.Elems) == 0 {
+		return false
+	}
+	inRange := 0
+	for _, e := range v.Elems {
+		if !e.OK {
+			return false
+		}
+		if isAndroidResourceID(e.Val) {
+			inRange++
+		}
+	}
+	return inRange*100 >= len(v.Elems)*90
 }
 
 // resourceFieldNamesSafe 判断类中字段名没有被「字段引用」之外的语义使用。
@@ -788,8 +881,11 @@ func (r *Renamer) resourceFieldNamesSafe(ci *ClassInfo) bool {
 //  1. 整份 DEX 可被安全重建（checkRebuildSupported）：含 call_site_ids /
 //     method_handles 段或 0xfa-0xfe 指令时，这些结构里的字段引用无法确认，
 //     全部 R 类不改；
-//  2. 类名形如 R / R$<Type>，且不属于平台/三方库前缀（Landroid/ 等一律排除）；
-//  3. R$Type：至少一个 static int 字段带资源段 static_values 常量；
+//  2. 类名形如 R / R$<Type>，且不属于当前生效的保留前缀
+//     （Landroid/ 等平台前缀恒排除；库前缀仅在未开启 RenameLibraries 时排除）；
+//  3. R$Type 满足 hasResourceIDStaticField 的任一形态：
+//     static int 字段带资源段常量，或 static int[] 字段（R$styleable）
+//     的数组元素全部为数值型且 ≥90% 落在资源段；数组经重建器逐字节保留；
 //     外层 R：本 DEX 内它的全部 R$Type 都满足第 3 条时才一起放行
 //     （外层与内部类进同一个计划，避免半个家族改名）；
 //  4. 字段名只被字段引用使用（resourceFieldNamesSafe）。
@@ -802,7 +898,7 @@ func (r *Renamer) planResourceIDClasses() map[string]bool {
 	qualifies := map[string]bool{}
 	for i := range r.infos {
 		ci := &r.infos[i]
-		if !isResourceIDClassDesc(ci.Desc) || hasAnyPrefix(ci.Desc, javaPrefixes) {
+		if !isResourceIDClassDesc(ci.Desc) || r.keptByPrefix(ci.Desc) {
 			continue
 		}
 		fam := resourceFamilyKey(ci.Desc)
@@ -813,7 +909,7 @@ func (r *Renamer) planResourceIDClasses() map[string]bool {
 	}
 	for i := range r.infos {
 		ci := &r.infos[i]
-		if !isResourceIDClassDesc(ci.Desc) || hasAnyPrefix(ci.Desc, javaPrefixes) {
+		if !isResourceIDClassDesc(ci.Desc) || r.keptByPrefix(ci.Desc) {
 			continue
 		}
 		fam := resourceFamilyKey(ci.Desc)

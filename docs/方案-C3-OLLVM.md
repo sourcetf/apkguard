@@ -1,9 +1,23 @@
 # 方案 C3：OLLVM 混淆（控制流平坦化 / 虚假控制流 / 指令替换）
 
-> 本文是**设计文档**，不改任何代码。对应功能项 `C3`（`internal/config` 中 Group=Native、Stage=L3、Risk=Safe、默认关闭）。
+> 本文是**设计文档**。对应功能项 `C3`（`internal/config` 中 Group=Native、Stage=L3、Risk=Safe、默认关闭）。
 > 参照实现：`internal/native/csrc/apkguard.c`（守卫 C 源码，唯一由本项目编译的 native 代码）、
 > `internal/native/build_native.py`（NDK 交叉编译、`.agexpect` 摘要回填、16 KB 页对齐检查）、
 > `internal/passes/shell.go`（C1/C4/C5/C6 注入该库并调用）。
+>
+> **落地状态（已实现）**：C3 已按本文 §2.2/§6 的结论落地——**不依赖外部 LLVM/OLLVM**，
+> 在 `csrc/apkguard.c` + 新增的 `csrc/obfuscate.h` 中手写三项变换：
+> ① 敏感字符串加密（密文数组 + volatile 密钥流的运行期解密，明文不进源码与 .so）；
+> ② 6 个关键函数的控制流平坦化（`ag_seed`/`ag_derive`/`ag_debugged`/`ag_hooked`/
+> `ag_frida_port`/`ag_intact`，volatile 状态变量 + `for(;;) switch(st)`，经反汇编确认
+> -O2 下仍保留跳转表间接分派）；
+> ③ 不透明谓词（`x*(x+1)` 恒为偶数；noinline + volatile，且死分支不参与控制流，
+> 谓词即使被改坏也不改变行为）。
+> 编译面补 `-fno-ident -fvisibility=hidden -fno-unwind-tables -Wl,-s`。
+> 自动化验收见 `internal/native/obfuscate_test.go`（产物无敏感明文、密文逐串解密对拍、
+> JNI 符号仍导出）与既有 `embed_test.go`/`build_native.py --check`（`.agexpect`、16 KB 对齐）；
+> 运行期另在 Android 16 x86_64 模拟器与 WSL glibc 宿主二进制上验证 dlopen/JNI_OnLoad/
+> 反调试/反注入/完整性行为不变。完整 OLLVM 工具链（路线 A/B）仍按本文结论不做。
 
 ---
 
@@ -11,7 +25,7 @@
 
 1. **本项目的 C3 作用对象只能是 `libapkguard.so` 这一个我们自己的守卫库**。设计文档里 C3 的原始表述是「保护 native 层核心逻辑」，但本工具**不编译用户应用的 native 库**（用户应用的 `.so` 随 APK 一起进来，我们只做搬运/注入）。因此 C3 的真实防护对象是我们自己的守卫：派生种子、反调试/反注入/完整性校验逻辑。**必须据此下调它的价值评估。**
 2. **完整 OLLVM（LLVM Pass）对本项目性价比极低**：需要引入并长期维护一套与 NDK clang ABI 匹配的 LLVM 工具链（数百 MB），破坏「单二进制、零外部依赖」定位，却只保护一个 ~25 KB 的守卫库。建议**不做 LLVM Pass 版本**。
-3. **唯一现实落点是「C 源码层的最小等价变换」**：对 `ag_derive`、`ag_intact`、`ag_hooked`、`ag_debugged` 等少数函数手写/宏化「不透明谓词 + 指令替换 + 轻量平坦化」，无 LLVM 依赖，可确定性复现，并与现有 `build_native.py` 的摘要/对齐检查兼容。
+3. **唯一现实落点是「C 源码层的最小等价变换」（已实现）**：对 `ag_seed`、`ag_derive`、`ag_intact`、`ag_hooked`、`ag_debugged`、`ag_frida_port` 六个函数做了手工控制流平坦化，对全部敏感字符串（路径、注入特征、日志 tag/格式串）做密文存放 + 运行期解密，并在关键路径插入不透明谓词；无 LLVM 依赖，可确定性复现，与现有 `build_native.py` 的摘要/对齐检查兼容。
 4. 诚实结论：C3 的**实际防护增量是低到中**。守卫库最有效的保护是 **C2（SO 加壳）** 与 **C6（完整性自校验）**；OLLVM 只是让逆向者多花几小时。若目标是保护业务算法，正确路径是 B5/B6/B7 这些 DEX 层方案，不是 C3。
 
 ---
@@ -211,7 +225,7 @@ static const char AG_OLLVM_MARK[] = "AGOLLVM1";
 
 **为什么安全**：不动控制流结构（不做 CFF），只做数学等价替换与恒真假分支；语义由现有对拍测试兜底；失败时最坏是库编译不过或摘要不一致，能立刻在 CI 发现。
 
-**第二步（可选）**：对 `ag_derive` 一个函数做手工 CFF，并加「反汇编验证伪代码不再线性」的人工检查；仍不做全库。
+**第二步（已提前一并落地）**：实际落地取了超集——对 6 个函数（含 `ag_derive`、完整性自校验与三项检测）做手工 CFF，并已用反汇编确认 `-O2` 下每个函数的调度循环带跳转表间接分派；仍不做全库（SHA-256、ELF/ZIP 解析等结构复杂且非核心秘密的函数保持原样，降低改坏风险）。
 
 ---
 

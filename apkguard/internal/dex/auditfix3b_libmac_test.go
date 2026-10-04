@@ -154,9 +154,15 @@ func TestAuditfix3bLibMACDisabledNoMACInstructions(t *testing.T) {
 
 // auditfix3bLibGolden 是「未启用 MAC、含 C2 库载荷」时壳 DEX 的 SHA-256。
 //
-// 该值取自本改动**之前**的代码：它把「关闭 -payload-mac 时产物字节不变」
-// 这条承诺钉死。若将来有人在库解析路径上无条件加了常量或指令，这里立刻报警。
-const auditfix3bLibGolden = "9d687a4fe1f84c0ae84598a89cd5d5e8a27683b625b9b39d2a98ca69ab5c1c49"
+// 该值把「关闭 -payload-mac 时壳不引入 MAC 相关指令/常量」这条承诺钉死
+// （另有 TestAuditfix3bLibMACDisabledNoMACInstructions 从字符串面复核）。
+// 若将来有人在库解析路径上无条件加了常量或指令，这里立刻报警。
+//
+// 2026-10（B5 函数抽取）：Loader 新增了抽取计划回填的 3 个辅助方法
+// （q/p/t，见 loader.go）。它们对所有载荷 unconditional 生成，但以 trailer
+// 魔数（ExtractPlanMagic）为判据，未启用 B5 的载荷走到即原样返回，属于
+// **行为等价**的字节变化；因此这里重新基线化 golden，而不是保留旧值。
+const auditfix3bLibGolden = "119c8c2e128370d43b2bb745740d69664995afc988f505d2bda3db6c6ffbd8d9"
 
 // TestAuditfix3bLibMACDisabledGolden 用 golden 摘要比对关闭 MAC 时的壳 DEX。
 func TestAuditfix3bLibMACDisabledGolden(t *testing.T) {

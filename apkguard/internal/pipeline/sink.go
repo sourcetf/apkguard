@@ -80,6 +80,9 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 
 	// ---- E1: 签名 ----
 	if !opts.IsEnabled("E1") {
+		if opts.DualAPK {
+			return nil, fmt.Errorf("B9（双 APK 投放器）需要启用 E1（APK 签名）：插件 APK 必须签名后才能被系统安装器接受")
+		}
 		art.Note("E1 签名：未启用，输出未签名 APK")
 		return raw, nil
 	}
@@ -89,10 +92,10 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 		return nil, fmt.Errorf("加载密钥库失败: %w", err)
 	}
 
-	// 输入可能带有旧签名块，必须先剥离，否则新签名块的插入位置会错乱。
-	clean, err := zipx.StripSigningBlock(raw)
-	if err != nil {
-		return nil, fmt.Errorf("剥离旧签名块失败: %w", err)
+	// B9 的插件必须是「能被系统安装器接受」的 APK：至少保留一种签名方案。
+	// 全禁（-no-v1 -no-v2 -no-v3）时 E1 实际什么也不签，宿主里的插件必然装不上。
+	if opts.DualAPK && opts.NoV1 && opts.NoV2 && opts.NoV3 {
+		return nil, fmt.Errorf("B9（双 APK 投放器）要求插件 APK 至少有 v1/v2/v3 之一：只启用 v4 或全部禁用签名的 APK 无法被系统安装器接受，请去掉对应的 -no-v* 选项")
 	}
 
 	// v3 签名块里的 SDK 区间必须覆盖真实设备，否则平台会跳过该 signer；
@@ -132,25 +135,64 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 		}
 	}
 
-	sr, err := sign.Sign(clean, ks, sign.Options{
-		V1:     !opts.NoV1,
-		V2:     !opts.NoV2,
-		V3:     !opts.NoV3,
-		V4:     opts.V4,
-		MinSDK: minSDK,
-		MaxSDK: maxSDK,
-		Stamp:  stamp,
-		Align:  alignOpts,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("签名失败: %w", err)
+	// signOne 对一份「已对齐、未签名」的归档执行 v1/v2/v3/v4 签名。
+	// B9 需要对插件与宿主各签一次，抽成闭包避免两处参数漂移。
+	signOne := func(data []byte, minS uint32) ([]byte, []byte, error) {
+		// 输入可能带有旧签名块，必须先剥离，否则新签名块的插入位置会错乱。
+		clean, err := zipx.StripSigningBlock(data)
+		if err != nil {
+			return nil, nil, fmt.Errorf("剥离旧签名块失败: %w", err)
+		}
+		sr, err := sign.Sign(clean, ks, sign.Options{
+			V1:     !opts.NoV1,
+			V2:     !opts.NoV2,
+			V3:     !opts.NoV3,
+			V4:     opts.V4,
+			MinSDK: minS,
+			MaxSDK: maxSDK,
+			Stamp:  stamp,
+			Align:  alignOpts,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("签名失败: %w", err)
+		}
+		return sr.APK, sr.IDSig, nil
 	}
-	signed := sr.APK
+
+	signed, idsig, err := signOne(raw, minSDK)
+	if err != nil {
+		return nil, err
+	}
+
+	// ---- B9: 双 APK 投放器（产物形态改写，必须在插件签名之后）----
+	//
+	// 此时 signed 是「已走完全部加固与签名」的插件 APK；把它加密进宿主
+	// assets，再用同一密钥库给宿主签名。宿主 minSdk 固定 24（宿主 Manifest
+	// 如此声明），v3 区间下界取两者较大值。
+	if opts.DualAPK {
+		hostRaw, err := buildDualAPKHost(signed, art, opts, alignOpts)
+		if err != nil {
+			return nil, fmt.Errorf("B9 宿主 APK 构建失败: %w", err)
+		}
+		hostMinSDK := minSDK
+		if hostMinSDK < dualAPKHostMinSDK {
+			hostMinSDK = dualAPKHostMinSDK
+		}
+		host, hostIDSig, err := signOne(hostRaw, hostMinSDK)
+		if err != nil {
+			return nil, fmt.Errorf("B9 宿主 APK 签名失败: %w", err)
+		}
+		art.Put(sharedKeyPluginAPK, signed)
+		signed = host
+		idsig = hostIDSig
+	}
+
 	// v4 的签名文件（.idsig）是独立于 APK 的一个文件，必须交给调用方落盘——
 	// 否则 `-v4` 只是「算了一遍但没交给任何人」，CLI 的帮助文本却写着会生成它。
 	// 这里借 Shared 传给 pipeline.Result（Sink 的返回值只有 APK 字节流）。
-	if len(sr.IDSig) > 0 {
-		art.Put(sharedKeyIDSig, sr.IDSig)
+	// B9 启用时落盘的是宿主 APK 对应的 .idsig（插件的不对外暴露）。
+	if len(idsig) > 0 {
+		art.Put(sharedKeyIDSig, idsig)
 	}
 
 	var schemes []string
@@ -168,7 +210,10 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 	}
 	// 别名只有 JKS 才有意义（PKCS12 用公文包口令定位条目，不暴露别名），
 	// 因此为空时改为报告来源类型，避免出现「（别名 ）」这样的空占位。
-	if ks.Alias != "" {
+	if opts.DualAPK {
+		art.Note("B9 宿主签名：%s（与插件同一密钥库 %s）——宿主与插件是两个独立安装的包，卸载/更新互不联动",
+			join(schemes, "+"), ks.Source)
+	} else if ks.Alias != "" {
 		art.Note("E1 签名：%s（%s 密钥库，别名 %s）", join(schemes, "+"), ks.Source, ks.Alias)
 	} else {
 		art.Note("E1 签名：%s（%s 密钥库）", join(schemes, "+"), ks.Source)

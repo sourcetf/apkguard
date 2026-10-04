@@ -9,12 +9,13 @@ import (
 
 // TestAllFeaturesUnique 验证功能项 ID 唯一且数量符合设计文档。
 //
-// 设计文档列了 38 项，另有 2 项按参考样本的手法补充实现（A15 巨型 Manifest
-// 填充、B8 载荷容器化、A16~A20 欺骗类、C2 SO 加壳、C7 原生库伪装），因此总数为 46。
+// 设计文档列了 38 项，另有若干按参考样本与落地设计补充的项（A15~A20 欺骗类、
+// B8 载荷容器化、B9 双 APK 投放器、C2 SO 加壳、C7 原生库伪装），本轮再落地
+// B5/B6/B7/C3，因此总数为 47。
 func TestAllFeaturesUnique(t *testing.T) {
 	fs := All()
-	if len(fs) != 46 {
-		t.Errorf("功能项数量应为 46，实际 %d", len(fs))
+	if len(fs) != 47 {
+		t.Errorf("功能项数量应为 47，实际 %d", len(fs))
 	}
 	seen := map[FeatureID]bool{}
 	for _, f := range fs {
@@ -34,10 +35,38 @@ func TestAllFeaturesUnique(t *testing.T) {
 	for _, f := range fs {
 		counts[f.ID[0]]++
 	}
-	want := map[byte]int{'A': 20, 'B': 8, 'C': 7, 'D': 5, 'E': 6}
+	want := map[byte]int{'A': 20, 'B': 9, 'C': 7, 'D': 5, 'E': 6}
 	for k, v := range want {
 		if counts[k] != v {
 			t.Errorf("%c 类功能项应为 %d 个，实际 %d", k, v, counts[k])
+		}
+	}
+}
+
+// TestAllFeaturesImplemented 验证注册表里的 47 项全部已实现，且
+// implementedIDs 与 All() 的 Implemented 标记一致。
+//
+// 本轮起不再有「已注册但未实现」的功能项；新增功能项而实现未跟上时，
+// 这条测试会立即失败，提醒补 register/实现或把它从注册表里拿掉。
+func TestAllFeaturesImplemented(t *testing.T) {
+	fs := All()
+	ids := ImplementedIDs()
+	if len(ids) != len(fs) {
+		t.Fatalf("已实现 %d 项 != 注册 %d 项：本轮之后应为 47/47", len(ids), len(fs))
+	}
+	seen := map[FeatureID]bool{}
+	for _, id := range ids {
+		seen[id] = true
+	}
+	for _, f := range fs {
+		if f.Implemented != Implemented(f.ID) {
+			t.Errorf("%s 的 Implemented=%v 与 implementedIDs 不一致", f.ID, f.Implemented)
+		}
+		if !f.Implemented {
+			t.Errorf("%s 尚未实现", f.ID)
+		}
+		if !seen[f.ID] {
+			t.Errorf("%s 不在 ImplementedIDs() 中", f.ID)
 		}
 	}
 }
@@ -181,12 +210,91 @@ func TestValidateRejectsLibOptionsWithoutC7(t *testing.T) {
 	}
 }
 
-// TestValidateRejectsExtractRatio 验证 B5 的死开关被显式拒绝。
-func TestValidateRejectsExtractRatio(t *testing.T) {
+// TestValidateExtractRatioNoLongerRejected 验证 B5 落地后抽取比例不再被旧的
+// 「尚未实现」文案拒绝。
+//
+// 历史：B5 未实现时 -extract-ratio 会被显式拒绝（死开关）。B5 已实现，
+// 比例参数成为调节项，合法性只剩 0~100 的范围校验（TestValidateRanges 覆盖）。
+// B5 的开关是 ExtractMethods（0=关闭），与比例无关。
+func TestValidateExtractRatioNoLongerRejected(t *testing.T) {
 	o := &Options{Enabled: map[FeatureID]bool{"E1": false}, In: "a.apk", ExtractRatio: 50}
+	if err := o.Validate(); err != nil {
+		t.Fatalf("B5 已实现，ExtractRatio=50 不应再报错，实际: %v", err)
+	}
+	if !Implemented("B5") {
+		t.Fatal("B5 应已加入 implementedIDs")
+	}
+}
+
+// TestValidateRejectsUnimplementedRegisteredFeature 验证「已注册但未实现」
+// 的拒绝分支仍然有效。
+//
+// 本轮之后 47 项全部已实现，注册表里没有现成的未实现项可用；这里直接在
+// 测试内临时从 implementedIDs 摘掉一项（E5，无依赖，便于隔离），构造
+// 「注册项存在、实现缺失」的场景，断言 Validate 返回「尚未实现」类错误，
+// 防止这条兜底校验在后续重构中被悄悄删除。测试结束前恢复原状。
+func TestValidateRejectsUnimplementedRegisteredFeature(t *testing.T) {
+	const id = FeatureID("E5")
+	prev, existed := implementedIDs[id]
+	if !existed {
+		t.Fatalf("precondition: %s 应原本已实现", id)
+	}
+	delete(implementedIDs, id)
+	defer func() {
+		if prev {
+			implementedIDs[id] = true
+		}
+	}()
+
+	// 先确认场景成立：注册表里仍有 E5，但 Implemented(E5)==false。
+	if _, ok := ByID()[id]; !ok {
+		t.Fatalf("precondition: %s 应在 All() 注册表里", id)
+	}
+	if Implemented(id) {
+		t.Fatalf("precondition: %s 应处于未实现状态", id)
+	}
+
+	o := &Options{Enabled: map[FeatureID]bool{"E1": false, id: true}, In: "a.apk"}
 	err := o.Validate()
-	if err == nil || !strings.Contains(err.Error(), "B5") {
-		t.Fatalf("ExtractRatio=50 应因 B5 未实现被拒绝，实际: %v", err)
+	if err == nil {
+		t.Fatal("启用已注册但未实现的功能项必须报错，否则会静默地什么都不做")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "尚未实现") || !strings.Contains(msg, "E5") {
+		t.Fatalf("错误应点明 E5 尚未实现，实际: %v", err)
+	}
+}
+
+// TestNewOptionFieldsJSONContract 钉住本轮新增 6 个字段的 JSON tag 与零值语义。
+//
+// Options 是 Web/配置文件反序列化的目标：缺键即 Go 零值 = 关闭/空，因此
+// 「默认关闭」不需要任何额外处理；但 tag 名必须稳定，Web 端 collect() 的键
+// 与之逐字对应（cmd/apkguard 的 TestWebFormCoversAllOptions 守住这点）。
+func TestNewOptionFieldsJSONContract(t *testing.T) {
+	b, err := json.Marshal(Options{})
+	if err != nil {
+		t.Fatalf("序列化零值 Options 失败: %v", err)
+	}
+	for _, want := range []string{
+		`"rename_libraries":false`,
+		`"dual_apk":false`,
+		`"extract_methods":0`,
+		`"vmp_methods":0`,
+		`"dex2c_methods":0`,
+		`"ndk_path":""`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("零值 Options 应包含 %s，实际: %s", want, b)
+		}
+	}
+
+	// 反序列化缺键 = 关闭/空（API 调用方必须能显式关闭，不能被强制翻成 true）。
+	var o Options
+	if err := json.Unmarshal([]byte(`{"in":"a.apk"}`), &o); err != nil {
+		t.Fatalf("反序列化失败: %v", err)
+	}
+	if o.RenameLibraries || o.DualAPK || o.ExtractMethods != 0 || o.VMPMethods != 0 || o.Dex2CMethods != 0 || o.NDKPath != "" {
+		t.Fatalf("JSON 缺键时 6 个新字段应保持零值，实际: %+v", o)
 	}
 }
 

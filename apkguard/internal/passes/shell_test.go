@@ -447,15 +447,17 @@ func TestImplementedMatchesRegistry(t *testing.T) {
 	for _, p := range Registry().Passes() {
 		registered[p.ID()] = true
 	}
-	// E1/E2/E3 由 Sink 收尾流程实现，E5 由 CLI 的批量入口实现，都不在
-	// Pass 注册表里，因此这里必须把它们算作「已实现」，否则会产生假报错。
+	// E1/E2/E3 由 Sink 收尾流程实现，E5 由 CLI 的批量入口实现，C3 是原生库的
+	// 编译期变换（作用于我们自己的 .so，没有 Pass 可注册），都不在 Pass 注册表里，
+	// 因此这里必须把它们算作「已实现」，否则会产生假报错。
 	//
 	// 但这**不能**只是无条件假设——否则「实现被删掉、implementedIDs 还留着」
 	// 就没人发现。每一项都有对应的功能性守卫，删掉实现会让守卫失败：
 	//   E1/E2/E3 → internal/pipeline/auditfix_impl_test.go（正反例，判据取自产物字节）
 	//   E5       → cmd/apkguard/batch_test.go（目录批量真跑流水线）
+	//   C3       → internal/native/obfuscate_test.go（敏感明文串扫描 + 预编译库一致性）
 	// 新增「不在注册表里却标为已实现」的项时，必须同时补上这样的守卫。
-	for _, id := range []config.FeatureID{"E1", "E2", "E3", "E5"} {
+	for _, id := range []config.FeatureID{"E1", "E2", "E3", "E5", "C3"} {
 		registered[id] = true
 	}
 

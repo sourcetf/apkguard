@@ -52,6 +52,61 @@ func entryData(t *testing.T, e *zipx.Entry) []byte {
 	return data
 }
 
+// randSegLike 判断 s 是否为长度为 [lo,hi] 的 ASCII 字母数字串（与 randSeg 同字符集）。
+func randSegLike(s string, lo, hi int) bool {
+	if len(s) < lo || len(s) > hi {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// isA12PrefixAbuseName 判断名字是否属于 A12 的「前缀滥用」族：
+// 关键文件前缀 + 恰好 6 位字母数字（randSeg(rnd, 6)）。
+//
+// A12 的归一化近重名族也以相同前缀开头（AndroidManifest.xml//.xml 等），
+// 但它前缀之后不是 6 位纯字母数字；不分族精确计数会让两个族的断言互相污染
+// （旧写法把所有带前缀的条目都算成前缀滥用）。
+func isA12PrefixAbuseName(name string) bool {
+	for _, p := range junkPathPrefixes {
+		if rest, ok := strings.CutPrefix(name, p); ok && randSegLike(rest, 6, 6) {
+			return true
+		}
+	}
+	return false
+}
+
+// isA10KotlinName 判断名字是否属于 A10 的 kotlin/ 伪装族：
+// kotlin/<4~8 位字母数字>/<4~8 位字母数字>.<xml|bin|png>。
+//
+// A12 归一化近重名族的 kotlin//kotlin.kotlin_builtins/.xml 也以 "kotlin/" 开头，
+// 但第二段含 `.`、段数也不符，必须靠精确判据排除。
+func isA10KotlinName(name string) bool {
+	rest, ok := strings.CutPrefix(name, "kotlin/")
+	if !ok {
+		return false
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || !randSegLike(parts[0], 4, 8) {
+		return false
+	}
+	leaf := parts[1]
+	i := strings.LastIndexByte(leaf, '.')
+	if i < 0 {
+		return false
+	}
+	ext := leaf[i+1:]
+	if ext != "xml" && ext != "bin" && ext != "png" {
+		return false
+	}
+	return randSegLike(leaf[:i], 4, 8)
+}
+
 // TestJunkSharedPayloadFamily 钉住族 A：A10 的畸形/近重名族与 A12 的路径攻击
 // 共用**同一份** 176 字节随机载荷（样本 323 条共用载荷的分布里，绝对路径 84、
 // META-INF/ 35、classes.dex/ 32、resources.arsc/ 31、AndroidManifest.xml/ 28
@@ -73,12 +128,10 @@ func TestJunkSharedPayloadFamily(t *testing.T) {
 		if bytes.Equal(data, payload) {
 			shared++
 		}
-		for _, p := range junkPathPrefixes {
-			if strings.HasPrefix(e.NameString(), p) {
-				prefixTotal++
-				if bytes.Equal(data, payload) {
-					prefixHave++
-				}
+		if isA12PrefixAbuseName(e.NameString()) {
+			prefixTotal++
+			if bytes.Equal(data, payload) {
+				prefixHave++
 			}
 		}
 	}
@@ -246,13 +299,10 @@ func TestJunkKotlinFamily(t *testing.T) {
 	exts := map[string]bool{"xml": false, "bin": false, "png": false}
 	for _, e := range art.Entries() {
 		name := e.NameString()
-		if !strings.HasPrefix(name, "kotlin/") {
+		if !isA10KotlinName(name) {
 			continue
 		}
 		n++
-		if strings.Count(name, "/") != 2 {
-			t.Fatalf("kotlin/ 条目 %q 不是 kotlin/<词>/<词>.<ext> 形态", name)
-		}
 		ext := name[strings.LastIndexByte(name, '.')+1:]
 		if _, ok := exts[ext]; !ok {
 			t.Fatalf("kotlin/ 条目 %q 的扩展名 %q 不在 {xml,bin,png}", name, ext)

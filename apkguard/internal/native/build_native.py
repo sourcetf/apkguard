@@ -207,9 +207,24 @@ def build(ndk_bin):
         # 无法装载（Google Play 自 2025-11 起对 targetSdk 35 的提交强制检查）。
         # 32 位 ABI 一并设置只是为了让三个 ABI 的产物一致、便于断言，
         # 代价是几 KB 的填充。
+        #
+        # C3（源码层控制流混淆）的常规强化标志：
+        #   -fno-ident            不写编译器版本等 .comment 标识
+        #   -fvisibility=hidden   只导出带默认可见性的符号（JNIEXPORT 的
+        #                         Java_com_apkguard_* / JNI_OnLoad，jni.h 里
+        #                         它们就是 __attribute__((visibility("default")))），
+        #                         内部 static 符号不再进入动态符号表
+        #   -fno-unwind-tables / -fno-asynchronous-unwind-tables  去掉 C 代码
+        #                         用不到的 .eh_frame，减少可读信息与体积
+        #   -Wl,-s                链接后 strip 静态符号表（含 STT_FILE 源文件名）
+        #                         ；动态符号表保留，dladdr 依旧能取回本库路径
+        #                         （它只需要映射区间，不需要符号名）
         r = subprocess.run(
             [cc, "-shared", "-O2", "-fPIC", "-DAG_JNI",
-             "-Wl,-z,max-page-size=16384", "-o", out, SRC, "-ldl", "-llog"],
+             "-fno-ident", "-fvisibility=hidden",
+             "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+             "-Wl,-z,max-page-size=16384", "-Wl,-s", "-o", out, SRC,
+             "-ldl", "-llog"],
             capture_output=True, text=True)
         if r.returncode != 0:
             print("  编译 %s 失败：\n%s" % (abi, r.stderr))

@@ -114,6 +114,20 @@ harden 9-cff         -enable "A1,A4,A6,A14,E1,E2,E3,E6"
 # B1/B2/B3 提供壳链路；-lib-name 显式指定假库名，便于产物断言。
 harden 11-libdisguise -enable "A1,A4,B1,B2,B3,C1,C7,A14,E1,E2,E3,E6" -lib-name libguardx.so
 
+# 剩余功能项（本轮新实现，全部按需开启）。B5/B6/B7 三组分列：它们改写 DEX 的
+# 方式不同且对「同一方法归属谁」互斥，混在一组会互相跳过、断言也就失去意义。
+harden 12-extract    -enable "A1,A4,B1,B2,B3,B5,A14,E1,E2,E3,E6" -extract-methods 20
+harden 13-vmp        -enable "A1,A4,B1,B2,B3,B6,A14,E1,E2,E3,E6" -vmp-methods 20
+# B7 需要 NDK 才能真编译；CI 的 e2e 作业不保证有 NDK，所以这里只覆盖「功能项被
+# 启用、依赖校验通过、零影响」这条路径（方法数 0），真正的「翻译 + 三 ABI 编译」
+# 由 internal/dex2c 的 TestCompileWithRealNDK 在提供 APKGUARD_TEST_NDK 时覆盖。
+harden 14-dex2c      -enable "A1,A4,B1,B2,B3,B7,A14,E1,E2,E3,E6" -dex2c-methods 0
+# C3 是原生库的编译期变换（无 Pass），启用它要带上 C1 的壳链路。
+harden 15-native-obf -enable "A1,A4,B1,B2,B3,C1,C3,A14,E1,E2,E3,E6"
+# B9 改变产物形态（产物是宿主、原应用变成加密插件），因此单独一组，
+# 并且不套用针对原应用的常规产物断言，只验它是合法且可签名的宿主。
+harden 16-dualapk    -enable "A1,A4,B1,B2,B3,B9,A14,E1,E2,E3,E6" -dual-apk
+
 # C2 SO 加壳需要输入里**真的有一个业务 .so**，否则 C2 是空操作、产物断言无从
 # 谈起。testapp 没有原生库，这里把仓库里的守卫库复制成 lib/<abi>/libdummy.so
 # 注入测试 APK（只验产物结构、不在设备上运行，所以不要求它是可加载的业务库）。
@@ -225,6 +239,7 @@ verify 9-cff.apk         "A1,A4,A6,A14"
 verify 10-soenc.apk      "B1,B2,C2" --c2-lib libdummy.so --c2-size "$C2_SIZE"
 verify 11-libdisguise.apk "B1,B2,C7"
 # E5 的两个批量产物也要过产物断言（A14 统一时间戳）。
+verify 16-dualapk.apk  "B9"
 verify e5a-protected.apk "A14"
 verify e5b-protected.apk "A14"
 

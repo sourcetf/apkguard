@@ -118,27 +118,32 @@ jobs:
           # 用 scripts/count-features.py 解析而不是内联 grep：
           # 默认启用标记是 U+221A（UTF-8 三字节），grep 的 . 是否按字符匹配依赖
           # locale；且 -list 每个功能项占两行、描述里也会出现 ID，直接数行会错。
-          echo "-- 功能项数量应为 46"
+          echo "-- 功能项数量应为 47"
           # 注意：本步骤的 working-directory 是 apkguard/，脚本在仓库根的 scripts/
           n="$("$BIN" -list | python3 ../scripts/count-features.py)"
           echo "   解析到 $n 项"
-          [ "$n" -eq 46 ] || { echo "::error::功能项数量不是 46（实际 $n）"; exit 1; }
+          [ "$n" -eq 47 ] || { echo "::error::功能项数量不是 47（实际 $n）"; exit 1; }
 
-          # 未实现的功能项必须是显式错误，而不是静默跳过——
-          # 否则使用者会以为自己拿到了 VMP/反射化等防护，实际完全没有。
+          # 未知功能项 ID 必须是显式错误，而不是静默忽略。
           #
-          # 断言必须匹配**错误文案**而不是功能项 ID：`-enable B6` 的输出里
-          # 「启用功能项: …B6…」这一行也含 B6，只 grep ID 会把「根本没校验」
-          # 误判成「已报错」（旧版对 A6 就是这么一条空断言，把 A6 换成任意
-          # 已实现项也照样通过）。这里锁定错误正文。
-          echo "-- 未实现的功能项应被拒绝（用确定未实现的 B6 = VMP）"
+          # 本轮之后 47 个功能项全部已实现，「用一个确定未实现的功能项断言
+          # -enable 必须报错」已没有可用对象；这里改为覆盖同一条校验路径的
+          # 未知 ID 分支（applyFeatureList）。「已注册但未实现」的拒绝分支
+          # 由 Go 单测覆盖（internal/config/config_test.go 临时从 implementedIDs
+          # 摘掉一项构造场景）。
+          #
+          # 断言必须匹配**错误文案**而不是功能项 ID：`-enable ZZZ` 的输出里
+          # 请求行也可能回显 ZZZ，只 grep ID 会把「根本没校验」误判成「已报错」
+          # （旧版对 A6 就是这么一条空断言，把 A6 换成任意已实现项也照样通过）。
+          # 这里锁定错误正文。
+          echo "-- 未知功能项 ID 应被拒绝（-enable ZZZ）"
           printf 'x' > /tmp/fake.apk
-          out="$("$BIN" -in /tmp/fake.apk -enable B6 2>&1 || true)"
+          out="$("$BIN" -in /tmp/fake.apk -enable ZZZ 2>&1 || true)"
           echo "$out" | head -3
-          if echo "$out" | grep -qE '尚未实现.*B6'; then
+          if echo "$out" | grep -qE '未知功能项.*ZZZ'; then
             echo "   正确报错"
           else
-            echo "::error::启用未实现的 B6 没有按要求报错"; exit 1
+            echo "::error::启用未知功能项 ZZZ 没有按要求报错"; exit 1
           fi
 
           echo "-- 缺密钥库时应报错"

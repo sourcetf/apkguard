@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"apkguard/internal/arsc"
@@ -125,7 +126,18 @@ func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool,
 	if err != nil {
 		return fmt.Errorf("重写 %s 失败: %w", arscName, err)
 	}
+	// A5/A11 的三个 ARSC 子行为，各自有 Shared 幂等标记、默认开启：
+	// 条目名随机化（keyStrings）、资源值零宽副本（全局池末尾追加）、
+	// 未使用 typeId 的占位名（typeStrings）。
 	out, err = randomizeArscKeys(art, opts, out, tag)
+	if err != nil {
+		return err
+	}
+	out, err = padArscValues(art, opts, out, tag)
+	if err != nil {
+		return err
+	}
+	out, err = placeholderArscTypeNames(art, out, tag)
 	if err != nil {
 		return err
 	}
@@ -189,6 +201,14 @@ func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool,
 // 或调用方手工各跑一次）；标记存于 Artifact.Shared，保证条目名只随机化一次。
 const arscKeysDoneKey = "A5.keysdone"
 
+// arscPadDoneKey / arscTypeDoneKey 是另外两个 A5/A11 子行为的幂等标记：
+// 资源值零宽副本、未使用 typeId 的 typeStrings 占位名。同样存于
+// Artifact.Shared，保证同一产物上只执行一次。
+const (
+	arscPadDoneKey  = "A5.paddone"
+	arscTypeDoneKey = "A5.typedone"
+)
+
 // randomizeArscKeys 执行资源条目名（keyStrings）随机化——A5/A11 的子行为，
 // 默认开启，无需单独开关（随 A5/A11 一起启用/关闭）。
 //
@@ -228,6 +248,53 @@ func randomizeArscKeys(art *pipeline.Artifact, opts *config.Options, data []byte
 	art.Stat(tag+".keysdex", fmt.Sprintf("%d+%d", keep.fromIn, keep.fromArt))
 	art.Stat(tag+".keysdexhit", fmt.Sprint(st.KeptDex))
 	art.Stat(tag+".keysprefixed", fmt.Sprint(st.Prefixed))
+	return out, nil
+}
+
+// padArscValues 执行「资源值零宽副本」——A5/A11 的子行为，默认开启，
+// 无独立开关（随 A5/A11 一起启用/关闭）。
+//
+// 只往全局字符串池**末尾**追加带 U+200E/U+200F 的副本，且不被任何 entry
+// 引用：目的与样本一致——同一逻辑值在池里不再有唯一字节形态，按内容做
+// 签名/去重/白名单的规则被稀释；同时已有条目下标不动，运行时资源解析
+// 完全不受影响。
+func padArscValues(art *pipeline.Artifact, opts *config.Options, data []byte, tag string) ([]byte, error) {
+	if done, _ := art.Get(arscPadDoneKey).(bool); done {
+		art.Note("%s 资源值零宽副本：本产物已执行过，跳过（幂等）", tag)
+		return data, nil
+	}
+	out, st, err := arsc.PadValues(data, arsc.ValuePadOptions{Seed: opts.Seed + "/arscpad"})
+	if err != nil {
+		return nil, fmt.Errorf("生成 %s 的资源值零宽副本失败: %w", arscName, err)
+	}
+	art.Put(arscPadDoneKey, true)
+	art.Note("%s 资源值零宽副本：%d 条（覆盖 %d 个逻辑值，%d 条重前缀 + %d 条单标记；全部追加在全局字符串池末尾，均未被任何 entry 引用）；另有 %d 条被引用值因 res/ 路径或形状不适合复制而排除",
+		tag, st.Appended, st.Originals, st.Heavy, st.Single, st.ExcludedShape)
+	art.Stat(tag+".padstrings", fmt.Sprint(st.Appended))
+	art.Stat(tag+".padvalues", fmt.Sprint(st.Originals))
+	return out, nil
+}
+
+// placeholderArscTypeNames 执行「未使用 typeId 的占位名」——A5/A11 的子行为，
+// 默认开启：未使用 id 的 typeStrings 槽位改名为 ?<id>（与样本一致），
+// 已使用的类型名保持原样，不影响 getIdentifier 与 aapt2 的类型名解析。
+func placeholderArscTypeNames(art *pipeline.Artifact, data []byte, tag string) ([]byte, error) {
+	if done, _ := art.Get(arscTypeDoneKey).(bool); done {
+		art.Note("%s typeStrings 占位名：本产物已执行过，跳过（幂等）", tag)
+		return data, nil
+	}
+	out, st, err := arsc.PlaceholderTypeNames(data)
+	if err != nil {
+		return nil, fmt.Errorf("改写 %s 的 typeStrings 占位名失败: %w", arscName, err)
+	}
+	art.Put(arscTypeDoneKey, true)
+	ids := make([]string, 0, len(st.IDs))
+	for _, id := range st.IDs {
+		ids = append(ids, strconv.Itoa(id))
+	}
+	art.Note("%s typeStrings 占位名：%d 个（未使用 id：%s；已使用的类型名保持原样，getIdentifier/aapt2 不受影响）",
+		tag, st.Placeholders, strings.Join(ids, ","))
+	art.Stat(tag+".typetokens", fmt.Sprint(st.Placeholders))
 	return out, nil
 }
 

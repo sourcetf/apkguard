@@ -9,6 +9,9 @@ export ANDROID_NDK_HOME="$SDK/ndk/26.1.10909125"
 export PATH=$HOME/goroot/bin:$PATH
 
 echo "== 重编 =="
+# C3 的强化编译标志（-O2 -fno-ident -fvisibility=hidden -fno-unwind-tables
+# -fno-asynchronous-unwind-tables -Wl,-s，保留 JNIEXPORT 导出与 16 KB 对齐）
+# 在 build_native.py 的 build() 里，本脚本只负责调用与校验。
 python3 "$REPO/apkguard/internal/native/build_native.py" || exit 1
 
 echo

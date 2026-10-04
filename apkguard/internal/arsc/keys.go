@@ -28,6 +28,7 @@ const (
 	typeType    = 0x0201 // RES_TABLE_TYPE_TYPE
 
 	// ResTable_entry.flags（compact 形态复用同一字段）。
+	entryFlagComplex = 0x0001 // 复合 entry：后跟 ResTable_map_entry
 	entryFlagCompact = 0x0008
 	// ResTable_type.flags。
 	typeFlagSparse   = 0x01 // 稀疏条目数组：(u16 idx, u16 offset/4) 对
@@ -92,19 +93,9 @@ type KeyRenameStats struct {
 // string/color/dimen/integer/bool → vx_s_/vx_c_/vx_d_/vx_i_/vx_b_，其余 vx_x_）。
 func RandomizeKeys(data []byte, opts KeyRenameOptions) ([]byte, KeyRenameStats, error) {
 	var st KeyRenameStats
-	if len(data) < tableHeaderLen {
-		return nil, st, fmt.Errorf("arsc: 数据过短")
-	}
-	if binary.LittleEndian.Uint16(data[0:]) != typeTable {
-		return nil, st, fmt.Errorf("arsc: 不是 RES_TABLE_TYPE（0x%04x）", binary.LittleEndian.Uint16(data[0:]))
-	}
-	hdr := int(binary.LittleEndian.Uint16(data[2:]))
-	if hdr < tableHeaderLen || hdr > len(data) {
-		return nil, st, fmt.Errorf("arsc: 表头长度非法 %d", hdr)
-	}
-	total := int(binary.LittleEndian.Uint32(data[4:]))
-	if total < hdr || total > len(data) {
-		return nil, st, fmt.Errorf("arsc: 表长度非法 %d", total)
+	hdr, total, err := tableSpan(data)
+	if err != nil {
+		return nil, st, err
 	}
 
 	pkgs, err := scanPackages(data, hdr, total)
@@ -233,33 +224,78 @@ func (pk *pkgKeys) typeID(i int) int { return pk.keyType[i] }
 // 顶层块形如：全局字符串池 → 包 1 → 包 2 → …（表头没有任何绝对偏移）。
 func scanPackages(data []byte, start, end int) ([]*pkgKeys, error) {
 	var out []*pkgKeys
+	var perr error
+	err := forEachTopChunk(data, start, end, func(t uint16, p, sz int) bool {
+		if t != typePackage {
+			return true
+		}
+		pk, err := parsePackageKeys(data, p, sz)
+		if err != nil {
+			perr = err
+			return false
+		}
+		if pk != nil {
+			out = append(out, pk)
+		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if perr != nil {
+		return nil, perr
+	}
+	return out, nil
+}
+
+// tableSpan 校验 RES_TABLE 头部，返回表头长度与表长度。
+//
+// 三个改写入口（RandomizeKeys / PadValues / PlaceholderTypeNames）共用这一份
+// 头部校验，避免各自的边界判断出现漂移。
+func tableSpan(data []byte) (hdr, total int, err error) {
+	if len(data) < tableHeaderLen {
+		return 0, 0, fmt.Errorf("arsc: 数据过短")
+	}
+	if binary.LittleEndian.Uint16(data[0:]) != typeTable {
+		return 0, 0, fmt.Errorf("arsc: 不是 RES_TABLE_TYPE（0x%04x）", binary.LittleEndian.Uint16(data[0:]))
+	}
+	hdr = int(binary.LittleEndian.Uint16(data[2:]))
+	if hdr < tableHeaderLen || hdr > len(data) {
+		return 0, 0, fmt.Errorf("arsc: 表头长度非法 %d", hdr)
+	}
+	total = int(binary.LittleEndian.Uint32(data[4:]))
+	if total < hdr || total > len(data) {
+		return 0, 0, fmt.Errorf("arsc: 表长度非法 %d", total)
+	}
+	return hdr, total, nil
+}
+
+// forEachTopChunk 按顺序遍历表头之后的顶层块，fn 对每个块调用一次。
+//
+// 与 scanPackages 共用同一套「未知块/尾部填充」校验：type=0 且 size=0 视为
+// 尾部对齐填充（要求全零，避免把未知数据当填充静默跳过），其余块必须长度自洽。
+// fn 返回 false 时提前停止（用于错误传播）。
+func forEachTopChunk(data []byte, start, end int, fn func(typ uint16, off, size int) bool) error {
 	for p := start; p+8 <= end; {
 		t := binary.LittleEndian.Uint16(data[p:])
 		sz := int(binary.LittleEndian.Uint32(data[p+4:]))
 		if t == 0 && sz == 0 {
-			// 尾部对齐填充：要求全零，避免把未知数据当填充静默跳过。
 			for _, b := range data[p:end] {
 				if b != 0 {
-					return nil, fmt.Errorf("arsc: 表尾出现非零的未知块（偏移 %d）", p)
+					return fmt.Errorf("arsc: 表尾出现非零的未知块（偏移 %d）", p)
 				}
 			}
 			break
 		}
 		if sz < 8 || p+sz > end {
-			return nil, fmt.Errorf("arsc: 块（type=0x%04x，偏移 %d）长度非法 %d", t, p, sz)
+			return fmt.Errorf("arsc: 块（type=0x%04x，偏移 %d）长度非法 %d", t, p, sz)
 		}
-		if t == typePackage {
-			pk, err := parsePackageKeys(data, p, sz)
-			if err != nil {
-				return nil, err
-			}
-			if pk != nil {
-				out = append(out, pk)
-			}
+		if !fn(t, p, sz) {
+			break
 		}
 		p += sz
 	}
-	return out, nil
+	return nil
 }
 
 // parsePackageKeys 解析单个包块；包内没有可改写的 keyStrings 时返回 (nil, nil)。
@@ -338,6 +374,23 @@ func collectTypeChunkKeys(data []byte, off, size int, out map[int]int) {
 	if typeID <= 0 || typeID > 255 {
 		return
 	}
+	forEachEntry(data, off, size, func(eo, end int) bool {
+		addEntryKey(data, eo, end, typeID, out)
+		return true
+	})
+}
+
+// forEachEntry 遍历一个 ResTable_type（0x0201）块中每个非空 entry 的
+// 起始偏移与块尾边界。块结构异常时直接停止（不报错）——调用方只做
+// 「更少收集」而不是猜测，异常输入下宁少勿多。
+//
+// entriesStart 之后的偏移数组有三种编码（稀疏 48 位下标/32 位偏移、
+// 16 位偏移、32 位偏移），统一在这里处理，避免调用方各写一份而漂移。
+func forEachEntry(data []byte, off, size int, fn func(eo, end int) bool) {
+	hdr := int(binary.LittleEndian.Uint16(data[off+2:]))
+	if hdr < 20 || hdr > size {
+		return
+	}
 	flags := data[off+9]
 	entryCount := int(binary.LittleEndian.Uint32(data[off+12:]))
 	entriesStart := int(binary.LittleEndian.Uint32(data[off+16:]))
@@ -350,8 +403,6 @@ func collectTypeChunkKeys(data []byte, off, size int, out map[int]int) {
 	}
 	end := off + size
 
-	// entriesStart 之后是偏移数组（48 位下标/32 位偏移/16 位偏移三种编码），
-	// 再往后才是 entry 数据区。偏移数组长度按编码类型校验。
 	switch {
 	case flags&typeFlagSparse != 0:
 		if off+hdr+entryCount*4 > end {
@@ -362,7 +413,9 @@ func collectTypeChunkKeys(data []byte, off, size int, out map[int]int) {
 			if off4 == 0xffff {
 				continue
 			}
-			addEntryKey(data, entBase+off4*4, end, typeID, out)
+			if !fn(entBase+off4*4, end) {
+				return
+			}
 		}
 	case flags&typeFlagOffset16 != 0:
 		if off+hdr+entryCount*2 > end {
@@ -373,7 +426,9 @@ func collectTypeChunkKeys(data []byte, off, size int, out map[int]int) {
 			if o16 == 0xffff {
 				continue
 			}
-			addEntryKey(data, entBase+o16*4, end, typeID, out)
+			if !fn(entBase+o16*4, end) {
+				return
+			}
 		}
 	default:
 		if off+hdr+entryCount*4 > end {
@@ -384,7 +439,9 @@ func collectTypeChunkKeys(data []byte, off, size int, out map[int]int) {
 			if o32 == 0xffffffff {
 				continue
 			}
-			addEntryKey(data, entBase+o32, end, typeID, out)
+			if !fn(entBase+o32, end) {
+				return
+			}
 		}
 	}
 }

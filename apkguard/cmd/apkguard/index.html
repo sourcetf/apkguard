@@ -57,7 +57,7 @@
 <main>
   <div>
     <div class="card">
-      <h2>功能项<span class="hint">未实现的项已禁用</span></h2>
+      <h2>功能项<span class="hint">全部功能项已实现，可按需勾选</span></h2>
       <div class="presets">
         <button id="p-rec">推荐配置</button>
         <button id="p-min">仅混淆</button>
@@ -104,6 +104,7 @@
         <label class="row"><span>压缩包名</span><input type="checkbox" id="package_shrink"></label>
         <label class="row"><span>保留白名单</span><input type="text" id="keep_rules" placeholder="A1 规则文件路径（每行一条）"></label>
         <label class="row"><span>R 类改名</span><input type="checkbox" id="rename_resource_ids" checked title="A1 把 aapt 生成的资源 ID 类（R/R$Type）与字段一起改名，static_values 中的资源 ID 常量保持原样（对齐参考样本）。默认开启，取消勾选即 -rename-resource-ids=false；应急可用环境变量 APKGUARD_KEEP_RCLASS_IDS=1 强制关闭。"></label>
+        <label class="row"><span>库也改名</span><input type="checkbox" id="rename_libraries" title="A1 把第三方库（androidx/Kotlin stdlib 等）也纳入改名。默认关闭：库代码改名可能破坏反射/序列化/ServiceLoader 等按类名查找的机制，开启前请用目标应用回归。"></label>
         <label class="row"><span>最短加密</span><input type="number" id="obf_string_min" value="0" placeholder="0 = 全部（A2）"></label>
         <label class="row"><span>仅单引用串</span><input type="checkbox" id="obf_string_single_ref" title="A2 只加密恰好被 1 条 const-string 引用的字符串。会降低保护强度：多引用串将留明文，仅为让加密分布更像参考样本，不建议常规使用。"></label>
         <label class="row"><span>垃圾顶文件</span><input type="number" id="junk_top_count" value="800" placeholder="800（A10）"></label>
@@ -130,7 +131,12 @@
         <label class="row"><span>SO 加密</span><input type="checkbox" id="so_encrypt"></label>
         <label class="row"><span>壳包名</span><input type="text" id="shell_pkg" value="com.apkguard.shell"></label>
         <label class="row"><span>拆分份数</span><input type="number" id="split_count" value="0" placeholder="0 = 不拆（B4）"></label>
-        <label class="row"><span>抽取比例</span><input type="number" id="extract_ratio" value="0" placeholder="B5 未实现，须为 0"></label>
+        <label class="row"><span>抽取比例</span><input type="number" id="extract_ratio" value="0" placeholder="B5 抽取比例 1~100（配合抽取方法数）"></label>
+        <label class="row"><span>抽取方法数</span><input type="number" id="extract_methods" value="0" placeholder="0=关闭（B5）；建议先用小值试"></label>
+        <label class="row"><span>VMP 方法数</span><input type="number" id="vmp_methods" value="0" placeholder="0=关闭（B6）；建议先用小值试"></label>
+        <label class="row"><span>Dex2C 方法数</span><input type="number" id="dex2c_methods" value="0" placeholder="0=关闭（B7）；建议先用小值试"></label>
+        <label class="row"><span>NDK 路径</span><input type="text" id="ndk_path" placeholder="B7 的 NDK 根目录，留空自动探测"></label>
+        <label class="row"><span>双 APK 投放</span><input type="checkbox" id="dual_apk" title="B9 双 APK 投放器：产物是宿主，原应用整体加密为插件放进宿主 assets，运行时落地并调起系统安装器。默认关闭：需 REQUEST_INSTALL_PACKAGES，首次需用户在系统安装界面确认，且换包名无法覆盖升级原应用。"></label>
         <label class="row"><span>排障壳</span><input type="checkbox" id="debug_shell"></label>
         <label class="row"><span>假库名</span><input type="text" id="lib_fake_name" placeholder="libsqlite3x.so（C7）"></label>
         <label class="row"><span>清 ELF 节头</span><input type="checkbox" id="lib_strip_sections"></label>
@@ -232,6 +238,7 @@ function collect() {
     package_shrink: checked('package_shrink'),
     keep_rules: val('keep_rules'),
     rename_resource_ids: checked('rename_resource_ids'),
+    rename_libraries: checked('rename_libraries'),
     obf_string_min: num('obf_string_min', 0),
     obf_string_single_ref: checked('obf_string_single_ref'),
     seed: val('seed'),
@@ -261,6 +268,11 @@ function collect() {
     shell_pkg: val('shell_pkg'),
     split_count: num('split_count', 0),
     extract_ratio: num('extract_ratio', 0),
+    extract_methods: num('extract_methods', 0),
+    vmp_methods: num('vmp_methods', 0),
+    dex2c_methods: num('dex2c_methods', 0),
+    ndk_path: val('ndk_path'),
+    dual_apk: checked('dual_apk'),
     debug_shell: checked('debug_shell'),
     sig_hashes: val('sig_hash') ? [val('sig_hash')] : undefined,
     bind_device: val('bind_device'),

@@ -191,6 +191,22 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 	if err != nil {
 		return Addition{}, err
 	}
+	// B5 函数抽取的运行时回填：q 读小端 u32，p 解析 DEX 尾部的抽取计划并
+	// 原地回填方法体，t 按 file_size 截断写盘。三者无条件生成：p 以 trailer
+	// 魔数为判据，未启用 B5 的载荷不含 trailer，走原来的 w 路径（字节与旧版
+	// 一致，见 loaderEntryCode 的注释）。
+	readU32, err := loaderReadU32Code()
+	if err != nil {
+		return Addition{}, err
+	}
+	applyExtract, err := loaderApplyExtractCode(ls.Class)
+	if err != nil {
+		return Addition{}, err
+	}
+	writeRange, err := loaderWriteRangeCode(ls.MarkReadOnly)
+	if err != nil {
+		return Addition{}, err
+	}
 	install, err := loaderInstallCode(ls.Class)
 	if err != nil {
 		return Addition{}, err
@@ -220,6 +236,9 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 		nameGetF    = "g"
 		nameSetF    = "s"
 		nameMAC     = "v"
+		nameReadU32 = "q"
+		namePatch   = "p"
+		nameWriteR  = "t"
 	)
 
 	protoCtxCL := ProtoSpec{Ret: descClassLoader, Params: []string{descContext}}
@@ -231,6 +250,11 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 	protoObjStrObjBool := ProtoSpec{Ret: "Z", Params: []string{descObject, descStringType, descObject}}
 	// v(blob, key, name)：blob=IV‖密文‖tag，key=AES 密钥，name=原始 DEX 名。
 	protoMAC := ProtoSpec{Ret: "Z", Params: []string{descByteArray, descByteArray, descStringType}}
+	// q(byte[], int)：读小端 u32。p(byte[])：回填抽取计划并返回 file_size。
+	// t(File, byte[], int)：只写前 n 字节（截掉 trailer）。
+	protoReadU32 := ProtoSpec{Ret: "I", Params: []string{descByteArray, "I"}}
+	protoStringI := ProtoSpec{Ret: "I", Params: []string{descByteArray}}
+	protoFileBytesI := ProtoSpec{Ret: "V", Params: []string{descFile, descByteArray, "I"}}
 
 	methods := []ClassMethod{
 		{Name: nameEntry, Proto: protoCtxCL, Access: accPublic | accStatic, Code: entry},
@@ -240,6 +264,9 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 		{Name: nameInstall, Proto: protoCLI, Access: accPrivate | accStatic, Code: install},
 		{Name: nameGetF, Proto: protoObjStr, Access: accPrivate | accStatic, Code: getField},
 		{Name: nameSetF, Proto: protoObjStrObjBool, Access: accPrivate | accStatic, Code: setField},
+		{Name: nameReadU32, Proto: protoReadU32, Access: accPrivate | accStatic, Code: readU32},
+		{Name: namePatch, Proto: protoStringI, Access: accPrivate | accStatic, Code: applyExtract},
+		{Name: nameWriteR, Proto: protoFileBytesI, Access: accPrivate | accStatic, Code: writeRange},
 	}
 	// 方法表必须与类体一一对应，planInjectedClass 会校验。
 	regMethods := []MethodSpec{
@@ -250,6 +277,9 @@ func LoaderAddition(ls *LoaderSpec) (Addition, error) {
 		{Class: ls.Class, Name: nameInstall, Proto: protoCLI},
 		{Class: ls.Class, Name: nameGetF, Proto: protoObjStr},
 		{Class: ls.Class, Name: nameSetF, Proto: protoObjStrObjBool},
+		{Class: ls.Class, Name: nameReadU32, Proto: protoReadU32},
+		{Class: ls.Class, Name: namePatch, Proto: protoStringI},
+		{Class: ls.Class, Name: nameWriteR, Proto: protoFileBytesI},
 	}
 	// 未启用 MAC 时**不**生成 v：产物字节与旧版完全一致，也不引入
 	// javax.crypto.Mac 相关引用。
@@ -359,6 +389,11 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 		Proto: ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, "I"}}}
 	writeM := MethodSpec{Class: ls.Class, Name: "w",
 		Proto: ProtoSpec{Ret: "V", Params: []string{descFile, descByteArray}}}
+	// B5：p 回填抽取计划（返回 file_size），t 按 file_size 截断写盘。
+	patchM := MethodSpec{Class: ls.Class, Name: "p",
+		Proto: ProtoSpec{Ret: "I", Params: []string{descByteArray}}}
+	writeRangeM := MethodSpec{Class: ls.Class, Name: "t",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descFile, descByteArray, "I"}}}
 	instM := MethodSpec{Class: ls.Class, Name: "i",
 		Proto: ProtoSpec{Ret: "I", Params: []string{descClassLoader}}}
 	// MAC 校验（仅在 ls.MAC 时被引用）与失败终止。
@@ -467,10 +502,31 @@ func loaderEntryCode(ls *LoaderSpec) (*CodeBlob, error) {
 		if err := a.InvokeDirect([]int{rFile, rDir, rT0}, fileInit); err != nil {
 			return nil, err
 		}
+		// B5：解密后的 DEX 若带抽取计划 trailer，先回填原始方法体，再按
+		// DEX 头部声明的 file_size 截断落盘。p() 以 trailer 魔数为判据：
+		// 未启用 B5 时原样返回 dex.length，走原来的 w 路径，产物字节与
+		// 旧版完全一致。rT2/rT4 在解密调用之后已空闲。
+		if err := a.InvokeStatic([]int{rDex}, patchM); err != nil {
+			return nil, err
+		}
+		a.MoveResult(rT2)
+		a.ArrayLength(rT4, rDex)
+		extPatch := fmt.Sprintf("L_ext_patch_%d", i)
+		extDone := fmt.Sprintf("L_ext_done_%d", i)
+		if err := a.IfNe(rT2, rT4, extPatch); err != nil {
+			return nil, err
+		}
 		// w(f, dex)
 		if err := a.InvokeStatic([]int{rFile, rDex}, writeM); err != nil {
 			return nil, err
 		}
+		a.Goto(extDone)
+		a.Label(extPatch)
+		// t(f, dex, fileSize)：写前 file_size 字节（截掉 trailer）。
+		if err := a.InvokeStatic([]int{rFile, rDex, rT2}, writeRangeM); err != nil {
+			return nil, err
+		}
+		a.Label(extDone)
 		// 分隔符只加在「不是第一份」之前。
 		//
 		// 不能反过来在每份之后都加：那样末位会留下一个空路径元素，
@@ -1150,6 +1206,302 @@ func loaderWriteCode(markReadOnly bool) (*CodeBlob, error) {
 		return nil, err
 	}
 	return &CodeBlob{Registers: 4, Ins: 2, Outs: 2, Insns: insns, Patches: patches}, nil
+}
+
+// ---- B5 回填：q(byte[], int) -> int ----
+//
+// 等价 Java：
+//
+//	static int q(byte[] a, int i) {
+//	    return (a[i] & 0xff) | ((a[i+1] & 0xff) << 8) |
+//	           ((a[i+2] & 0xff) << 16) | ((a[i+3] & 0xff) << 24);
+//	}
+//
+// 只做纯字节运算（不用 ByteBuffer/Arrays）：任何 API 级别可用，也便于
+// interp_test.go 的解释器逐指令模拟。
+//
+// registers=6、ins=2 → a 在 v4、i 在 v5。
+func loaderReadU32Code() (*CodeBlob, error) {
+	const (
+		rV  = 0
+		rT0 = 1
+		rT1 = 2
+		rT2 = 3
+		rA  = 4
+		rI  = 5
+	)
+	a := NewAsm()
+	a.AGetByte(rV, rA, rI)
+	a.Const16(rT0, 0xff)
+	a.AndInt(rV, rV, rT0)
+	for k, sh := range []int{8, 16, 24} {
+		a.Const4(rT0, int8(k+1))
+		a.AddInt(rT1, rI, rT0)
+		a.AGetByte(rT1, rA, rT1)
+		a.Const16(rT2, 0xff)
+		a.AndInt(rT1, rT1, rT2)
+		a.ShlIntLit8(rT1, int8(sh))
+		a.OrInt(rV, rV, rT1)
+	}
+	a.Return(rV)
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		return nil, err
+	}
+	return &CodeBlob{Registers: 6, Ins: 2, Outs: 1, Insns: insns, Patches: patches}, nil
+}
+
+// ---- B5 回填：p(byte[]) -> int ----
+//
+// 等价 Java：
+//
+//	static int p(byte[] d) {
+//	    int n = d.length;
+//	    if (n < 40) return n;
+//	    int fs = q(d, 32);                       // DEX file_size
+//	    if (fs < 32 || fs + 8 > n) return n;
+//	    if (q(d, fs) != 0x31584741) return n;    // 无抽取计划
+//	    int count = q(d, fs + 4);
+//	    if (count <= 0 || (n - (fs + 32)) / 8 < count) bad();
+//	    System.arraycopy(d, fs + 8, d, 8, 24);   // 恢复原 checksum+signature
+//	    int bp = fs + 32 + count * 8;
+//	    for (int i = 0; i < count; i++) {
+//	        int off = q(d, fs + 32 + i * 8);
+//	        int len = q(d, fs + 32 + i * 8 + 4);
+//	        if (off < 0 || len < 0 || off + len > fs || bp + len > n) bad();
+//	        System.arraycopy(d, bp, d, off, len);
+//	        bp += len;
+//	    }
+//	    return fs;                               // 调用方按 fs 截断写盘
+//	    // bad(): System.exit(1)（与 MAC 失败同一硬终止路径），绝不静默返回
+//	}
+//
+// 失败语义：魔数不匹配 = 未启用 B5（返回原长度，调用方走原路径）；魔数匹配
+// 但结构损坏 = 载荷被篡改/损坏，硬终止而不是让 stub 静默执行（stub 返回
+// 默认值会产生比崩溃更糟的错误结果）。
+//
+// registers=14、ins=1 → d 在 v13。
+func loaderApplyExtractCode(self string) (*CodeBlob, error) {
+	const (
+		rN   = 0 // d.length
+		rFs  = 1 // file_size
+		rCnt = 2 // 条目数
+		rEp  = 3 // 条目表起点
+		rBp  = 4 // bodies 读位置
+		rI   = 5 // 循环变量
+		rOff = 6 // code_off
+		rLen = 7 // 字节数
+		rT0  = 8
+		rT1  = 9
+		rT2  = 10
+		rT3  = 11
+		rD   = 13 // 入参 byte[]
+	)
+	qM := MethodSpec{Class: self, Name: "q",
+		Proto: ProtoSpec{Ret: "I", Params: []string{descByteArray, "I"}}}
+	arraycopy := MethodSpec{Class: descSystem, Name: "arraycopy",
+		Proto: ProtoSpec{Ret: "V",
+			Params: []string{descObject, "I", descObject, "I", "I"}}}
+	exitM := MethodSpec{Class: descSystem, Name: "exit",
+		Proto: ProtoSpec{Ret: "V", Params: []string{"I"}}}
+
+	a := NewAsm()
+	a.ArrayLength(rN, rD)
+	a.Const16(rT0, 40)
+	if err := a.IfLt(rN, rT0, "ret_n"); err != nil {
+		return nil, err
+	}
+	// fs = q(d, 32)
+	a.Const16(rT0, 32)
+	if err := a.InvokeStatic([]int{rD, rT0}, qM); err != nil {
+		return nil, err
+	}
+	a.MoveResult(rFs)
+	// if (fs < 32 || fs + 8 > n) return n;
+	a.Const16(rT0, 32)
+	if err := a.IfLt(rFs, rT0, "ret_n"); err != nil {
+		return nil, err
+	}
+	// 8/32 都超出 const/4 的 4 位有符号范围（8 会被 ART 当成 -8），必须用 const/16。
+	a.Const16(rT0, 8)
+	a.AddInt(rT1, rFs, rT0)
+	if err := a.IfGt(rT1, rN, "ret_n"); err != nil {
+		return nil, err
+	}
+	// if (q(d, fs) != MAGIC) return n;
+	a.Move(rT0, rFs)
+	if err := a.InvokeStatic([]int{rD, rT0}, qM); err != nil {
+		return nil, err
+	}
+	a.MoveResult(rT0)
+	a.Const32(rT1, int32(ExtractPlanMagic))
+	if err := a.IfNe(rT0, rT1, "ret_n"); err != nil {
+		return nil, err
+	}
+	// count = q(d, fs + 4)
+	a.Const4(rT1, 4)
+	a.AddInt(rT0, rFs, rT1)
+	if err := a.InvokeStatic([]int{rD, rT0}, qM); err != nil {
+		return nil, err
+	}
+	a.MoveResult(rCnt)
+	a.Const4(rT0, 0)
+	if err := a.IfLt(rCnt, rT0, "bad"); err != nil {
+		return nil, err
+	}
+	a.IfEqz(rCnt, "bad")
+	// ep = fs + 32；条目表必须整体落在数组内。
+	a.Const16(rT1, extractPlanEntriesOff)
+	a.AddInt(rEp, rFs, rT1)
+	a.SubInt(rT0, rN, rEp)
+	a.Const16(rT1, 8)
+	a.DivInt(rT0, rT0, rT1)
+	if err := a.IfGt(rCnt, rT0, "bad"); err != nil {
+		return nil, err
+	}
+	// System.arraycopy(d, fs + 8, d, 8, 24)
+	a.Const16(rT1, 8)
+	a.AddInt(rT0, rFs, rT1)
+	a.Const16(rT2, 8)
+	a.Const16(rT3, 24)
+	if err := a.InvokeStatic([]int{rD, rT0, rD, rT2, rT3}, arraycopy); err != nil {
+		return nil, err
+	}
+	// bp = ep + count * 8
+	a.Move(rBp, rCnt)
+	a.ShlIntLit8(rBp, 3)
+	a.AddInt(rBp, rBp, rEp)
+	a.Const4(rI, 0)
+
+	a.Label("loop")
+	if err := a.IfGe(rI, rCnt, "done"); err != nil {
+		return nil, err
+	}
+	// rT0 = 条目表内第 i 项的地址
+	a.Move(rT0, rI)
+	a.ShlIntLit8(rT0, 3)
+	a.AddInt(rT0, rT0, rEp)
+	if err := a.InvokeStatic([]int{rD, rT0}, qM); err != nil {
+		return nil, err
+	}
+	a.MoveResult(rOff)
+	a.Const4(rT2, 4)
+	a.AddInt(rT1, rT0, rT2)
+	if err := a.InvokeStatic([]int{rD, rT1}, qM); err != nil {
+		return nil, err
+	}
+	a.MoveResult(rLen)
+	// 边界：负数（高位被当符号）、off+len 溢出、越出 fs、bodies 越出数组。
+	a.Const4(rT0, 0)
+	if err := a.IfLt(rOff, rT0, "bad"); err != nil {
+		return nil, err
+	}
+	if err := a.IfLt(rLen, rT0, "bad"); err != nil {
+		return nil, err
+	}
+	a.AddInt(rT1, rOff, rLen)
+	if err := a.IfLt(rT1, rT0, "bad"); err != nil {
+		return nil, err
+	}
+	if err := a.IfGt(rT1, rFs, "bad"); err != nil {
+		return nil, err
+	}
+	a.AddInt(rT2, rBp, rLen)
+	if err := a.IfLt(rT2, rT0, "bad"); err != nil {
+		return nil, err
+	}
+	if err := a.IfGt(rT2, rN, "bad"); err != nil {
+		return nil, err
+	}
+	// System.arraycopy(d, bp, d, off, len)
+	if err := a.InvokeStatic([]int{rD, rBp, rD, rOff, rLen}, arraycopy); err != nil {
+		return nil, err
+	}
+	a.AddInt(rBp, rBp, rLen)
+	a.AddIntLit8(rI, 1)
+	a.Goto("loop")
+
+	a.Label("done")
+	a.Return(rFs)
+
+	a.Label("ret_n")
+	a.Return(rN)
+
+	a.Label("bad")
+	a.Const4(rT0, 1)
+	if err := a.InvokeStatic([]int{rT0}, exitM); err != nil {
+		return nil, err
+	}
+	a.Return(rN)
+
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		return nil, err
+	}
+	return &CodeBlob{Registers: 14, Ins: 1, Outs: 5, Insns: insns, Patches: patches}, nil
+}
+
+// ---- B5 截断落地：t(File, byte[], int) -> void ----
+//
+// 等价 Java：
+//
+//	static void t(File f, byte[] data, int n) {
+//	    f.delete();
+//	    FileOutputStream os = new FileOutputStream(f);
+//	    os.write(data, 0, n);        // 只写前 n 字节，丢弃 trailer
+//	    os.close();
+//	    f.setReadOnly();             // 仅 targetSdk ≥ 34（同 w）
+//	}
+//
+// 与 w 的先删后写一致：上次启动留下的只读文件必须先删，否则覆盖会 EACCES
+// （真实案例：RustDesk targetSdk ≥ 34 第二次启动闪退）。
+//
+// registers=5、ins=3 → f 在 v2、data 在 v3、n 在 v4。
+func loaderWriteRangeCode(markReadOnly bool) (*CodeBlob, error) {
+	const (
+		rOs   = 0
+		rT    = 1
+		rF    = 2
+		rData = 3
+		rN    = 4
+	)
+	osInit := MethodSpec{Class: descFileOut, Name: "<init>",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descFile}}}
+	writeRange := MethodSpec{Class: descFileOut, Name: "write",
+		Proto: ProtoSpec{Ret: "V", Params: []string{descByteArray, "I", "I"}}}
+	closeM := MethodSpec{Class: descFileOut, Name: "close", Proto: ProtoSpec{Ret: "V"}}
+	setRO := MethodSpec{Class: descFile, Name: "setReadOnly", Proto: ProtoSpec{Ret: "Z"}}
+	delM := MethodSpec{Class: descFile, Name: "delete", Proto: ProtoSpec{Ret: "Z"}}
+
+	a := NewAsm()
+	if err := a.InvokeVirtual([]int{rF}, delM); err != nil {
+		return nil, err
+	}
+	a.NewInstance(rOs, descFileOut)
+	if err := a.InvokeDirect([]int{rOs, rF}, osInit); err != nil {
+		return nil, err
+	}
+	a.Const4(rT, 0)
+	if err := a.InvokeVirtual([]int{rOs, rData, rT, rN}, writeRange); err != nil {
+		return nil, err
+	}
+	if err := a.InvokeVirtual([]int{rOs}, closeM); err != nil {
+		return nil, err
+	}
+	if markReadOnly {
+		if err := a.InvokeVirtual([]int{rF}, setRO); err != nil {
+			return nil, err
+		}
+	}
+	a.ReturnVoid()
+
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		return nil, err
+	}
+	// Outs=4：FileOutputStream.write([BII) 的参数字数是「接收者 + 3」，
+	// 漏算接收者会被 ART 判 VerifyError（outs_test 会拦下）。
+	return &CodeBlob{Registers: 5, Ins: 3, Outs: 4, Insns: insns, Patches: patches}, nil
 }
 
 // ---- 接管：i(ClassLoader) -> void ----

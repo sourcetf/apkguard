@@ -549,6 +549,36 @@ class Checker:
             self.check(manifest_contains(self.manifest, SHELL_CLASS), "B2",
                        "Manifest 里找不到壳类 %s（android:name 未被改写）" % SHELL_CLASS)
 
+        # ---- B9 双 APK 投放器：产物是宿主，原应用是加密插件 ----
+        #
+        # 判据取自「宿主形态」而不是原应用：宿主必须声明安装权限，且 assets 下
+        # 必须有一个高熵、非 ZIP 的载荷（插件本体）。原应用的资源/类名在这里
+        # 不该出现——那正是双 APK 形态的意义。
+        if self.want("B9"):
+            self.check(manifest_contains(self.manifest, "REQUEST_INSTALL_PACKAGES"), "B9",
+                       "宿主 Manifest 未声明 REQUEST_INSTALL_PACKAGES（无法调起安装器）")
+            import math
+            plugs = []
+            for n in self.names:
+                if not n.startswith("assets/"):
+                    continue
+                data = zf.read(n)
+                if len(data) < 4096:
+                    continue
+                if data[:4] == b"PK":
+                    continue
+                # 香农熵：加密载荷应接近 8 bit/byte
+                cnt = [0] * 256
+                for b in data:
+                    cnt[b] += 1
+                ent = -sum((c / len(data)) * math.log2(c / len(data)) for c in cnt if c)
+                if ent > 7.5:
+                    plugs.append((n, len(data), ent))
+            self.check(bool(plugs), "B9",
+                       "宿主 assets 下找不到高熵加密插件载荷")
+            self.check("Lcom/agtest/MainActivity;" not in self.dex_strs, "B9",
+                       "宿主 classes.dex 里出现了原应用业务类（宿主不应包含业务代码）")
+
         # ---- A4 调试信息清除 ----
         #
         # 判据是「class_def.source_file_idx 全部置空」——这正是 jadx 读取源文件名的
@@ -769,10 +799,50 @@ class Checker:
             self.check(bool(nonascii) or bool(malformed), "A10",
                        "既没有非 ASCII 顶层文件，也没有畸形 META-INF 条目")
 
-        # ---- A12 ZIP 路径攻击：绝对路径条目 ----
+        # ---- A12 ZIP 路径攻击：绝对路径条目 + 归一化近重名组 ----
         if self.want("A12"):
             absents = [n for n in self.names if n.startswith("/")]
             self.check(bool(absents), "A12", "找不到绝对路径攻击条目")
+
+            # 归一化近重名：把 `\` 当分隔符、折叠连续 `/` 后落进同一路径的条目组。
+            # 样本实测 33+ 组（最大一组 13 条，如 /resources.arsc//.xml 一族），
+            # 组内中央目录精确名互不相同，所以能通过签名与安装；任何「先归一化
+            # 路径再处理」的工具都会在这类组上撞车。A12 至少注入 8 组（基础路径
+            # 覆盖 AndroidManifest.xml/、classes*.dex/、resources.arsc/、META-INF/、
+            # res/values/、kotlin/），这里按 ≥8 组断言。
+            #
+            # 必须用 orig_filename 而不是 ZipInfo.filename：Windows 上 Python 的
+            # zipfile 会把 `\` 归一化成 `/`（os.sep 替换），于是同一个 `//` 变体
+            # 会被当成精确重名（假阳性），而中央目录里的名字其实是唯一的。
+            raw_names = [getattr(i, "orig_filename", i.filename) for i in zf.infolist()]
+
+            def _norm(n):
+                out = []
+                prev_slash = False
+                for ch in n.replace("\\", "/"):
+                    if ch == "/":
+                        if prev_slash:
+                            continue
+                        prev_slash = True
+                    else:
+                        prev_slash = False
+                    out.append(ch)
+                return "".join(out)
+
+            groups = {}
+            for n in raw_names:
+                groups.setdefault(_norm(n), []).append(n)
+            near = [g for g in groups.values() if len(g) >= 2]
+            self.check(len(near) >= 8, "A12",
+                       "归一化后同路径的条目组只有 %d 组（要求 ≥8）" % len(near))
+            # 与精确重名的关键差别：这些组在中央目录里名字必须互不相同
+            # （apksigner 只拒绝精确重名，否则整个归档无法签名/安装）。
+            self.check(len(raw_names) == len(set(raw_names)), "A12",
+                       "中央目录存在精确重名条目（apksigner 会以 Duplicate entry 拒绝归档）")
+            if near:
+                biggest = max(near, key=len)
+                self.notes.append("[A12] 归一化近重名 %d 组，最大一组 %d 条（样例 %s）"
+                                  % (len(near), len(biggest), biggest[0]))
 
         # ---- A13 类膨胀 ----
         if self.want("A13"):

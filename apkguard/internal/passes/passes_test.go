@@ -279,11 +279,8 @@ func TestZipPathAttack(t *testing.T) {
 	nPrefix, nAbs, nDex := 0, 0, 0
 	for _, e := range art.Entries() {
 		name := e.NameString()
-		for _, p := range []string{"classes.dex/", "AndroidManifest.xml/", "resources.arsc/", "classes2.dex/", "lib/"} {
-			if strings.HasPrefix(name, p) {
-				nPrefix++
-				break
-			}
+		if isA12PrefixAbuseName(name) {
+			nPrefix++
 		}
 		if strings.HasPrefix(name, "/") {
 			nAbs++

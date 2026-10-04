@@ -43,6 +43,18 @@ func renameResourceIDsEnabled(opts *config.Options) bool {
 //	第一轮：遍历全部 DEX，汇总「可重命名类集合」与「被反射引用的类名」，
 //	        由主 DEX 统一分配新名，形成全局 ClassMap；
 //	第二轮：各 DEX 按同一份 ClassMap 应用重命名，保证引用不断链。
+//
+// 库代码深度改名（Options.RenameLibraries，默认关闭）：开启后
+// dex.RenameConfig.RenameLibraries 会在三条构造路径上一致打开，
+// androidx/、android/support/、kotlin/、kotlinx/、com/google/ 等三方库类
+// 也进入类名混淆。护栏不变：平台前缀（java/、javax/、android/、dalvik/、
+// sun/、libcore/、org/apache/、org/json/、org/w3c/、org/xml/…）恒保留，
+// 类名进 const-string 的反射类、清单组件类、含 native 方法的类与
+// Android 入口类也恒保留。
+//
+// 风险提示（写入 art.Note）：库代码常按名称做反射/序列化/热修复匹配
+// （Gson、Kotlin 反射、Tinker 类名 patch 等），开启后产物与这些框架的
+// 兼容风险上升，属设计取舍，默认关闭、按需开启。
 type renameClass struct{}
 
 func (renameClass) ID() config.FeatureID { return "A1" }
@@ -101,6 +113,13 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 
 	// R 类改名开关在三个 Renamer 构造点必须一致，这里只求值一次。
 	renameResIDs := renameResourceIDsEnabled(opts)
+	// 库代码深度改名开关（默认关闭）。开启与否都要在报告中留下痕迹：
+	// 这是与反射/序列化/热修复框架的兼容性取舍，出问题时需要能一眼看出
+	// 产物是不是在该模式下生成的。
+	renameLibs := opts.RenameLibraries
+	if renameLibs {
+		art.Note("A1 库代码深度改名已开启（RenameLibraries）：androidx/Kotlin/stdlib 等三方库类参与混淆；产物与依赖反射、序列化、热修复（Tinker 等按类名匹配）的框架兼容风险上升，属设计取舍，请确认适配后再发布")
+	}
 
 	keep := splitKeepRules(opts.KeepRules)
 	keepClasses := manifestComponents(art)
@@ -168,6 +187,7 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			ReflectedNames:    reflected,
 			ObfuscateFields:   true,
 			RenameResourceIDs: renameResIDs,
+			RenameLibraries:   renameLibs,
 		})
 		if err != nil {
 			return fmt.Errorf("%s 构造重命名器失败: %w", u.entry.NameString(), err)
@@ -283,6 +303,7 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			ReflectedNames:    reflected,
 			ObfuscateFields:   true,
 			RenameResourceIDs: renameResIDs,
+			RenameLibraries:   renameLibs,
 			ClassMap:          classMap,
 		})
 		if err != nil {
@@ -402,6 +423,7 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			ReflectedNames:    reflected,
 			ObfuscateFields:   true,
 			RenameResourceIDs: renameResIDs,
+			RenameLibraries:   renameLibs,
 			ClassMap:          classMap,
 			MemberMap:         memberMap,
 			MemberKeep:        memberKeep,

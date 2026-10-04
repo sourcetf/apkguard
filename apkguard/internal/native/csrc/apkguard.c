@@ -16,8 +16,126 @@
  *   - 定义 AG_JNI 才引入 <jni.h> 并导出 JNI 入口（NDK 交叉编译时）。
  */
 
+/* glibc 的 dladdr/Dl_info 需要 _GNU_SOURCE；bionic 默认可见。
+ * 只在宿主 Linux 实测（AG_LINUX_TEST）下开启，不影响 NDK 产物。 */
+#if defined(AG_LINUX_TEST) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 #include <stdint.h>
 #include <dlfcn.h>
+
+#include "obfuscate.h"
+
+/* ------------------------------------------------------------------ */
+/* C3：敏感字符串密文表（加解密原语见 obfuscate.h）                    */
+/* ------------------------------------------------------------------ */
+/*
+ * 这里只出现密文与「用途」注释，明文不落在源码里。-O2 下密钥流必须读
+ * volatile 的 g_ag_ks_key，无法被常量折叠回明文，因此构建产物里也扫不到。
+ * 离线生成密文的算法与 ag_ks_byte 逐位一致：enc[i] = plain[i] ^ ks(i, salt)。
+ */
+#define AG_SALT_STATUS         0x5d3a1f27u
+#define AG_SALT_MAPS           0x76b4c9e1u
+#define AG_SALT_FRIDA          0x1f0c8a53u
+#define AG_SALT_XPOSED         0x2ab7d46fu
+#define AG_SALT_SUBSTRATE      0x3c58e2a9u
+#define AG_SALT_LINJECTOR      0x49d1b753u
+#define AG_SALT_LIBHOOK        0x5718af2du
+#define AG_SALT_HOOKZZ         0x6e2c40b7u
+#define AG_SALT_WHALE          0x7d94e63fu
+#define AG_SALT_DDI            0x0b6f3ad1u
+#define AG_SALT_EPIC           0x18e75c4bu
+#define AG_SALT_MAGISK         0x24c9f06du
+#define AG_SALT_TAG            0x31a8d5e3u
+#define AG_SALT_TPID           0x43b1c97fu
+#define AG_SALT_LOG_NOPATH     0x52d8e4a1u
+#define AG_SALT_LOG_OPENFAIL   0x6f13b95du
+#define AG_SALT_LOG_NOSEC      0x7a46c8e9u
+
+/* C4 反调试：进程状态文件路径 */
+AG_DEFSTR(ag_s_status, AG_SALT_STATUS,
+	0x47, 0xbc, 0x28, 0xec, 0xe1, 0x0e, 0xae, 0x3c, 0x72, 0x97, 0x5c, 0x23,
+	0xb2, 0x6c, 0x62, 0x48, 0xfc);
+
+/* C5 反注入：内存映射表路径 */
+AG_DEFSTR(ag_s_maps, AG_SALT_MAPS,
+	0x5e, 0xce, 0x86, 0x37, 0x3d, 0xae, 0x5f, 0xe6, 0xee, 0x32, 0xca, 0x01,
+	0x9d, 0x7f, 0x42);
+
+/* C5：注入框架特征名 1 */
+AG_DEFSTR(ag_s_frida, AG_SALT_FRIDA,
+	0xdb, 0xdd, 0x93, 0x8b, 0x86);
+
+/* C5：注入框架特征名 2 */
+AG_DEFSTR(ag_s_xposed, AG_SALT_XPOSED,
+	0xfd, 0x14, 0x6f, 0xed, 0xa3, 0x09);
+
+/* C5：注入框架特征名 3 */
+AG_DEFSTR(ag_s_substrate, AG_SALT_SUBSTRATE,
+	0xa6, 0x05, 0x7e, 0x3c, 0xda, 0x1a, 0x90, 0x48, 0x52);
+
+/* C5：注入框架特征名 4 */
+AG_DEFSTR(ag_s_linjector, AG_SALT_LINJECTOR,
+	0xfd, 0xcc, 0x58, 0xb1, 0x42, 0xef, 0x10, 0x47, 0x46);
+
+/* C5：注入框架特征名 5 */
+AG_DEFSTR(ag_s_libhook, AG_SALT_LIBHOOK,
+	0x91, 0x6d, 0x3b, 0xaa, 0x34, 0x5f, 0x24);
+
+/* C5：注入框架特征名 6 */
+AG_DEFSTR(ag_s_hookzz, AG_SALT_HOOKZZ,
+	0xb8, 0x58, 0x22, 0xbb, 0x84, 0xab);
+
+/* C5：注入框架特征名 7 */
+AG_DEFSTR(ag_s_whale, AG_SALT_WHALE,
+	0xa0, 0xfa, 0x2c, 0xa2, 0x90);
+
+/* C5：注入框架特征名 8 */
+AG_DEFSTR(ag_s_ddi, AG_SALT_DDI,
+	0x3e, 0xbe, 0x33);
+
+/* C5：注入框架特征名 9 */
+AG_DEFSTR(ag_s_epic, AG_SALT_EPIC,
+	0x4e, 0xe7, 0x2f, 0xc1);
+
+/* C5：root 注入框架（Zygisk）特征名 */
+AG_DEFSTR(ag_s_magisk, AG_SALT_MAGISK,
+	0x8c, 0xde, 0x73, 0x9a, 0x58, 0x04);
+
+/* 日志 tag */
+AG_DEFSTR(ag_s_tag, AG_SALT_TAG,
+	0xfb, 0x7c, 0x08, 0x6a, 0xc5, 0x82, 0x08, 0x7d);
+
+/* C4：被跟踪字段名（在进程状态文件内容里匹配） */
+AG_DEFSTR(ag_s_tpid, AG_SALT_TPID,
+	0x96, 0xc9, 0xca, 0xfe, 0x94, 0x2d, 0x85, 0xb1, 0x88, 0x21);
+
+/* C6 降级日志 1（无 printf 参数） */
+AG_DEFSTR(ag_s_log_nopath, AG_SALT_LOG_NOPATH,
+	0xd8, 0xc0, 0xfa, 0xb2, 0x92, 0x06, 0xe4, 0xbc, 0x0c, 0x97, 0x0f, 0xa3,
+	0x90, 0x8e, 0xdd, 0x6c, 0xcd, 0xb7, 0x5b, 0x23, 0x3e, 0xb3, 0x89, 0x8c,
+	0x9b, 0x0f, 0x2c, 0x1b, 0x99, 0x07, 0x2e, 0x93, 0xbf, 0xa2, 0x76, 0x16,
+	0x4e, 0xf2, 0xfd, 0xb0, 0x09, 0xd3, 0xae, 0xbc, 0xaa, 0x68);
+
+/* C6 降级日志 2（path, g_sec_err） */
+AG_DEFSTR(ag_s_log_openfail, AG_SALT_LOG_OPENFAIL,
+	0xe4, 0x14, 0x9b, 0x52, 0x34, 0x65, 0x54, 0x53, 0x12, 0xef, 0xf6, 0xde,
+	0xae, 0x9f, 0x3c, 0x77, 0x35, 0x68, 0xaa, 0x59, 0x67, 0xb1, 0x5d, 0xda,
+	0xea, 0x64, 0x86, 0xd0, 0x78, 0x8c, 0x42, 0xf5, 0x0d, 0xd8, 0x34, 0x73,
+	0x13, 0x86, 0xf0, 0xd2, 0x5f, 0xc7, 0x88, 0x23, 0xdc, 0x6c, 0x17, 0x87,
+	0xfa, 0xa3, 0xc3, 0xff, 0x2d, 0x2f, 0xf0, 0x72, 0x8f, 0x67, 0x21, 0x5d,
+	0x37, 0xfd, 0x0a, 0x43, 0x32, 0x4a);
+
+/* C6 降级日志 3（g_sec_err） */
+AG_DEFSTR(ag_s_log_nosec, AG_SALT_LOG_NOSEC,
+	0xf8, 0x29, 0xdc, 0x8b, 0xff, 0x6a, 0x9e, 0xc7, 0x1b, 0xee, 0xf4, 0xee,
+	0x9f, 0x6b, 0x5e, 0x4b, 0xe6, 0x57, 0xca, 0xe9, 0x29, 0xa7, 0x44, 0xef,
+	0xdf, 0x7e, 0x41, 0xa7, 0x98, 0x3e, 0x0a, 0xae, 0x77, 0xcd, 0x0b, 0x81,
+	0x03, 0xfa, 0x38, 0xe4, 0x1e, 0x83, 0x4b, 0x78, 0x99, 0x31, 0x5b, 0x34,
+	0xce, 0xe3, 0x25, 0x3c, 0x41, 0x1a, 0x61, 0x56, 0xfb, 0xc9, 0x30, 0xa4,
+	0xa0, 0xa9, 0x4e, 0x91, 0x4f, 0x96, 0x23, 0x66, 0xee, 0x37, 0x6e, 0xa7,
+	0xaf, 0xd0, 0x0e, 0xf2);
 
 /*
  * 可观测的日志：有意不用「悄悄记在内存里」的方式。
@@ -27,16 +145,50 @@
  * 里对应的是 base.apk 而不是 .so 自己的路径。旧实现此时「当作完整」返回，
  * 于是完整性校验静默失效（用户以为有防护，实际没有）。现在无论走哪条分支，
  * 都会打一行日志，使这种降级在 logcat 里**可见**，而不是无声无息。
+ *
+ * C3 之后 tag 与格式串也都以密文存放，ag_logv 先解密到栈上再交给平台日志。
+ * 语义不变：只是取字符串的时机从编译期挪到调用时。
  */
 #if defined(AG_JNI)
 #include <android/log.h>
-#define AG_LOG(fmt, ...) __android_log_print(4 /*ANDROID_LOG_INFO*/, "APKGUARD", fmt, ##__VA_ARGS__)
-#elif defined(AG_HOST_TEST)
+#include <stdarg.h>
+static void ag_logv(const uint8_t *enc, uint32_t n, uint32_t salt, ...) {
+	char tag[ag_s_tag_len + 1];
+	char fmt[256];
+	va_list ap;
+	ag_dec((uint8_t *)tag, ag_s_tag_enc, (uint32_t)ag_s_tag_len, AG_SALT_TAG);
+	tag[ag_s_tag_len] = 0;
+	if (n > sizeof(fmt) - 1) {
+		n = sizeof(fmt) - 1;
+	}
+	ag_dec((uint8_t *)fmt, enc, n, salt);
+	fmt[n] = 0;
+	va_start(ap, salt);
+	__android_log_vprint(4 /*ANDROID_LOG_INFO*/, tag, fmt, ap);
+	va_end(ap);
+}
+#define AG_LOG_ENC(enc, len, salt, ...) ag_logv((enc), (uint32_t)(len), (salt), ##__VA_ARGS__)
+#elif defined(AG_HOST_TEST) || defined(AG_LINUX_TEST)
 #include <stdio.h>
-/* 用 fputc(10,..) 而非转义换行：本项目里转义序列多次被多层工具链吃掉 */
-#define AG_LOG(fmt, ...) do { fprintf(stderr, "[AG] " fmt, ##__VA_ARGS__); fputc(10, stderr); } while (0)
+#include <stdarg.h>
+static void ag_logv(const uint8_t *enc, uint32_t n, uint32_t salt, ...) {
+	char fmt[256];
+	va_list ap;
+	if (n > sizeof(fmt) - 1) {
+		n = sizeof(fmt) - 1;
+	}
+	ag_dec((uint8_t *)fmt, enc, n, salt);
+	fmt[n] = 0;
+	/* 用 fputc(10,..) 而非转义换行：本项目里转义序列多次被多层工具链吃掉 */
+	fprintf(stderr, "[AG] ");
+	va_start(ap, salt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc(10, stderr);
+}
+#define AG_LOG_ENC(enc, len, salt, ...) ag_logv((enc), (uint32_t)(len), (salt), ##__VA_ARGS__)
 #else
-#define AG_LOG(fmt, ...) ((void)0)
+#define AG_LOG_ENC(enc, len, salt, ...) ((void)0)
 #endif
 
 /*
@@ -48,8 +200,8 @@
  * 打一次足够。
  */
 static int ag_once_flag = 0;
-#define AG_LOG_ONCE(fmt, ...) do { \
-	if (!ag_once_flag) { ag_once_flag = 1; AG_LOG(fmt, ##__VA_ARGS__); } \
+#define AG_LOG_ONCE_ENC(enc, len, salt, ...) do { \
+	if (!ag_once_flag) { ag_once_flag = 1; AG_LOG_ENC((enc), (len), (salt), ##__VA_ARGS__); } \
 } while (0)
 
 /* ------------------------------------------------------------------ */
@@ -182,11 +334,40 @@ static const uint8_t AG_SEED_OBF[32] = {
 
 static const uint8_t AG_SEED_MASK[8] = {0xa5, 0x3c, 0xd7, 0x62, 0x9b, 0x0e, 0x54, 0xf1};
 
-/* ag_seed 还原派生的种子。 */
-static void ag_seed(uint8_t out[32]) {
-	int i;
-	for (i = 0; i < 32; i++) {
-		out[i] = (uint8_t)(AG_SEED_OBF[i] ^ AG_SEED_MASK[i & 7]);
+/*
+ * ag_seed 还原派生的种子。
+ *
+ * C3 控制流平坦化：原「初始化 i → 循环条件 → 循环体 → 返回」四个基本块
+ * 映射为状态 0/1/2/3，语义保持论证：
+ *   - 状态 1 的条件转移 st=(i<32)?2:3 与原 for 的循环条件逐位一致
+ *     （进入循环体 / 退出循环）；状态 2 完成原循环体并 i++ 后回到 1；
+ *   - 状态 3 即原函数的 return；状态变量与状态转移都是 volatile，
+ *     编译器必须保留间接分派，无法把 switch 还原成 for 结构；
+ *   - AG_OPAQUE_GUARD 只插入死分支（volatile 写，无副作用），
+ *     其后语句与状态转移不受谓词影响，行为与改造前相同。
+ */
+static AG_NOINLINE void ag_seed(uint8_t out[32]) {
+	AG_FLAT_DECL(st);
+	uint32_t i = 0;
+	AG_FLAT_LOOP(st) {
+		case 0:
+			i = 0;
+			st = 1;
+			break;
+		case 1:
+			AG_OPAQUE_GUARD(i ^ 0x5au);
+			st = (i < 32u) ? 2u : 3u;
+			break;
+		case 2:
+			out[i] = (uint8_t)(AG_SEED_OBF[i] ^ AG_SEED_MASK[i & 7]);
+			i++;
+			st = 1;
+			break;
+		case 3:
+			return;
+		default:
+			st = 1; /* 不可达；闭环避免调度器落空 */
+			break;
 	}
 }
 
@@ -201,23 +382,64 @@ static void ag_seed(uint8_t out[32]) {
  * sig 为 APK 签名证书的 SHA-256（32 字节）；siglen 允许为 0，
  * 此时退化为仅由种子派生。
  */
-static void ag_derive(const uint8_t *sig, uint32_t siglen, uint8_t out[32]) {
+static AG_NOINLINE void ag_derive(const uint8_t *sig, uint32_t siglen, uint8_t out[32]) {
 	uint8_t seed[32];
 	ag_sha256 s;
-	ag_seed(seed);
-	ag_sha256_init(&s);
-	ag_sha256_update(&s, seed, 32);
-	if (sig != 0 && siglen > 0) {
-		ag_sha256_update(&s, sig, siglen);
+	int have_sig;
+	AG_FLAT_DECL(st);
+	/*
+	 * C3 控制流平坦化：原线性序列「还原种子 → 初始化 → 喂种子 →
+	 * （可选）喂签名 → 收尾」映射为状态 0..6。语义保持论证：
+	 *   - 状态 3 用原条件 (sig != 0 && siglen > 0) 决定去状态 4 还是跳过
+	 *     到 5，与原 if 完全一致；have_sig 的计算无副作用；
+	 *   - 状态 0/1/2/4/5 是原语句的一一搬移，状态 6 即 return；
+	 *   - AG_OPAQUE_GUARD 不参与状态转移（它不改变 st），只增加死分支。
+	 * 派生结果只取决于 seed‖sig 的字节序列，因此该变换逐位保持输出。
+	 */
+	AG_FLAT_LOOP(st) {
+		case 0:
+			ag_seed(seed);
+			st = 1;
+			break;
+		case 1:
+			ag_sha256_init(&s);
+			st = 2;
+			break;
+		case 2:
+			AG_OPAQUE_GUARD(siglen ^ (uint32_t)(uintptr_t)sig);
+			ag_sha256_update(&s, seed, 32);
+			st = 3;
+			break;
+		case 3:
+			have_sig = (sig != 0 && siglen > 0) ? 1 : 0;
+			st = have_sig ? 4u : 5u;
+			break;
+		case 4:
+			ag_sha256_update(&s, sig, siglen);
+			st = 5;
+			break;
+		case 5:
+			ag_sha256_final(&s, out);
+			st = 6;
+			break;
+		case 6:
+			return;
+		default:
+			st = 3; /* 不可达；闭环避免调度器落空 */
+			break;
 	}
-	ag_sha256_final(&s, out);
 }
 
 /* ------------------------------------------------------------------ */
 /* C4：反调试                                                          */
 /* ------------------------------------------------------------------ */
 
-#ifndef AG_HOST_TEST
+/*
+ * AG_LINUX_TEST：在 WSL/CI 的 Linux 宿主编译（glibc）下也编译这一段，
+ * 用于「宿主二进制实测」——正常环境 vs 被 ptrace / 端口监听时的行为对照，
+ * 以及 ag_intact 对原文件/篡改文件返回值的对照。NDK 构建不定义它。
+ */
+#if !defined(AG_HOST_TEST) || defined(AG_LINUX_TEST)
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -275,39 +497,119 @@ static uint32_t ag_htonl(uint32_t v) { return htonl(v); }
  * 判定是「失败开放」的：读不到文件、解析不出数字都按「没有调试器」处理。
  * 宁可漏报，也不能因为 ROM 差异把正常用户挡在门外。
  */
-static int ag_debugged(void) {
+static AG_NOINLINE int ag_debugged(void) {
 	char buf[4096];
-	int fd, n, i;
-	fd = ag_open("/proc/self/status", 0);
-	if (fd < 0) {
-		return 0;
-	}
-	n = ag_read(fd, buf, (int)sizeof(buf) - 1);
-	ag_close(fd);
-	if (n <= 0) {
-		return 0;
-	}
-	buf[n] = 0;
-	for (i = 0; i + 10 < n; i++) {
-		/* 匹配 "TracerPid:"，其后第一个非 0 数字即被跟踪。 */
-		if (buf[i] == 'T' && buf[i + 1] == 'r' && buf[i + 2] == 'a' &&
-		    buf[i + 3] == 'c' && buf[i + 4] == 'e' && buf[i + 5] == 'r' &&
-		    buf[i + 6] == 'P' && buf[i + 7] == 'i' && buf[i + 8] == 'd' &&
-		    buf[i + 9] == ':') {
-			int j = i + 10;
-			while (j < n && (buf[j] == ' ' || buf[j] == '\t')) {
-				j++;
+	char needle[ag_s_tpid_len + 1];
+	int fd = -1, n = 0, i = 0;
+	AG_FLAT_DECL(st);
+	/*
+	 * C3 控制流平坦化：原「open → 判 fd → read/close → 判 n → for 扫描
+	 * → 匹配后跳过空白并判数字」映射为状态 0..8。语义保持论证：
+	 *   - 状态 1/3 的提前 return 0 与原 if 失败分支一致；
+	 *   - 状态 4 的循环条件与原 for 的 i+10<n 逐位相同，未命中时状态 5
+	 *     自增 i 后回到 4，命中则进 6/7；扫描结束（条件不成立）走状态 8
+	 *     返回 0，与原「for 结束返回 0」一致；
+	 *   - 状态 5 的逐字节比较等价于原来的 10 个字符常量比较，只是匹配串
+	 *     由解密得到；比较所需的 i+9 由 i+10<n 保证在缓冲区内；
+	 *   - AG_OPAQUE_GUARD 不触碰 st，不改变任何控制流。
+	 */
+	AG_FLAT_LOOP(st) {
+		case 0: {
+			AG_DECL_STR(ag_s_status, AG_SALT_STATUS);
+			fd = ag_open(ag_s_status_buf, 0);
+			st = 1;
+			break;
+		}
+		case 1:
+			if (fd < 0) {
+				return 0;
 			}
-			if (j < n && buf[j] >= '1' && buf[j] <= '9') {
+			st = 2;
+			break;
+		case 2:
+			n = ag_read(fd, buf, (int)sizeof(buf) - 1);
+			ag_close(fd);
+			st = 3;
+			break;
+		case 3:
+			AG_OPAQUE_GUARD((uint32_t)n);
+			if (n <= 0) {
+				return 0;
+			}
+			buf[n] = 0;
+			/* 匹配字段名，其后第一个非 0 数字即被跟踪。 */
+			ag_dec((uint8_t *)needle, ag_s_tpid_enc, (uint32_t)ag_s_tpid_len, AG_SALT_TPID);
+			needle[ag_s_tpid_len] = 0;
+			i = 0;
+			st = 4;
+			break;
+		case 4:
+			AG_OPAQUE_GUARD((uint32_t)i ^ (uint32_t)n);
+			st = (i + 10 < n) ? 5u : 8u;
+			break;
+		case 5: {
+			int j, hit = 1;
+			for (j = 0; j < 10; j++) {
+				if (buf[i + j] != needle[j]) {
+					hit = 0;
+					break;
+				}
+			}
+			if (!hit) {
+				i++;
+				st = 4;
+				break;
+			}
+			i += 10;
+			st = 6;
+			break;
+		}
+		case 6:
+			while (i < n && (buf[i] == ' ' || buf[i] == '\t')) {
+				i++;
+			}
+			st = 7;
+			break;
+		case 7:
+			if (i < n && buf[i] >= '1' && buf[i] <= '9') {
 				return 1;
 			}
 			return 0;
-		}
+		case 8:
+			return 0;
+		default:
+			st = 4; /* 不可达；闭环避免调度器落空 */
+			break;
 	}
-	return 0;
 }
 
 static int ag_frida_port(void);
+
+/*
+ * C5 的注入特征串表：表项只存密文指针/长度/salt，运行到匹配前才解密到栈。
+ * 新增 magisk 一项用于识别 Zygisk 这类把自身映射进应用进程的 root 框架；
+ * 不含 "su"/"gum" 这类过短特征：它们是大量正常路径（package/so 名）的子串，
+ * 会引入误报，宁可交由端口与其它特征判定。
+ */
+typedef struct {
+	const uint8_t *enc;
+	uint32_t len;
+	uint32_t salt;
+} ag_enc_t;
+
+static const ag_enc_t AG_HOOK_NEEDLES[] = {
+	{ag_s_frida_enc, (uint32_t)ag_s_frida_len, AG_SALT_FRIDA},
+	{ag_s_xposed_enc, (uint32_t)ag_s_xposed_len, AG_SALT_XPOSED},
+	{ag_s_substrate_enc, (uint32_t)ag_s_substrate_len, AG_SALT_SUBSTRATE},
+	{ag_s_linjector_enc, (uint32_t)ag_s_linjector_len, AG_SALT_LINJECTOR},
+	{ag_s_libhook_enc, (uint32_t)ag_s_libhook_len, AG_SALT_LIBHOOK},
+	{ag_s_hookzz_enc, (uint32_t)ag_s_hookzz_len, AG_SALT_HOOKZZ},
+	{ag_s_whale_enc, (uint32_t)ag_s_whale_len, AG_SALT_WHALE},
+	{ag_s_ddi_enc, (uint32_t)ag_s_ddi_len, AG_SALT_DDI},
+	{ag_s_epic_enc, (uint32_t)ag_s_epic_len, AG_SALT_EPIC},
+	{ag_s_magisk_enc, (uint32_t)ag_s_magisk_len, AG_SALT_MAGISK},
+};
+#define AG_NEEDLE_COUNT ((int)(sizeof(AG_HOOK_NEEDLES) / sizeof(AG_HOOK_NEEDLES[0])))
 
 /*
  * ag_hooked 返回 1 表示检测到注入/Hook 框架。
@@ -319,68 +621,147 @@ static int ag_frida_port(void);
  *      会监听该端口，能连通就说明设备上跑着 Frida。
  *
  * 同样是失败开放：读不到 maps、socket 建不出来都按「未注入」处理。
+ *
+ * C3 控制流平坦化：状态 0..8 与原基本块一一对应——
+ *   open=0；判 fd=1；read/close=2；判 n 与小写化=3；取第 k 个特征=4；
+ *   内层扫描条件=5；内层比较=6；全部未命中/读失败 → 状态 8 端口探测。
+ * 语义保持论证：
+ *   - 状态 5 的 i+ln<=n 与原内层 for 条件逐位相同，未命中 i++ 后回到 5；
+ *   - 状态 6 的逐字节比较与原 while(j<ln && ...) 相同；
+ *   - 原来的「maps 打不开 / n<=0 直接 return ag_frida_port()」改走
+ *     状态 8，仍是同一个函数调用，返回值语义不变；
+ *   - 特征串改由表驱动解密，内容与原字面量一致，仅存放形态不同。
  */
-static int ag_hooked(void) {
-	static const char *needles[] = {
-		"frida", "xposed", "substrate", "linjector",
-		"libhook", "hookzz", "whale", "ddi", "epic",
-	};
+static AG_NOINLINE int ag_hooked(void) {
 	char buf[16384];
-	int fd, n, i, k;
-	fd = ag_open("/proc/self/maps", 0);
-	if (fd >= 0) {
-		n = ag_read(fd, buf, (int)sizeof(buf) - 1);
-		ag_close(fd);
-		if (n > 0) {
+	char needle[32];
+	int fd = -1, n = 0, i = 0, k = 0, ln = 0;
+	AG_FLAT_DECL(st);
+	AG_FLAT_LOOP(st) {
+		case 0: {
+			AG_DECL_STR(ag_s_maps, AG_SALT_MAPS);
+			fd = ag_open(ag_s_maps_buf, 0);
+			st = 1;
+			break;
+		}
+		case 1:
+			if (fd < 0) {
+				st = 8;
+				break;
+			}
+			n = ag_read(fd, buf, (int)sizeof(buf) - 1);
+			ag_close(fd);
+			st = 2;
+			break;
+		case 2:
+			AG_OPAQUE_GUARD((uint32_t)n ^ 0x27u);
+			if (n <= 0) {
+				st = 8;
+				break;
+			}
 			buf[n] = 0;
+			i = 0;
+			st = 3;
+			break;
+		case 3:
 			/* 逐字节小写化比较，避免依赖 tolower（locale 行为不确定）。 */
-			for (i = 0; i < n; i++) {
+			while (i < n) {
 				if (buf[i] >= 'A' && buf[i] <= 'Z') {
 					buf[i] = (char)(buf[i] + 32);
 				}
+				i++;
 			}
-			for (k = 0; k < (int)(sizeof(needles) / sizeof(needles[0])); k++) {
-				const char *nd = needles[k];
-				int ln = 0;
-				while (nd[ln]) {
-					ln++;
-				}
-				for (i = 0; i + ln <= n; i++) {
-					int j = 0;
-					while (j < ln && buf[i + j] == nd[j]) {
-						j++;
-					}
-					if (j == ln) {
-						return 1;
-					}
-				}
+			k = 0;
+			st = 4;
+			break;
+		case 4:
+			if (k >= AG_NEEDLE_COUNT) {
+				st = 8;
+				break;
 			}
+			ln = (int)AG_HOOK_NEEDLES[k].len;
+			ag_dec((uint8_t *)needle, AG_HOOK_NEEDLES[k].enc,
+			       AG_HOOK_NEEDLES[k].len, AG_HOOK_NEEDLES[k].salt);
+			needle[ln] = 0;
+			i = 0;
+			st = 5;
+			break;
+		case 5:
+			AG_OPAQUE_GUARD((uint32_t)k ^ (uint32_t)i);
+			if (i + ln <= n) {
+				st = 6;
+			} else {
+				k++;
+				st = 4;
+			}
+			break;
+		case 6: {
+			int j = 0;
+			while (j < ln && buf[i + j] == needle[j]) {
+				j++;
+			}
+			if (j == ln) {
+				return 1;
+			}
+			i++;
+			st = 5;
+			break;
 		}
+		case 8:
+			return ag_frida_port();
+		default:
+			st = 8; /* 不可达；闭环避免调度器落空 */
+			break;
 	}
-	return ag_frida_port();
 }
 
-/* ag_frida_port 探测 Frida 默认端口是否在本地监听。 */
-static int ag_frida_port(void) {
+/*
+ * ag_frida_port 探测 Frida 默认端口是否在本地监听。
+ *
+ * C3 控制流平坦化：socket 建立、fd 判空、参数填充、connect 结果分支、
+ * 两个收尾 return 分别是状态 0..5。语义保持论证：状态转移与原来的
+ * if/else 一一对应（connect==0 → 状态 4 返回 1；否则状态 5 返回 0，
+ * 且两条路径都先 close(fd)），参数与常量保持不变。
+ */
+static AG_NOINLINE int ag_frida_port(void) {
 	struct sockaddr_in sa;
-	int fd;
+	int fd = -1;
 	int one = 1;
-	fd = ag_socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) {
-		return 0;
+	AG_FLAT_DECL(st);
+	AG_FLAT_LOOP(st) {
+		case 0:
+			fd = ag_socket(AF_INET, SOCK_STREAM, 0);
+			st = 1;
+			break;
+		case 1:
+			if (fd < 0) {
+				return 0;
+			}
+			st = 2;
+			break;
+		case 2:
+			AG_OPAQUE_GUARD((uint32_t)fd);
+			/* Linux 没有 SO_NOSIGPIPE（那是 BSD/macOS 的选项）；这里保留调用
+			 * 只为在某些兼容层下生效，失败无副作用。 */
+			ag_setsockopt(fd, SOL_SOCKET, 0, &one, (unsigned)sizeof(one));
+			sa.sin_family = AF_INET;
+			sa.sin_port = ag_htons(27042);
+			sa.sin_addr.s_addr = ag_htonl(0x7f000001u); /* 127.0.0.1 */
+			st = 3;
+			break;
+		case 3:
+			st = (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) ? 4u : 5u;
+			break;
+		case 4:
+			close(fd);
+			return 1;
+		case 5:
+			close(fd);
+			return 0;
+		default:
+			st = 5; /* 不可达；闭环避免调度器落空 */
+			break;
 	}
-	/* Linux 没有 SO_NOSIGPIPE（那是 BSD/macOS 的选项）；这里保留调用
-	 * 只为在某些兼容层下生效，失败无副作用。 */
-	ag_setsockopt(fd, SOL_SOCKET, 0, &one, (unsigned)sizeof(one));
-	sa.sin_family = AF_INET;
-	sa.sin_port = ag_htons(27042);
-	sa.sin_addr.s_addr = ag_htonl(0x7f000001u); /* 127.0.0.1 */
-	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
-		close(fd);
-		return 1;
-	}
-	close(fd);
-	return 0;
 }
 
 /*
@@ -786,14 +1167,15 @@ static int ag_hash_region(int fd, ag_sha256 *sh, uint64_t off, uint64_t size) {
 /*
  * ag_intact 返回 1 表示自身代码与常量未被篡改。
  */
-static int ag_intact(void) {
+static AG_NOINLINE int ag_intact(void) {
 	char path[512];
-	int fd, ok = 1;
+	int fd = -1, ok = 1;
 	ag_sha256 sh;
 	uint8_t got[32];
 	uint64_t toff = 0, tsize = 0, roff = 0, rsize = 0;
 	uint64_t base = 0;
 	int i;
+	AG_FLAT_DECL(st);
 	/*
 	 * 以下分支是**已知的能力边界**，不是应该静默掉的分支：
 	 *
@@ -805,41 +1187,105 @@ static int ag_intact(void) {
 	 *
 	 * 日志用 ONCE 变体：D4 的看门狗每 3 秒调一次本函数，逐次打印会把 logcat
 	 * 刷屏（实测每进程每 3 秒一行），反而让这个提示被无视。
+	 *
+	 * C3 控制流平坦化：状态 0..9 与原基本块一一对应——
+	 *   0=取自身路径；1=打开自身文件；2=定位 .text/.rodata；3=初始化摘要器；
+	 *   4=哈希 .text；5=哈希 .rodata 并关闭 fd；6=判 ok 与收尾；
+	 *   7/8=逐字节比较期望摘要的循环头/体；9=返回完整。
+	 * 语义保持论证：
+	 *   - 原 `if (!hash(.text) || !hash(.rodata)) ok = 0;` 的短路语义被
+	 *     原样保留：状态 4 失败则置 ok=0 并跳到状态 6，不执行状态 5 的
+	 *     rodata 哈希（与原 || 短路一致）；
+	 *   - 降级分支与对应日志、close(fd) 的位置一一对应，返回值不变；
+	 *   - 状态 7/8 的循环与原来的 for (i=0;i<32;i++) 比较完全一致；
+	 *   - AG_OPAQUE_GUARD 不写 st，只增加不可达分支，不改变状态转移。
 	 */
-	if (!ag_self_path(path, (int)sizeof(path))) {
-		AG_LOG_ONCE("C6: 无法定位自身文件，自校验跳过");
-		return 1;
+	AG_FLAT_LOOP(st) {
+		case 0:
+			if (!ag_self_path(path, (int)sizeof(path))) {
+				AG_LOG_ONCE_ENC(ag_s_log_nopath_enc, ag_s_log_nopath_len,
+				                AG_SALT_LOG_NOPATH);
+				return 1;
+			}
+			st = 1;
+			break;
+		case 1:
+			AG_OPAQUE_GUARD((uint32_t)path[0]);
+			fd = ag_self_open(path, &base);
+			if (fd < 0) {
+				AG_LOG_ONCE_ENC(ag_s_log_openfail_enc, ag_s_log_openfail_len,
+				                AG_SALT_LOG_OPENFAIL, path, g_sec_err);
+				return 1;
+			}
+			st = 2;
+			break;
+		case 2:
+			if (!ag_find_section(fd, base, ".text", &toff, &tsize) ||
+			    !ag_find_section(fd, base, ".rodata", &roff, &rsize)) {
+				AG_LOG_ONCE_ENC(ag_s_log_nosec_enc, ag_s_log_nosec_len,
+				                AG_SALT_LOG_NOSEC, g_sec_err);
+				ag_close(fd);
+				return 1;
+			}
+			st = 3;
+			break;
+		case 3:
+			ag_sha256_init(&sh);
+			st = 4;
+			break;
+		case 4:
+			if (!ag_hash_region(fd, &sh, toff, tsize)) {
+				ok = 0;
+				st = 6; /* 与原 || 短路一致：跳过 rodata 哈希 */
+				break;
+			}
+			st = 5;
+			break;
+		case 5:
+			if (!ag_hash_region(fd, &sh, roff, rsize)) {
+				ok = 0;
+			}
+			st = 6;
+			break;
+		case 6:
+			ag_close(fd);
+			if (!ok) {
+				return 1;
+			}
+			ag_sha256_final(&sh, got);
+			i = 0;
+			st = 7;
+			break;
+		case 7:
+			AG_OPAQUE_GUARD((uint32_t)i ^ got[0]);
+			st = (i < 32) ? 8u : 9u;
+			break;
+		case 8:
+			if (got[i] != AG_EXPECT[i]) {
+				return 0;
+			}
+			i++;
+			st = 7;
+			break;
+		case 9:
+			return 1;
+		default:
+			st = 6; /* 不可达；闭环避免调度器落空 */
+			break;
 	}
-	fd = ag_self_open(path, &base);
-	if (fd < 0) {
-		AG_LOG_ONCE("C6: 打开自身文件失败（%s，原因 %s），自校验跳过", path, g_sec_err);
-		return 1;
-	}
-	if (!ag_find_section(fd, base, ".text", &toff, &tsize) ||
-	    !ag_find_section(fd, base, ".rodata", &roff, &rsize)) {
-		AG_LOG_ONCE("C6: 自身文件缺少 .text/.rodata 节名（原因 %s），自校验跳过", g_sec_err);
-		ag_close(fd);
-		return 1;
-	}
-	ag_sha256_init(&sh);
-	if (!ag_hash_region(fd, &sh, toff, tsize) ||
-	    !ag_hash_region(fd, &sh, roff, rsize)) {
-		ok = 0;
-	}
-	ag_close(fd);
-	if (!ok) {
-		return 1;
-	}
-	ag_sha256_final(&sh, got);
-	for (i = 0; i < 32; i++) {
-		if (got[i] != AG_EXPECT[i]) {
-			return 0;
-		}
-	}
-	return 1;
 }
 
 #endif /* !AG_HOST_TEST */
+
+/* ------------------------------------------------------------------ */
+/* B6：VMP 私有字节码解释器（核心实现见 agvm.h）                       */
+/* ------------------------------------------------------------------ */
+/*
+ * 私有指令是数据、解释器是固定 C 代码，因此不需要 NDK 之外的任何工具链。
+ * agvm.h 在 NDK（AG_JNI）、宿主自测（AG_HOST_TEST）与 Linux 自测下都编译；
+ * AG_HOST_TEST 时它还会提供 ag_vm_selftest()，由本文件的宿主自测调用。
+ */
+#include "agvm.h"
 
 /* ------------------------------------------------------------------ */
 /* JNI 入口（仅 NDK 构建）                                             */
@@ -951,6 +1397,64 @@ Java_com_apkguard_nativebridge_Native_intact(JNIEnv *env, jclass cls) {
 	return ag_intact() ? JNI_TRUE : JNI_FALSE;
 }
 
+/*
+ * B6：VM 方法注册入口。
+ *
+ * Java 侧（壳按需注入的桥接类）：
+ *   com.apkguard.nativebridge.VM.registerVmMethod(String sig, byte[] code)
+ *
+ * sig  形如 "Lcom/x/A;->f(I)I"（与 Go 侧 Program.Sig 同格式）；
+ * code 是**单方法记录**（Go 侧 vmp.EncodeMethodRecord 的字节），由壳在
+ *      B1 载荷解密后逐条取出交给 native。
+ *
+ * 返回 0 成功；负数错误码（见 agvm.h 的 ag_vm_err）。
+ *
+ * 边界说明：run/runWide 执行入口需要 JNI 运行时后端（类解析走载荷
+ * ClassLoader）与生成的 Dalvik 桥接 stub，属后续切片——本版只交付
+ * 「翻译 + 私有字节码 + C 解释器（宿主已对拍）+ 注册表」，
+ * 因此不导出半可用的执行入口。
+ */
+JNIEXPORT jint JNICALL
+Java_com_apkguard_nativebridge_VM_registerVmMethod(JNIEnv *env, jclass cls, jstring jSig, jbyteArray jCode) {
+	const char *sig;
+	jbyte *body;
+	jsize n;
+	ag_vm_prog *prog;
+	int rc = AG_VM_ERR_ARG;
+	(void)cls;
+
+	if (!jSig || !jCode) {
+		return AG_VM_ERR_ARG;
+	}
+	sig = (*env)->GetStringUTFChars(env, jSig, 0);
+	if (!sig) {
+		return AG_VM_ERR_NOMEM;
+	}
+	n = (*env)->GetArrayLength(env, jCode);
+	body = (*env)->GetByteArrayElements(env, jCode, 0);
+	if (!body) {
+		(*env)->ReleaseStringUTFChars(env, jSig, sig);
+		return AG_VM_ERR_NOMEM;
+	}
+	if (n > 0 && n <= (1 << 20)) {
+		prog = ag_vm_parse_record((const uint8_t *)body, (size_t)n, &rc);
+	} else {
+		prog = 0;
+	}
+	(*env)->ReleaseByteArrayElements(env, jCode, body, JNI_ABORT);
+	if (!prog) {
+		(*env)->ReleaseStringUTFChars(env, jSig, sig);
+		return rc;
+	}
+	/* ag_vm_register 内部会校验传入签名与记录身份一致；成功即接管所有权。 */
+	rc = ag_vm_register(sig, prog);
+	(*env)->ReleaseStringUTFChars(env, jSig, sig);
+	if (rc != AG_VM_OK) {
+		ag_vm_free_prog(prog);
+	}
+	return rc;
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 	(void)vm;
 	(void)reserved;
@@ -987,6 +1491,30 @@ static int check(const char *name, const uint8_t *got, const char *want) {
 	}
 	printf("FAIL %s\n  got  %s\n  want %s\n", name, hex, want);
 	return 1;
+}
+
+/*
+ * encdec 把一串密文解密到栈上并以 hex 打印。
+ *
+ * C3 的跨语言断言：Go 测试解析这些行，与自己保存的期望明文（hex）比对——
+ * 明文只存在于测试代码里，C 源码与 .so 中都没有。这样既能证明每串密文
+ * 解出的是原字符串，也避免把敏感串再写回源码。
+ */
+static void encdec(const char *name, const uint8_t *enc, int len, uint32_t salt) {
+	static const char *d = "0123456789abcdef";
+	uint8_t buf[256];
+	char hex[520];
+	int i;
+	if (len > (int)sizeof(buf)) {
+		len = (int)sizeof(buf);
+	}
+	ag_dec(buf, enc, (uint32_t)len, salt);
+	for (i = 0; i < len; i++) {
+		hex[i * 2] = d[buf[i] >> 4];
+		hex[i * 2 + 1] = d[buf[i] & 15];
+	}
+	hex[len * 2] = 0;
+	printf("ENCDEC_%s %s\n", name, hex);
 }
 
 int main(void) {
@@ -1048,6 +1576,55 @@ int main(void) {
 		}
 	}
 
+	/* C3：逐串解密并输出 hex，供 Go 侧比对期望明文。 */
+	encdec("ag_s_status", ag_s_status_enc, ag_s_status_len, AG_SALT_STATUS);
+	encdec("ag_s_maps", ag_s_maps_enc, ag_s_maps_len, AG_SALT_MAPS);
+	encdec("ag_s_frida", ag_s_frida_enc, ag_s_frida_len, AG_SALT_FRIDA);
+	encdec("ag_s_xposed", ag_s_xposed_enc, ag_s_xposed_len, AG_SALT_XPOSED);
+	encdec("ag_s_substrate", ag_s_substrate_enc, ag_s_substrate_len, AG_SALT_SUBSTRATE);
+	encdec("ag_s_linjector", ag_s_linjector_enc, ag_s_linjector_len, AG_SALT_LINJECTOR);
+	encdec("ag_s_libhook", ag_s_libhook_enc, ag_s_libhook_len, AG_SALT_LIBHOOK);
+	encdec("ag_s_hookzz", ag_s_hookzz_enc, ag_s_hookzz_len, AG_SALT_HOOKZZ);
+	encdec("ag_s_whale", ag_s_whale_enc, ag_s_whale_len, AG_SALT_WHALE);
+	encdec("ag_s_ddi", ag_s_ddi_enc, ag_s_ddi_len, AG_SALT_DDI);
+	encdec("ag_s_epic", ag_s_epic_enc, ag_s_epic_len, AG_SALT_EPIC);
+	encdec("ag_s_magisk", ag_s_magisk_enc, ag_s_magisk_len, AG_SALT_MAGISK);
+	encdec("ag_s_tag", ag_s_tag_enc, ag_s_tag_len, AG_SALT_TAG);
+	encdec("ag_s_tpid", ag_s_tpid_enc, ag_s_tpid_len, AG_SALT_TPID);
+	encdec("ag_s_log_nopath", ag_s_log_nopath_enc, ag_s_log_nopath_len, AG_SALT_LOG_NOPATH);
+	encdec("ag_s_log_openfail", ag_s_log_openfail_enc, ag_s_log_openfail_len, AG_SALT_LOG_OPENFAIL);
+	encdec("ag_s_log_nosec", ag_s_log_nosec_enc, ag_s_log_nosec_len, AG_SALT_LOG_NOSEC);
+
+	/*
+	 * C3：不透明谓词恒定性。边界值 + 100 万组 LCG 输入，任一时刻谓词
+	 * 走反方向（或实现有 UB/写错）都会置 opq_bad，RESULT 变 FAIL。
+	 */
+	{
+		uint32_t i, v;
+		int opq_bad = 0;
+		const uint32_t edge[6] = {
+			0u, 1u, 0xffffffffu, 0x80000000u, 0x7fffffffu, 0xdeadbeefu};
+		for (i = 0; i < 6; i++) {
+			if (!ag_opq_true(edge[i]) || ag_opq_false(edge[i])) {
+				opq_bad = 1;
+			}
+		}
+		v = 0x12345678u;
+		for (i = 0; i < 1000000u; i++) {
+			v = v * 1664525u + 1013904223u;
+			if (!ag_opq_true(v) || ag_opq_false(v)) {
+				opq_bad = 1;
+				break;
+			}
+		}
+		if (opq_bad) {
+			printf("FAIL opaque predicate\n");
+			bad++;
+		} else {
+			printf("PASS opaque predicate\n");
+		}
+	}
+
 	/* 派生：把结果打印出来，供 Go 侧对照，确保两侧实现一致。 */
 	{
 		uint8_t sig[32];
@@ -1063,6 +1640,12 @@ int main(void) {
 		tohex(out, 32, hex);
 		printf("DERIVE_NO_SIG %s\n", hex);
 	}
+	/*
+	 * B6：VMP 私有字节码解释器的宿主断言。它不看 JNI，只证明
+	 * 「解析 → 结构校验 → dispatch 循环 → 回调运行时」这条链的语义正确。
+	 */
+	bad += ag_vm_selftest();
+
 	printf(bad ? "RESULT FAIL\n" : "RESULT OK\n");
 	return bad;
 }

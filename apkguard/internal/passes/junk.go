@@ -579,6 +579,108 @@ func junkKotlinName(r *rand.Rand, i int) string {
 	return "kotlin/" + randSeg(r, 4+r.Intn(5)) + "/" + randSeg(r, 4+r.Intn(5)) + "." + ext
 }
 
+// ---- A12 归一化近重名族 ----
+//
+// 参考样本（sample.apk，2418 条）实测：中央目录里存在大量「把 `\` 当分隔符、
+// 折叠连续 `/` 后落进同一路径」的条目组（最大一组 13 条）：
+//
+//	/resources.arsc//.xml
+//	/resources.arsc//////.xml
+//	/resources.arsc\/.xml
+//
+// 三条都归一化为 /resources.arsc/.xml。它们在中央目录里的**精确名互不相同**，
+// 所以能通过签名与安装（apksigner 只拒绝精确重名）；而任何「先归一化路径、
+// 再按路径去重/派生行为」的工具都会撞车。
+//
+// 这与 A12 的精确重名族（③）是两回事：精确重名在启用 E1 时必须跳过，
+// 本族在签名开启时照常生效。变体名全部经 A12 的 add 走既有条目精确去重，
+// 基础路径的首段是核心文件名，但**精确名一律带 /<叶名> 后缀**，绝不与真实
+// AndroidManifest.xml / classes*.dex / resources.arsc / lib/** /
+// META-INF/*.MF|*.SF|*.RSA 精确同名——这是「能装能签」的前提。
+
+// nearDupLeaf 是全部基础路径的叶名（与样本同形：resources.arsc/.xml 等）。
+const nearDupLeaf = ".xml"
+
+// nearDupBases 是归一化近重名族的 8 个基础路径（按段给出），覆盖样本里出现过的
+// 命名空间：AndroidManifest.xml/、classes*.dex/、resources.arsc/、META-INF/、
+// res/values/、kotlin/。
+//
+// 每个基础路径的**精确名都不是**真实核心文件（真实核心文件没有 /<叶名> 后缀），
+// 同组变体只在分隔符与冗余斜杠上做文章，归一化后落进同一路径。
+//
+// 这里用 res/values/themes.xml 而不是更常见的 strings.xml：A10 的「真资源路径
+// 变体」族会给 junkResSourceNames 的每个名字生成归一化后等于
+// res/values/<名>.xml/.xml 的条目，用同名单会让本族变体在 coreCollision 处被
+// A10 已注入的诱饵挡下（A10 与 A12 常同时启用），导致组数随 seed 波动。
+var nearDupBases = [][]string{
+	{"AndroidManifest.xml", nearDupLeaf},
+	{"classes.dex", nearDupLeaf},
+	{"classes2.dex", nearDupLeaf},
+	{"resources.arsc", nearDupLeaf},
+	{"META-INF", "MANIFEST.MF", nearDupLeaf},
+	{"META-INF", "CERT.SF", nearDupLeaf},
+	{"res", "values", "themes.xml", nearDupLeaf},
+	{"kotlin", "kotlin.kotlin_builtins", nearDupLeaf},
+}
+
+// nearDupSepForms 是每个变体在**首个分隔符**位置使用的形态：单反斜杠、冗余双斜杠、
+// 反斜杠+斜杠混排、冗余三斜杠。四者归一化（`\`→`/`、折叠连续 `/`）后都等于单个
+// `/`。把变体统一放在首段之后，既复刻样本 `resources.arsc//.xml` 的形态，又让
+// 同组 4 个精确名两两不同。
+var nearDupSepForms = [...]string{`\`, "//", `\/`, "///"}
+
+// nearDupVariants 返回基础路径 base 的变体：每个变体只替换首段之后的分隔符，
+// 其余分隔符保持 `/`。len(nearDupSepForms) 个变体互不相同，且都不等于基础
+// 路径本身（首段之后永远不是干净的单个 `/`）。
+func nearDupVariants(base []string) []string {
+	if len(base) < 2 {
+		return nil
+	}
+	out := make([]string, 0, len(nearDupSepForms))
+	for _, form := range nearDupSepForms {
+		var b strings.Builder
+		for i, seg := range base {
+			b.WriteString(seg)
+			if i == len(base)-1 {
+				break
+			}
+			if i == 0 {
+				b.WriteString(form)
+			} else {
+				b.WriteByte('/')
+			}
+		}
+		out = append(out, b.String())
+	}
+	return out
+}
+
+// nearDupNormalize 按样本口径归一化近重名路径：把 `\` 当分隔符，折叠连续 `/`。
+//
+// 与 normZipPath 的差别：不做 `.`/`..` 消解（本族禁止点段），因此它同时是
+// 「归一化后同路径」的判定函数与生成侧的承诺——任何两个变体归一化后必须相等。
+func nearDupNormalize(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	prevSlash := false
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == '\\' {
+			c = '/'
+		}
+		if c == '/' {
+			if prevSlash {
+				continue
+			}
+			prevSlash = true
+		} else {
+			prevSlash = false
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // junkHexSuffixBases 是 4 位 hex 近重名族的基础名。
 //
 // 样本用 4 位随机 hex 给同一基础名去重：META-INF///.xml629c 等，CD 里精确名字

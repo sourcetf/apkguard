@@ -102,9 +102,9 @@ func TestRenamerPlan(t *testing.T) {
 	t.Logf("重命名计划：类 %d、方法名 %d、字段名 %d；保留类 %d 个（%v）",
 		st.Classes, st.Methods, st.Fields, st.KeptCls, st.KeepReasons)
 
-	// 关键约束 1：平台/框架类绝不能被改名
+	// 关键约束 1：平台/框架类（及默认配置下的三方库类）绝不能被改名
 	for _, ci := range infos {
-		if !hasAnyPrefix(ci.Desc, javaPrefixes) {
+		if !hasAnyPrefix(ci.Desc, platformPrefixes) && !hasAnyPrefix(ci.Desc, libraryPrefixes) {
 			continue
 		}
 		if nw, ok := plan[ci.Desc]; ok {
@@ -288,7 +288,8 @@ func TestRenamerKeepRules(t *testing.T) {
 	// 找一个业务包名（非平台前缀、非组件类），用它的包名构造保留规则
 	pkg := ""
 	for _, ci := range infos {
-		if hasAnyPrefix(ci.Desc, javaPrefixes) || isEntryPoint(&ci) || strings.Contains(ci.Desc, "$") {
+		if hasAnyPrefix(ci.Desc, platformPrefixes) || hasAnyPrefix(ci.Desc, libraryPrefixes) ||
+			isEntryPoint(&ci) || strings.Contains(ci.Desc, "$") {
 			continue
 		}
 		j := descToJava(ci.Desc)

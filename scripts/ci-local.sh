@@ -99,20 +99,22 @@ case "$(uname -s)" in
 esac
 if "$LOCAL_BIN" -list >/dev/null 2>&1; then ok "-list 可执行"; else bad "-list 失败"; fi
 n="$("$LOCAL_BIN" -list | "$PY_BIN" "$ROOT/scripts/count-features.py")"
-[ "$n" -eq 46 ] && ok "功能项 46 个" || bad "功能项数量为 $n（应为 46）"
+[ "$n" -eq 47 ] && ok "功能项 47 个" || bad "功能项数量为 $n（应为 47）"
 
 printf 'x' > /tmp/ag-fake.apk
 # 注意：本脚本开了 pipefail，而这两条命令**预期会非零退出**（报错即成功）。
 # 直接 `cmd | grep -q X` 会因为管道里前半段非零而让整个 if 判假，
 # 于是「确实报了错」反而被记成失败。必须先取输出再匹配。
 #
-# 断言必须匹配**错误文案**而不是功能项 ID：`-enable A7` 的输出里
-# 「启用功能项: …A7…」这一行也含 A7，只匹配 ID 会让「根本没校验」也算通过
-# （旧版对 A6 就是一条这样的空断言）。B6（VMP）是确定未实现的项（见 config 注册表）。
-out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable B6 2>&1 || true)"
+# 断言必须匹配**错误文案**而不是功能项 ID：`-enable ZZZ` 的输出里
+# 请求行也可能回显 ZZZ，只匹配 ID 会让「根本没校验」也算通过
+# （旧版对 A6 就是一条这样的空断言）。本轮之后 47 项全部已实现，
+# 「已注册但未实现」的拒绝分支改由 internal/config/config_test.go 的单测
+# 覆盖（临时从 implementedIDs 摘掉一项构造场景），这里覆盖未知 ID 分支。
+out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable ZZZ 2>&1 || true)"
 case "$out" in
-  *尚未实现*B6*) ok "未实现的功能项被正确拒绝" ;;
-  *)             bad "启用未实现的 B6 没有按要求报错" ;;
+  *未知功能项*ZZZ*) ok "未知功能项 ID 被正确拒绝" ;;
+  *)                bad "启用未知功能项 ZZZ 没有按要求报错" ;;
 esac
 out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable E1 2>&1 || true)"
 case "$out" in

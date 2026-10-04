@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"apkguard/internal/arsc"
 	"apkguard/internal/axml"
@@ -636,4 +637,574 @@ func TestArscKeysA5A11RunsOnce(t *testing.T) {
 	if !notesContain(art, "已执行过 keyStrings 随机化，跳过") {
 		t.Fatalf("第二次 A11 未报告跳过: %v", art.Notes)
 	}
+}
+
+// ---- 资源值零宽副本 + typeStrings 占位名的接线测试 ----
+
+// syntheticArscVals 构造带字符串值 entry 的最小资源表，用于接线测试。
+//
+// global 是全局字符串池；entries 是 typeId → 该类型条目引用的全局池下标
+// （简单 entry，Res_value.dataType = TYPE_STRING）；keyStrings 按条目序号取模。
+// typeNames 里没有 entry 的 id 即「未使用 typeId」，应被写成 ?<id>。
+func syntheticArscVals(t *testing.T, global, typeNames, keys []string, entries map[int][]int) []byte {
+	t.Helper()
+	gp := axml.EncodeStringPool(global, true)
+	tp := axml.EncodeStringPool(typeNames, true)
+	kp := axml.EncodeStringPool(keys, true)
+
+	var sub []byte
+	for id := 1; id <= len(typeNames); id++ {
+		idxs := entries[id]
+		if len(idxs) == 0 {
+			continue
+		}
+		ts := make([]byte, 16+4*len(idxs))
+		binary.LittleEndian.PutUint16(ts[0:], 0x0202)
+		binary.LittleEndian.PutUint16(ts[2:], 16)
+		binary.LittleEndian.PutUint32(ts[4:], uint32(len(ts)))
+		ts[8] = byte(id)
+		binary.LittleEndian.PutUint32(ts[12:], uint32(len(idxs)))
+		sub = append(sub, ts...)
+
+		const hdr = 84
+		es := hdr + 4*len(idxs)
+		size := es + 16*len(idxs)
+		tc := make([]byte, size)
+		binary.LittleEndian.PutUint16(tc[0:], 0x0201)
+		binary.LittleEndian.PutUint16(tc[2:], hdr)
+		binary.LittleEndian.PutUint32(tc[4:], uint32(size))
+		tc[8] = byte(id)
+		binary.LittleEndian.PutUint32(tc[12:], uint32(len(idxs)))
+		binary.LittleEndian.PutUint32(tc[16:], uint32(es))
+		for i, gi := range idxs {
+			binary.LittleEndian.PutUint32(tc[hdr+4*i:], uint32(16*i))
+			eo := es + 16*i
+			binary.LittleEndian.PutUint16(tc[eo:], 8)   // ResTable_entry.size
+			binary.LittleEndian.PutUint16(tc[eo+2:], 2) // FLAG_PUBLIC
+			binary.LittleEndian.PutUint32(tc[eo+4:], uint32(i%len(keys)))
+			binary.LittleEndian.PutUint16(tc[eo+8:], 8) // Res_value.size
+			tc[eo+11] = 0x03                            // TYPE_STRING
+			binary.LittleEndian.PutUint32(tc[eo+12:], uint32(gi))
+		}
+		sub = append(sub, tc...)
+	}
+
+	pkg := make([]byte, 288+len(tp)+len(kp)+len(sub))
+	binary.LittleEndian.PutUint16(pkg[0:], 0x0200)
+	binary.LittleEndian.PutUint16(pkg[2:], 288)
+	binary.LittleEndian.PutUint32(pkg[4:], uint32(len(pkg)))
+	binary.LittleEndian.PutUint32(pkg[8:], 0x7f)
+	binary.LittleEndian.PutUint32(pkg[268:], 288)
+	binary.LittleEndian.PutUint32(pkg[276:], uint32(288+len(tp)))
+	copy(pkg[288:], tp)
+	copy(pkg[288+len(tp):], kp)
+	copy(pkg[288+len(tp)+len(kp):], sub)
+
+	out := make([]byte, 12+len(gp)+len(pkg))
+	binary.LittleEndian.PutUint16(out[0:], 0x0002)
+	binary.LittleEndian.PutUint16(out[2:], 12)
+	binary.LittleEndian.PutUint32(out[4:], uint32(len(out)))
+	copy(out[12:], gp)
+	copy(out[12+len(gp):], pkg)
+	return out
+}
+
+// subBehaviorFixture 构造「40 条全局值 + 30 个字符串值 entry + 1 个未使用
+// typeId（id=2 的 legacy_slot）」的产物，返回产物与原始全局值列表。
+func subBehaviorFixture(t *testing.T) (*pipeline.Artifact, []string) {
+	t.Helper()
+	var global []string
+	end := map[int][]int{}
+	for i := 0; i < 40; i++ {
+		global = append(global, "value_text_"+strconv.Itoa(i))
+		if i < 30 {
+			end[1] = append(end[1], i) // typeId 1 = string
+		}
+	}
+	raw := syntheticArscVals(t,
+		global,
+		[]string{"string", "legacy_slot"}, // id 2 无 entry → 未使用
+		[]string{"key_name_a", "key_name_b", "key_name_c"},
+		end,
+	)
+	art := newArtifact(zipx.NewStored(arscName, raw))
+	return art, global
+}
+
+// intStat 读取一个应为整数的统计值。
+func intStat(t *testing.T, art *pipeline.Artifact, key string) int {
+	t.Helper()
+	v, ok := art.Stats[key]
+	if !ok {
+		t.Fatalf("缺少统计 %s（现有：%v）", key, art.Stats)
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		t.Fatalf("统计 %s=%q 不是整数", key, v)
+	}
+	return n
+}
+
+// arscEntryStringRefs 是测试自写的极简遍历器：收集简单 entry 的字符串值下标。
+// 故意不复用 internal/arsc 的遍历（避免用同一份代码自证自己）。
+func arscEntryStringRefs(t *testing.T, data []byte) map[int]bool {
+	t.Helper()
+	hdr := int(binary.LittleEndian.Uint16(data[2:]))
+	total := int(binary.LittleEndian.Uint32(data[4:]))
+	refs := map[int]bool{}
+	for p := hdr; p+8 <= total; {
+		tp := binary.LittleEndian.Uint16(data[p:])
+		sz := int(binary.LittleEndian.Uint32(data[p+4:]))
+		if sz < 8 || p+sz > total {
+			t.Fatalf("顶层块非法: type=%#x size=%d", tp, sz)
+		}
+		if tp != 0x0200 {
+			p += sz
+			continue
+		}
+		phdr := int(binary.LittleEndian.Uint16(data[p+2:]))
+		for q := p + phdr; q+8 <= p+sz; {
+			st := binary.LittleEndian.Uint16(data[q:])
+			ssz := int(binary.LittleEndian.Uint32(data[q+4:]))
+			if ssz < 8 || q+ssz > p+sz {
+				t.Fatalf("包内子块非法: type=%#x size=%d", st, ssz)
+			}
+			if st == 0x0201 {
+				th := int(binary.LittleEndian.Uint16(data[q+2:]))
+				cnt := int(binary.LittleEndian.Uint32(data[q+12:]))
+				es := int(binary.LittleEndian.Uint32(data[q+16:]))
+				for i := 0; i < cnt; i++ {
+					o := int(binary.LittleEndian.Uint32(data[q+th+4*i:]))
+					if o == 0xffffffff {
+						continue
+					}
+					eo := q + es + o
+					if flags := binary.LittleEndian.Uint16(data[eo+2:]); flags&1 != 0 {
+						continue // 复合 entry：本夹具不产生
+					}
+					if data[eo+11] == 0x03 {
+						refs[int(binary.LittleEndian.Uint32(data[eo+12:]))] = true
+					}
+				}
+			}
+			q += ssz
+		}
+		p += sz
+	}
+	return refs
+}
+
+// TestArscSubBehaviorsWiring 验证 A5/A11 两个新子行为的接线：
+// 统计、Note、幂等标记，以及产物自洽（原值逐条不变、追加区间未被引用、
+// 未使用 typeId 的占位名真的写入且已使用类型名不动）。
+func TestArscSubBehaviorsWiring(t *testing.T) {
+	art, global := subBehaviorFixture(t)
+	opts := &config.Options{Enabled: map[config.FeatureID]bool{"A5": true}, Seed: "sub-wire"}
+	if err := (&resourceObf{}).Run(context.Background(), art, opts); err != nil {
+		t.Fatalf("A5 执行失败: %v", err)
+	}
+
+	// 统计：池 40 条 → 自适应上限 10，恰好覆盖 10 个逻辑值，每个 1~3 条。
+	if got := intStat(t, art, "A5.padvalues"); got != 10 {
+		t.Fatalf("A5.padvalues=%d，期望 10（40/4 自适应上限）", got)
+	}
+	padN := intStat(t, art, "A5.padstrings")
+	if padN < 10 || padN > 30 {
+		t.Fatalf("A5.padstrings=%d 超出每值 1~3 条的范围", padN)
+	}
+	if got := intStat(t, art, "A5.typetokens"); got != 1 {
+		t.Fatalf("A5.typetokens=%d，期望 1（id 2 未使用）", got)
+	}
+	for _, sub := range []string{"资源值零宽副本", "均未被任何 entry 引用", "typeStrings 占位名"} {
+		if !notesContain(art, sub) {
+			t.Fatalf("Note 缺少 %q: %v", sub, art.Notes)
+		}
+	}
+
+	// 产物自洽。
+	data := arscBytes(t, art)
+	tbl, err := arsc.Parse(data)
+	if err != nil {
+		t.Fatalf("改写后解析失败: %v", err)
+	}
+	strs := tbl.Strings()
+	if len(strs) != len(global)+padN {
+		t.Fatalf("池条目数 %d ≠ %d + %d", len(strs), len(global), padN)
+	}
+	for i, v := range global {
+		if strs[i] != v {
+			t.Fatalf("原值 %d 被改动: %q → %q", i, v, strs[i])
+		}
+	}
+	marked := 0
+	for _, s := range strs[len(global):] {
+		if strings.ContainsAny(s, "\u200e\u200f") {
+			marked++
+		}
+	}
+	if marked != padN {
+		t.Fatalf("追加条目含标记的只有 %d/%d 条", marked, padN)
+	}
+	// 没有任何 entry 引用追加区间（自写遍历器 + 夹具已知引用双重验证）。
+	for idx := range arscEntryStringRefs(t, data) {
+		if idx >= len(global) {
+			t.Fatalf("entry 引用了追加区间下标 %d", idx)
+		}
+	}
+	if arscEntryStringRefs(t, data)[0] != true || arscEntryStringRefs(t, data)[29] != true {
+		t.Fatal("夹具原有的字符串引用丢失")
+	}
+	// 占位名 ?2 已写入（typeNames 用 UTF-8 池）。
+	if !bytes.Contains(data, []byte("?2\x00")) {
+		t.Fatal("未使用 id 2 的占位名 ?2 未写入 typeStrings")
+	}
+	if !bytes.Contains(data, []byte("string\x00")) {
+		t.Fatal("已使用的类型名 string 被改动")
+	}
+
+	// A11 再跑同一产物：三个子行为都按 Shared 标记跳过，字节不变。
+	before := append([]byte(nil), data...)
+	opts2 := &config.Options{Enabled: map[config.FeatureID]bool{"A5": true, "A11": true}, Seed: "sub-wire"}
+	if err := (&resourceFlatten{}).Run(context.Background(), art, opts2); err != nil {
+		t.Fatalf("A11 第二次执行失败: %v", err)
+	}
+	if !bytes.Equal(before, arscBytes(t, art)) {
+		t.Fatal("第二次执行改动了字节（幂等标记失效）")
+	}
+	if !notesContain(art, "资源值零宽副本：本产物已执行过，跳过（幂等）") ||
+		!notesContain(art, "typeStrings 占位名：本产物已执行过，跳过（幂等）") {
+		t.Fatalf("缺少幂等跳过说明: %v", art.Notes)
+	}
+	t.Logf("接线：padstrings=%d（覆盖 %d 值）、typetokens=1、二次执行字节不变", padN, 10)
+}
+
+// TestArscSubBehaviorsIdempotent 直接验证两个函数级的幂等标记：
+// 第二次调用不做任何字节改动，只写跳过说明。
+func TestArscSubBehaviorsIdempotent(t *testing.T) {
+	art, _ := subBehaviorFixture(t)
+	opts := &config.Options{Enabled: map[config.FeatureID]bool{"A5": true}, Seed: "sub-idem"}
+	raw := arscBytes(t, art)
+
+	pad1, err := padArscValues(art, opts, raw, "A5")
+	if err != nil {
+		t.Fatalf("第一次 padArscValues 失败: %v", err)
+	}
+	pad2, err := padArscValues(art, opts, pad1, "A5")
+	if err != nil {
+		t.Fatalf("第二次 padArscValues 失败: %v", err)
+	}
+	if !bytes.Equal(pad1, pad2) {
+		t.Fatal("padArscValues 第二次调用改动了字节")
+	}
+	if !notesContain(art, "资源值零宽副本：本产物已执行过，跳过（幂等）") {
+		t.Fatalf("缺少跳过说明: %v", art.Notes)
+	}
+
+	ty1, err := placeholderArscTypeNames(art, pad2, "A5")
+	if err != nil {
+		t.Fatalf("第一次 placeholderArscTypeNames 失败: %v", err)
+	}
+	ty2, err := placeholderArscTypeNames(art, ty1, "A5")
+	if err != nil {
+		t.Fatalf("第二次 placeholderArscTypeNames 失败: %v", err)
+	}
+	if !bytes.Equal(ty1, ty2) {
+		t.Fatal("placeholderArscTypeNames 第二次调用改动了字节")
+	}
+	if !notesContain(art, "typeStrings 占位名：本产物已执行过，跳过（幂等）") {
+		t.Fatalf("缺少跳过说明: %v", art.Notes)
+	}
+}
+
+// ---- 真实产物 aapt2 回读 ----
+
+// testAapt2 是一个可执行的 aapt2 调用方式（本机二进制或经 WSL 调用的 Linux 二进制）。
+type testAapt2 struct {
+	prog string
+	pre  []string
+	wsl  bool
+}
+
+// path 把 Windows 路径转换成 aapt2 能读到的路径（WSL 场景转 /mnt/<盘>/…）。
+func (a testAapt2) path(p string) string {
+	if !a.wsl {
+		return p
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	abs = filepath.ToSlash(abs)
+	if len(abs) >= 2 && abs[1] == ':' {
+		return "/mnt/" + strings.ToLower(abs[:1]) + abs[2:]
+	}
+	return abs
+}
+
+// dump 跑 `aapt2 dump resources`；exit != 0 直接判失败（题目要求的判据）。
+func (a testAapt2) dump(t *testing.T, apk string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	defer cancel()
+	args := append(append([]string{}, a.pre...), "dump", "resources", a.path(apk))
+	out, err := exec.CommandContext(ctx, a.prog, args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("aapt2 dump resources 返回非零: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+// findTestAapt2 依次找本机 aapt2、WSL 里约定位置的 aapt2；都找不到返回 false。
+//
+// WSL 位置可用环境变量覆盖：WSL_AAPT2_DISTRO / WSL_AAPT2_PATH。
+func findTestAapt2() (testAapt2, bool) {
+	if p := findAapt2(); p != "" {
+		return testAapt2{prog: p}, true
+	}
+	if runtime.GOOS != "windows" {
+		return testAapt2{}, false
+	}
+	distro := os.Getenv("WSL_AAPT2_DISTRO")
+	if distro == "" {
+		distro = "Ubuntu-26.04"
+	}
+	cand := os.Getenv("WSL_AAPT2_PATH")
+	if cand == "" {
+		cand = "/home/dev123/android-sdk/build-tools/34.0.0/aapt2"
+	}
+	probe := func(p string) bool {
+		return exec.Command("wsl.exe", "-d", distro, "-e", "test", "-x", p).Run() == nil
+	}
+	if probe(cand) {
+		return testAapt2{prog: "wsl.exe", pre: []string{"-d", distro, "-e", cand}, wsl: true}, true
+	}
+	out, err := exec.Command("wsl.exe", "-d", distro, "-e", "sh", "-lc",
+		`ls -d $HOME/android-sdk/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1`).Output()
+	if err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" && probe(p) {
+			return testAapt2{prog: "wsl.exe", pre: []string{"-d", distro, "-e", p}, wsl: true}, true
+		}
+	}
+	return testAapt2{}, false
+}
+
+// countResourceDump 数 dump 输出里的资源行数与 (file) 引用行数。
+func countResourceDump(s string) (resources, fileRefs int) {
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "resource 0x") {
+			resources++
+		}
+		if strings.Contains(line, "(file)") {
+			fileRefs++
+		}
+	}
+	return
+}
+
+// TestA5A11Aapt2ReadbackStable 是真实产物回读判据：对真实 APK 跑完 A5/A11
+// （含零宽副本与占位名两个新子行为）后，aapt2 dump resources 必须 exit 0，
+// 且资源数与 (file) 引用数与改写前完全一致。
+//
+// 本机没有 aapt2 时经 WSL 调用（见 findTestAapt2）；两者都没有则跳过，
+// 但零宽副本的结构正确性仍有 internal/arsc 的单测兜底。
+func TestA5A11Aapt2ReadbackStable(t *testing.T) {
+	tool, ok := findTestAapt2()
+	if !ok {
+		t.Skip("未找到 aapt2（本机与 WSL 都没有），跳过真实产物回读")
+	}
+	in := aapt2Sample(t)
+	before := tool.dump(t, in)
+	beforeRes, beforeRefs := countResourceDump(before)
+	if beforeRes == 0 {
+		t.Skip("样本没有可枚举资源")
+	}
+
+	art, err := pipeline.Load(in)
+	if err != nil {
+		t.Fatalf("读取样本失败: %v", err)
+	}
+	opts := &config.Options{Enabled: map[config.FeatureID]bool{"A5": true, "A11": true}, Seed: "aapt2-readback"}
+	ctx := context.Background()
+	if err := (&resourceObf{}).Run(ctx, art, opts); err != nil {
+		t.Fatalf("A5 执行失败: %v", err)
+	}
+	if err := (&resourceFlatten{}).Run(ctx, art, opts); err != nil {
+		t.Fatalf("A11 执行失败: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "out.apk")
+	if err := os.WriteFile(out, pipeline.Bytes(art), 0o644); err != nil {
+		t.Fatalf("写出产物失败: %v", err)
+	}
+	after := tool.dump(t, out)
+	afterRes, afterRefs := countResourceDump(after)
+	if afterRes != beforeRes {
+		t.Fatalf("资源数变化：%d → %d", beforeRes, afterRes)
+	}
+	if afterRefs != beforeRefs {
+		t.Fatalf("(file) 引用数变化：%d → %d", beforeRefs, afterRefs)
+	}
+
+	// 确认新子行为确实生效（否则上述「不变」可能只是因为什么都没做）。
+	// A5+A11 同时启用时由 A11 执行，统计挂在 A11.* 下。
+	padStat := art.Stats["A5.padstrings"]
+	if padStat == "" {
+		padStat = art.Stats["A11.padstrings"]
+	}
+	data := arscBytes(t, art)
+	tbl, err := arsc.Parse(data)
+	if err != nil {
+		t.Fatalf("产物 resources.arsc 解析失败: %v", err)
+	}
+	marked := 0
+	for _, s := range tbl.Strings() {
+		if strings.ContainsAny(s, "\u200e\u200f") {
+			marked++
+		}
+	}
+	if padN, _ := strconv.Atoi(padStat); padN > 0 && marked == 0 {
+		t.Fatal("统计说追加了零宽副本，但产物池里找不到标记字符")
+	}
+	t.Logf("aapt2 回读：资源 %d 条、(file) 引用 %d 条不变；池内零宽标记条目 %d 条；padstrings=%s",
+		afterRes, afterRefs, marked, padStat)
+}
+
+// aapt2Sample 优先用开发机上的大样本（池大、引用多），没有则回退到常规样本。
+func aapt2Sample(t *testing.T) string {
+	t.Helper()
+	big := filepath.Join("..", "..", "..", "sample.apk")
+	if st, err := os.Stat(big); err == nil && st.Size() > 0 {
+		return big
+	}
+	return sampleAPK(t)
+}
+
+// dropTypeChunks 从 resources.arsc 的第一个包里删掉指定 typeId 的
+// Type(0x0201)/TypeSpec(0x0202) 块，保持包块与表头 size 自洽。
+//
+// 真实样本的 typeId 全部在用，为了给「占位名」一个真实的 aapt2 回读场景，
+// 这里制造一个未使用 id：删掉它的类型块（该类型的资源随之消失），
+// 之后的 before/after 对比仍在同一基线上进行。
+func dropTypeChunks(t *testing.T, data []byte, drop int) []byte {
+	t.Helper()
+	hdr := int(binary.LittleEndian.Uint16(data[2:]))
+	total := int(binary.LittleEndian.Uint32(data[4:]))
+	pkgOff, pkgSize := -1, 0
+	for p := hdr; p+8 <= total; {
+		tp := binary.LittleEndian.Uint16(data[p:])
+		sz := int(binary.LittleEndian.Uint32(data[p+4:]))
+		if sz < 8 || p+sz > total {
+			t.Fatalf("顶层块非法: type=%#x size=%d", tp, sz)
+		}
+		if tp == 0x0200 {
+			pkgOff, pkgSize = p, sz
+			break
+		}
+		p += sz
+	}
+	if pkgOff < 0 {
+		t.Fatal("没有包块")
+	}
+	ph := int(binary.LittleEndian.Uint16(data[pkgOff+2:]))
+	var sub []byte
+	removed := 0
+	for q := pkgOff + ph; q+8 <= pkgOff+pkgSize; {
+		tp := binary.LittleEndian.Uint16(data[q:])
+		sz := int(binary.LittleEndian.Uint32(data[q+4:]))
+		if sz < 8 || q+sz > pkgOff+pkgSize {
+			t.Fatalf("包内子块非法: type=%#x size=%d", tp, sz)
+		}
+		if (tp == 0x0201 || tp == 0x0202) && int(data[q+8]) == drop {
+			removed++
+		} else {
+			sub = append(sub, data[q:q+sz]...)
+		}
+		q += sz
+	}
+	if removed == 0 {
+		t.Fatalf("没有找到 typeId=%d 的块", drop)
+	}
+	newPkg := append([]byte(nil), data[pkgOff:pkgOff+ph]...)
+	newPkg = append(newPkg, sub...)
+	binary.LittleEndian.PutUint32(newPkg[4:], uint32(len(newPkg)))
+	out := append([]byte(nil), data[:hdr]...)
+	out = append(out, data[hdr:pkgOff]...) // 全局池
+	out = append(out, newPkg...)
+	out = append(out, data[pkgOff+pkgSize:]...)
+	binary.LittleEndian.PutUint32(out[4:], uint32(len(out)))
+	return out
+}
+
+// TestPlaceholderTypeNamesAapt2Readback 是占位名的真实产物回读：先在真实 APK
+// 上删掉一个类型的 Type/TypeSpec 块制造「未使用 id」，跑 A5 后：
+//   - 该 id 的 typeStrings 槽位被改名为 ?<id>（UTF-16 池）；
+//   - 其余类型名原样；
+//   - aapt2 dump resources 仍 exit 0，资源数与 (file) 引用数与改写前一致。
+func TestPlaceholderTypeNamesAapt2Readback(t *testing.T) {
+	tool, ok := findTestAapt2()
+	if !ok {
+		t.Skip("未找到 aapt2（本机与 WSL 都没有），跳过真实产物回读")
+	}
+	fw := filepath.Join("..", "..", "..", "testdata", "sample.apk")
+	if st, err := os.Stat(fw); err != nil || st.Size() == 0 {
+		t.Skipf("固件样本不存在（%v），跳过", err)
+	}
+
+	// 制造未使用 typeId=1 的输入产物。
+	art, err := pipeline.Load(fw)
+	if err != nil {
+		t.Fatalf("读取固件失败: %v", err)
+	}
+	e := pipeline.Find(art, arscName)
+	if e == nil {
+		t.Skip("固件没有 resources.arsc")
+	}
+	raw, err := e.Data()
+	if err != nil {
+		t.Fatalf("读取 ARSC 失败: %v", err)
+	}
+	if err := e.SetData(dropTypeChunks(t, raw, 1), !e.IsStored()); err != nil {
+		t.Fatalf("写回改造后的 ARSC 失败: %v", err)
+	}
+	derived := filepath.Join(t.TempDir(), "derived.apk")
+	if err := os.WriteFile(derived, pipeline.Bytes(art), 0o644); err != nil {
+		t.Fatalf("写出派生产物失败: %v", err)
+	}
+	before := tool.dump(t, derived)
+	beforeRes, beforeRefs := countResourceDump(before)
+	if beforeRes == 0 {
+		t.Skip("派生样本没有可枚举资源")
+	}
+
+	art2, err := pipeline.Load(derived)
+	if err != nil {
+		t.Fatalf("读取派生产物失败: %v", err)
+	}
+	opts := &config.Options{Enabled: map[config.FeatureID]bool{"A5": true}, Seed: "typetoken-readback"}
+	if err := (&resourceObf{}).Run(context.Background(), art2, opts); err != nil {
+		t.Fatalf("A5 执行失败: %v", err)
+	}
+	if got := intStat(t, art2, "A5.typetokens"); got != 1 {
+		t.Fatalf("A5.typetokens=%d，期望 1（派生出的未使用 id=1）", got)
+	}
+	out := filepath.Join(t.TempDir(), "out.apk")
+	if err := os.WriteFile(out, pipeline.Bytes(art2), 0o644); err != nil {
+		t.Fatalf("写出产物失败: %v", err)
+	}
+	after := tool.dump(t, out)
+	afterRes, afterRefs := countResourceDump(after)
+	if afterRes != beforeRes {
+		t.Fatalf("资源数变化：%d → %d", beforeRes, afterRes)
+	}
+	if afterRefs != beforeRefs {
+		t.Fatalf("(file) 引用数变化：%d → %d", beforeRefs, afterRefs)
+	}
+	// 固件的 typeStrings 是 UTF-16 池：?1 = '?' 00 '1' 00。
+	data := arscBytes(t, art2)
+	if !bytes.Contains(data, []byte{'?', 0, '1', 0}) {
+		t.Fatal("未使用 id 1 的占位名 ?1 未写入 typeStrings（UTF-16）")
+	}
+	if !bytes.Contains(data, []byte{'l', 0, 'a', 0, 'y', 0, 'o', 0, 'u', 0, 't', 0}) {
+		t.Fatal("已使用的类型名 layout 被改动")
+	}
+	t.Logf("占位名 aapt2 回读：资源 %d 条、(file) 引用 %d 条不变，未使用 id 1 → ?1", afterRes, afterRefs)
 }

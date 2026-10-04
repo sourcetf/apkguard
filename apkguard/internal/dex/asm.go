@@ -331,9 +331,40 @@ func (a *Asm) SGetObject(reg int, f FieldSpec) {
 	a.patch(1, RefSpec{Kind: RefField, Word: 1, Field: f}, 0x62|uint16(reg&0xff)<<8, 0)
 }
 
-// SGet 生成 sget vReg, field@符号（读取 int 静态字段，格式 21c）。
+// SGet 生成读取静态字段的指令（格式 21c）。
+//
+// 操作码按**字段声明类型**选择：`sget`(0x60) 只接受 int/float 字段，对
+// boolean/byte/char/short 字段必须用各自的 `sget-*` 变体。曾经无脑写 0x60，
+// 结果 B9 的双 APK 宿主在真机上被 ART 直接判死：
+//
+//	java.lang.VerifyError: Verifier rejected class …B:
+//	  void …B.run(Context): expected field boolean …B.s to have type
+//	  descriptor starting with 'I' or 'F' but found 'Z' in sget
+//
+// 结构校验（dex.Verify/ValidateDescriptors）看不出「操作码与字段类型不匹配」，
+// 只有 ART 的校验器会拒绝，所以在构建器这一层就按类型选对。
 func (a *Asm) SGet(reg int, f FieldSpec) {
-	a.patch(1, RefSpec{Kind: RefField, Word: 1, Field: f}, 0x60|uint16(reg&0xff)<<8, 0)
+	a.patch(1, RefSpec{Kind: RefField, Word: 1, Field: f}, narrowFieldOp(0x60, f.Type)|uint16(reg&0xff)<<8, 0)
+}
+
+// narrowFieldOp 把「int 家族的字段操作码」按字段类型换成对应的窄类型变体。
+//
+// base 是 int/float 版本（sget 0x60 / sput 0x67 / iget 0x52 / iput 0x59）；
+// Z/B/C/S 依次是 base+3/+4/+5/+6（DEX 指令表：sget-boolean 0x63、
+// sput-short 0x6d、iget-char 0x57…）。其余类型（I/F/对象/宽值）原样返回，
+// 由调用方用 SGetObject/SPutObject 等专用方法另行选择。
+func narrowFieldOp(base byte, typ string) uint16 {
+	switch typ {
+	case "Z":
+		return uint16(base + 3)
+	case "B":
+		return uint16(base + 4)
+	case "C":
+		return uint16(base + 5)
+	case "S":
+		return uint16(base + 6)
+	}
+	return uint16(base)
 }
 
 // IGetObject 生成 iget-object vDst, vObj, field@符号。
@@ -346,29 +377,29 @@ func (a *Asm) IGetObject(dst, obj int, f FieldSpec) error {
 	return nil
 }
 
-// IGet 生成 iget vDst, vObj, field@符号（读取 int 实例字段，格式 22c）。
+// IGet 生成读取 int 实例字段的指令（格式 22c）；窄类型字段按声明类型选变体。
 func (a *Asm) IGet(dst, obj int, f FieldSpec) error {
 	if err := checkReg4("iget", dst, obj); err != nil {
 		return err
 	}
 	a.patch(1, RefSpec{Kind: RefField, Word: 1, Field: f},
-		0x52|uint16(dst)<<8|uint16(obj)<<12, 0)
+		narrowFieldOp(0x52, f.Type)|uint16(dst)<<8|uint16(obj)<<12, 0)
 	return nil
 }
 
-// IPut 生成 iput vVal, vObj, field@符号（写入 int 实例字段，格式 22c）。
+// IPut 生成写入 int 实例字段的指令（格式 22c）；窄类型字段按声明类型选变体。
 func (a *Asm) IPut(val, obj int, f FieldSpec) error {
 	if err := checkReg4("iput", val, obj); err != nil {
 		return err
 	}
 	a.patch(1, RefSpec{Kind: RefField, Word: 1, Field: f},
-		0x59|uint16(val)<<8|uint16(obj)<<12, 0)
+		narrowFieldOp(0x59, f.Type)|uint16(val)<<8|uint16(obj)<<12, 0)
 	return nil
 }
 
-// SPut 生成 sput vReg, field@符号（写入 int 静态字段，格式 22c）。
+// SPut 生成写入静态字段的指令（格式 21c）；窄类型字段按声明类型选变体。
 func (a *Asm) SPut(reg int, f FieldSpec) {
-	a.patch(1, RefSpec{Kind: RefField, Word: 1, Field: f}, 0x67|uint16(reg&0xff)<<8, 0)
+	a.patch(1, RefSpec{Kind: RefField, Word: 1, Field: f}, narrowFieldOp(0x67, f.Type)|uint16(reg&0xff)<<8, 0)
 }
 
 // SPutObject 生成 sput-object vReg, field@符号（写入对象静态字段，格式 21c）。
