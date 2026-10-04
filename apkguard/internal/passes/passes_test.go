@@ -237,14 +237,21 @@ func TestJunkEntries(t *testing.T) {
 	if nDeep != 4 {
 		t.Fatalf("深目录条目数应为 4，实际 %d", nDeep)
 	}
-	// 畸形 META-INF 必须存在
+	// 畸形 META-INF 必须存在（尾部斜杠的两个目录形态已改为非目录等价路径）
 	meta := map[string]bool{}
 	for _, e := range art.Entries() {
 		meta[e.NameString()] = true
 	}
-	for _, want := range []string{"META-INF/", "META-INF//MANIFEST.MFx", "META-INF/./MANIFEST.MFx"} {
+	for _, want := range []string{"META-INF", "META-INF/sub", "META-INF//MANIFEST.MFx", "META-INF/./MANIFEST.MFx"} {
 		if !meta[want] {
 			t.Errorf("缺少畸形 META-INF 条目 %q", want)
+		}
+	}
+	// 产物里不得有「以 / 结尾」的条目：参考样本 2418 个条目里目录条目为 0，
+	// 且带 176B 数据的目录条目会让部分解包工具行为不一致。
+	for _, e := range art.Entries() {
+		if strings.HasSuffix(e.NameString(), "/") {
+			t.Errorf("产物存在以 / 结尾的目录形态条目 %q", e.NameString())
 		}
 	}
 	// 变异名不得碰 `META-INF/MANIFEST.MF`（大小写不敏感）或签名文件后缀，
@@ -527,17 +534,17 @@ func TestEncryptStringE2E(t *testing.T) {
 			}
 			return nil
 		})
-		// 解密器类只应出现在主 DEX 中（多 DEX 场景下不得重复定义）
-		f.Classes(func(_ uint32, _ dex.ClassDef, name string) error {
-			if name == "Lcom/demo/shell/Dec;" {
-				injected++
-			}
-			return nil
-		})
+		// 每个含密文的 DEX 自带一份解密器（类名随机、DEX 间互不相同），
+		// 同一 DEX 内不得重复定义。类名已随机化，故按方法签名识别。
+		got := decryptorClassNames(t, d)
+		if len(got) > 1 {
+			t.Fatalf("%s 注入了 %d 个解密器类（同一 DEX 内不得重复）", e.NameString(), len(got))
+		}
+		injected += len(got)
 		n++
 	}
-	if injected != 1 {
-		t.Fatalf("解密器类应恰好注入 1 次（实际 %d），否则多 DEX 会重复定义", injected)
+	if injected != n {
+		t.Fatalf("每个可解析 DEX 都应自带 1 个解密器（实际 %d/%d）", injected, n)
 	}
 	if art.Stats["A2.strings"] == "" || art.Stats["A2.strings"] == "0" {
 		t.Fatalf("未加密任何字符串: %v", art.Stats)
@@ -700,11 +707,10 @@ func TestEncryptThenArrayE2E(t *testing.T) {
 		if err := dex.Verify(d); err != nil {
 			t.Fatalf("%s 校验失败: %v", e.NameString(), err)
 		}
+		// A2 解密器类名随机化后按方法签名识别；A3 还原器仍是固定名。
+		decCount += len(decryptorClassNames(t, d))
 		f.Classes(func(_ uint32, _ dex.ClassDef, name string) error {
-			switch name {
-			case "Lcom/demo/shell/Dec;":
-				decCount++
-			case "Lcom/demo/shell/Arr;":
+			if name == "Lcom/demo/shell/Arr;" {
 				arrCount++
 			}
 			return nil

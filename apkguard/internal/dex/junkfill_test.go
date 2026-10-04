@@ -380,3 +380,347 @@ func TestJunkFillPayloadMethodUnchanged(t *testing.T) {
 		t.Errorf("SkippedPayload 应 >=1，实际 %d", st.ControlFlow.SkippedPayload)
 	}
 }
+
+// ---- A20 第二种形态：return 前单发 nop（参考样本形态） ----
+
+// returnNopPositions 返回指令流中「前一条是 nop 的 return*」的位置集合，
+// 以及全部 return* 的位置集合。
+func returnNopPositions(l *InsnList) (covered, returns map[int]bool) {
+	covered = map[int]bool{}
+	returns = map[int]bool{}
+	prevNop := false
+	for i := 0; i < l.ItemCount(); i++ {
+		if !l.ItemIsInsn(i) {
+			prevNop = false
+			continue
+		}
+		op := byte(l.ItemWords(i)[0] & 0xff)
+		pos := l.ItemOldOffset(i)
+		if op >= 0x0e && op <= 0x11 {
+			returns[pos] = true
+			if prevNop {
+				covered[pos] = true
+			}
+		}
+		prevNop = op == 0x00
+	}
+	return covered, returns
+}
+
+// nopBeforeReturnsInMethod 判断指令流中「每个 return 之前恰好一条 nop」，
+// 并返回「return 前 nop」的条数；同时拒绝出现连续 nop 段（单发形态）。
+func nopBeforeReturnsInMethod(t *testing.T, tag string, l *InsnList) (int, int) {
+	t.Helper()
+	nReturn, nCovered := 0, 0
+	run := 0 // 连续 nop 段长度
+	for i := 0; i < l.ItemCount(); i++ {
+		if !l.ItemIsInsn(i) {
+			run = 0
+			continue
+		}
+		op := byte(l.ItemWords(i)[0] & 0xff)
+		if op == 0x00 {
+			run++
+			if run > 1 && i+1 < l.ItemCount() && l.ItemIsInsn(i+1) {
+				next := byte(l.ItemWords(i + 1)[0] & 0xff)
+				if next >= 0x0e && next <= 0x11 {
+					t.Errorf("%s：return 前出现连续 %d 条 nop（参考样本全部单发，不允许连发）", tag, run)
+				}
+			}
+			continue
+		}
+		if op >= 0x0e && op <= 0x11 {
+			nReturn++
+			if i > 0 && l.ItemIsInsn(i-1) && byte(l.ItemWords(i - 1)[0]&0xff) == 0x00 {
+				nCovered++
+			}
+		}
+		run = 0
+	}
+	return nReturn, nCovered
+}
+
+// checkNoBranchTargetsNop 断言产物中没有任何分支指向一条 nop。
+//
+// 这是「分支目标仍指向原逻辑指令」的直接证据：改写前分支从不指向 nop，
+// 若重定位把目标落到插入的 nop 上，就是跳错了位置（nop 后继续 fallthrough
+// 可能改变语义）。
+func checkNoBranchTargetsNop(t *testing.T, tag string, f *File) int {
+	t.Helper()
+	checked, bad := 0, 0
+	if err := f.AllMethods(func(_, desc string, m EncodedMethod) error {
+		if m.CodeOff == 0 {
+			return nil
+		}
+		ci, err := f.ParseCodeItem(m.CodeOff)
+		if err != nil {
+			return nil
+		}
+		l, err := ParseInsns(ci.Insns)
+		if err != nil {
+			return nil
+		}
+		at := map[int]uint16{}
+		for i := 0; i < l.ItemCount(); i++ {
+			if l.ItemIsInsn(i) {
+				at[l.ItemOldOffset(i)] = l.ItemWords(i)[0]
+			}
+		}
+		for i := 0; i < l.ItemCount(); i++ {
+			if !l.ItemIsInsn(i) {
+				continue
+			}
+			w := l.ItemWords(i)
+			op := byte(w[0] & 0xff)
+			var rel int
+			switch {
+			case op == 0x28:
+				rel = int(int8(w[0] >> 8))
+			case op == 0x29, op == 0x2a, op >= 0x32 && op <= 0x3d:
+				rel = int(int16(w[1]))
+			default:
+				continue // switch/fill-array-data 的 payload 方法已被跳过
+			}
+			checked++
+			tgt := l.ItemOldOffset(i) + rel
+			if word, ok := at[tgt]; ok && word&0xff == 0x00 {
+				bad++
+				t.Errorf("%s：方法 %s 的分支（@word %d）指向了 nop（@word %d）——分支目标被重定位到了插入指令上",
+					tag, desc, l.ItemOldOffset(i), tgt)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("%s：遍历方法失败: %v", tag, err)
+	}
+	if bad > 0 {
+		t.Fatalf("%s：%d 条分支指向 nop", tag, bad)
+	}
+	return checked
+}
+
+// TestJunkFillReturnNopsShape 验证 return 前单发 nop 形态：
+// 条数与 return 数一致、每条 nop 紧邻 return、无连发、分支不指向 nop、
+// 产物 Verify 通过且语义不变。
+func TestJunkFillReturnNopsShape(t *testing.T) {
+	base := cffFixture(t)
+	f0, err := Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 语义基线：解释器跑一遍 loop（含分支）与 add。
+	type runCase struct {
+		name string
+		args []any
+	}
+	cases := []runCase{{"->loop(", []any{int32(5)}}, {"->add(", []any{int32(3), int32(5)}}}
+	before := make([]any, len(cases))
+	for i, c := range cases {
+		_, idx, off := cffFind(t, f0, "Lcff/T;", c.name)
+		v, err := runPadMethod(f0, idx, off, c.args...)
+		if err != nil {
+			t.Fatalf("改写前执行 %s 失败: %v", c.name, err)
+		}
+		before[i] = v
+	}
+
+	out, st, err := RebuildWithStats(f0, RebuildOptions{
+		ControlFlow: &ControlFlow{JunkFill: true, JunkNops: 4, ReturnNops: true},
+	})
+	if err != nil {
+		t.Fatalf("A20 return-nop 重建失败: %v", err)
+	}
+	if err := Verify(out); err != nil {
+		t.Fatalf("产物 Verify 失败（ART 会拒绝加载）: %v", err)
+	}
+	if err := ValidateDescriptors(out); err != nil {
+		t.Fatalf("产物描述符非法: %v", err)
+	}
+	// cffFixture 中 add/loop/mix/bits 各 1 条 return 且预算足够；
+	// sw 含 payload 被跳过，因此应是 4 条。
+	if st.ControlFlow.ReturnNops != 4 {
+		t.Fatalf("ReturnNops 统计应为 4，实际 %d", st.ControlFlow.ReturnNops)
+	}
+	if st.ControlFlow.ReturnNops > st.ControlFlow.Nops {
+		t.Fatalf("ReturnNops(%d) 不应超过 Nops(%d)", st.ControlFlow.ReturnNops, st.ControlFlow.Nops)
+	}
+
+	f1, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten := 0
+	if err := f1.AllMethods(func(_, desc string, m EncodedMethod) error {
+		if m.CodeOff == 0 || strings.Contains(desc, "->sw(") {
+			return nil // sw 含 payload，整体跳过
+		}
+		ci, err := f1.ParseCodeItem(m.CodeOff)
+		if err != nil {
+			return nil
+		}
+		l, err := ParseInsns(ci.Insns)
+		if err != nil {
+			return nil
+		}
+		nReturn, nCovered := nopBeforeReturnsInMethod(t, desc, l)
+		if nReturn == 0 {
+			return nil
+		}
+		rewritten++
+		if nCovered != nReturn {
+			t.Errorf("方法 %s：%d 条 return 中只有 %d 条前面有 nop（预算足够时应全覆盖）", desc, nReturn, nCovered)
+		}
+		if n, _ := returnNopPositions(l); len(n) != nReturn {
+			t.Errorf("方法 %s：return 前 nop 计数不一致", desc)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rewritten != 4 {
+		t.Fatalf("应有 4 个方法被插入 return 前 nop，实际 %d", rewritten)
+	}
+
+	// 分支目标不得指向插入的 nop。
+	if n := checkNoBranchTargetsNop(t, "junkfill-returnnops", f1); n == 0 {
+		t.Fatalf("产物中未检查到任何分支，测试样本失效")
+	}
+	checkTryHandlers(t, "junkfill-returnnops", f1)
+
+	// 语义等价（改写只插 nop，不应改变任何返回值）。
+	for i, c := range cases {
+		_, idx, off := cffFind(t, f1, "Lcff/T;", c.name)
+		v, err := runPadMethod(f1, idx, off, c.args...)
+		if err != nil {
+			t.Fatalf("改写后执行 %s 失败: %v", c.name, err)
+		}
+		if v != before[i] {
+			t.Errorf("%s 改写前后返回值不同：%v → %v", c.name, before[i], v)
+		}
+	}
+
+	// 同输入同选项必须字节可复现。
+	out2, _, err := RebuildWithStats(f0, RebuildOptions{
+		ControlFlow: &ControlFlow{JunkFill: true, JunkNops: 4, ReturnNops: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, out2) {
+		t.Fatal("同一输入两次 rewrite 的产物不一致（存在未受控随机性）")
+	}
+}
+
+// TestJunkFillReturnNopsMultiReturn 用多 return 方法验证：
+// 「插入的 nop 数 == return 数」（预算足够时逐条覆盖），且每个 nop 的下一条
+// 就是 return*。
+func TestJunkFillReturnNopsMultiReturn(t *testing.T) {
+	a := NewAsm()
+	a.Const4(0, 0)
+	for k := 0; k < 20; k++ { // 40 字填充，保证 8% 预算 >= 3
+		a.AddIntLit8(0, 1)
+	}
+	a.IfEqz(0, "r0")
+	a.Return(0) // return #1
+	a.Label("r0")
+	a.Const4(0, 1)
+	for k := 0; k < 20; k++ {
+		a.AddIntLit8(0, 1)
+	}
+	a.IfEqz(0, "r1")
+	a.Return(0) // return #2
+	a.Label("r1")
+	a.Return(0) // return #3
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := &CodeBlob{Registers: 2, Ins: 1, Outs: 0, Insns: insns, Patches: patches}
+
+	base, err := Build(Addition{Classes: []ClassSpec{{
+		Name: "Lcff/Multi;", Super: "Ljava/lang/Object;", Access: accPublic | accFinal,
+		Methods: []ClassMethod{{
+			Name: "m", Proto: ProtoSpec{Ret: "I", Params: []string{"I"}},
+			Access: accPublic | accStatic, Code: code,
+		}},
+	}}})
+	if err != nil {
+		t.Fatalf("构造多 return DEX 失败: %v", err)
+	}
+	f0, err := Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, st, err := RebuildWithStats(f0, RebuildOptions{
+		ControlFlow: &ControlFlow{JunkFill: true, JunkNops: 4, ReturnNops: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(out); err != nil {
+		t.Fatalf("产物 Verify 失败: %v", err)
+	}
+	if st.ControlFlow.ReturnNops != 3 {
+		t.Fatalf("3 条 return 应各插 1 条 nop（共 3），实际 %d", st.ControlFlow.ReturnNops)
+	}
+	f1, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci, _, _ := cffFind(t, f1, "Lcff/Multi;", "->m(")
+	l, err := ParseInsns(ci.Insns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	covered, returns := returnNopPositions(l)
+	if len(returns) != 3 {
+		t.Fatalf("产物中 return 数应为 3，实际 %d", len(returns))
+	}
+	if len(covered) != 3 {
+		t.Fatalf("3 条 return 应全部被 nop 覆盖，实际 %d", len(covered))
+	}
+}
+
+// TestJunkFillReturnNopsOffByDefault 断言不开选项时形态与既有产物一致（零回归）。
+func TestJunkFillReturnNopsOffByDefault(t *testing.T) {
+	base := cffFixture(t)
+	f0, err := Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, st, err := RebuildWithStats(f0, RebuildOptions{
+		ControlFlow: &ControlFlow{JunkFill: true, JunkNops: 4},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ControlFlow.ReturnNops != 0 {
+		t.Fatalf("未开启 ReturnNops 时不应插入 return 前 nop，实际 %d", st.ControlFlow.ReturnNops)
+	}
+	// 指令流中不得出现「nop 紧邻 return」的形态（fixture 原始代码里没有这种组合）。
+	f1, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.AllMethods(func(_, desc string, m EncodedMethod) error {
+		if m.CodeOff == 0 || strings.Contains(desc, "->sw(") {
+			return nil
+		}
+		ci, err := f1.ParseCodeItem(m.CodeOff)
+		if err != nil {
+			return nil
+		}
+		l, err := ParseInsns(ci.Insns)
+		if err != nil {
+			return nil
+		}
+		if covered, _ := returnNopPositions(l); len(covered) != 0 {
+			t.Errorf("未开启选项却出现 %d 处 return 前 nop（方法 %s）", len(covered), desc)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

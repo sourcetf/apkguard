@@ -56,21 +56,23 @@ type cliConfig struct {
 	addr    string
 
 	// 功能项参数
-	namePrefix    string
-	packageShrink bool
-	keepRules     string
-	obfStringMin  int
-	seed          string
-	fakeDexCount  int
-	fakeDexSize   int
-	junkTopCount  int
-	junkDirCount  int
-	junkDirDepth  int
-	junkMetaCount int
-	zipAtkCount   int
-	classPadCount int
-	stampTime     string
-	manifestPadMB int
+	namePrefix         string
+	packageShrink      bool
+	keepRules          string
+	renameResourceIDs  bool
+	obfStringMin       int
+	obfStringSingleRef bool
+	seed               string
+	fakeDexCount       int
+	fakeDexSize        int
+	junkTopCount       int
+	junkDirCount       int
+	junkDirDepth       int
+	junkMetaCount      int
+	zipAtkCount        int
+	classPadCount      int
+	stampTime          string
+	manifestPadMB      int
 
 	dexKey           string
 	decoyPkg         string
@@ -79,8 +81,10 @@ type cliConfig struct {
 	decoyMetaCount   int
 	strJunkCount     int
 	junkInsnCount    int
+	returnNops       bool
 	libFakeName      string
 	libStripSections bool
+	zipLocalDecoy    bool
 	payloadMAC       bool
 	soEncrypt        bool
 	shellPkg         string
@@ -94,66 +98,81 @@ type cliConfig struct {
 	bindDev  string
 }
 
+// registerFlags 注册全部 CLI 开关。
+//
+// 接收 FlagSet 而不是直接用全局 flag，是为了让测试能在独立 FlagSet 上
+// 验证默认值——尤其是 -return-nops 的「默认开、显式 -return-nops=false 关」。
+func registerFlags(fs *flag.FlagSet, c *cliConfig) {
+	fs.StringVar(&c.in, "in", "", "输入 APK 路径")
+	fs.StringVar(&c.out, "out", "", "输出 APK 路径（默认 <输入名>-protected.apk）")
+
+	fs.StringVar(&c.ksPath, "ks", "", "密钥库路径（.jks / .pfx / .p12）")
+	fs.StringVar(&c.ksPass, "ks-pass", "", "密钥库口令")
+	fs.StringVar(&c.keyPass, "key-pass", "", "私钥口令（默认同密钥库口令）")
+	fs.StringVar(&c.ksType, "ks-type", "", "密钥库类型：jks / pkcs12（默认自动探测）")
+	fs.StringVar(&c.alias, "alias", "", "JKS 条目别名（默认取第一个私钥条目）")
+	fs.BoolVar(&c.noV1, "no-v1", false, "禁用 v1 (JAR) 签名")
+	fs.BoolVar(&c.noV2, "no-v2", false, "禁用 v2 签名")
+	fs.BoolVar(&c.noV3, "no-v3", false, "禁用 v3 签名")
+	fs.BoolVar(&c.withV4, "v4", false, "额外生成 v4 签名文件（.idsig）")
+	fs.UintVar(&c.minSDK, "min-sdk", 24, "v3 签名块中的 minSdkVersion")
+	fs.UintVar(&c.maxSDK, "max-sdk", 0x7fffffff, "v3 签名块中的 maxSdkVersion")
+
+	fs.StringVar(&c.enable, "enable", "", "启用功能项，逗号分隔（如 A1,A2,A4,E1）")
+	fs.StringVar(&c.disable, "disable", "", "禁用功能项，逗号分隔")
+	fs.BoolVar(&c.list, "list", false, "列出全部功能项后退出")
+	fs.BoolVar(&c.web, "web", false, "启动内嵌 Web UI")
+	fs.StringVar(&c.addr, "addr", "127.0.0.1:8787", "Web UI 监听地址")
+
+	fs.StringVar(&c.namePrefix, "name-prefix", "", "A1 混淆后名称前缀")
+	fs.BoolVar(&c.packageShrink, "package-shrink", false, "A1 把每个原包整体映射为无意义短包名（隐藏包结构线索，保持同包 package-private 访问）")
+	fs.StringVar(&c.keepRules, "keep-rules", "", "A1 保留白名单文件（每行一条，支持 * 通配）")
+	fs.BoolVar(&c.renameResourceIDs, "rename-resource-ids", true,
+		"A1 把 aapt 生成的资源 ID 类（R/R$Type）与字段一起改名，static_values 中的资源 ID 常量保持原样（对齐参考样本）。默认开启，用 -rename-resource-ids=false 关闭；应急可用环境变量 APKGUARD_KEEP_RCLASS_IDS=1 强制关闭")
+	fs.IntVar(&c.obfStringMin, "obf-string-min", 0, "A2 仅加密长度不小于该值的字符串")
+	fs.BoolVar(&c.obfStringSingleRef, "obf-string-single-ref", false,
+		"A2 只加密恰好被 1 条 const-string 引用的字符串（对齐参考样本的选择性加密分布；会降低保护强度：多引用串将留明文，仅为形态对齐，不建议常规使用）")
+	fs.StringVar(&c.seed, "seed", "", "随机种子（留空则每次随机）")
+	fs.IntVar(&c.fakeDexCount, "fake-dex-count", 1, "A9 伪 DEX 块数量")
+	fs.IntVar(&c.fakeDexSize, "fake-dex-size", 80000, "A9 每块字节数")
+	fs.IntVar(&c.junkTopCount, "junk-top-count", 800, "A10 非 ASCII 顶层文件数（默认对齐参考样本的 884）")
+	fs.IntVar(&c.junkDirCount, "junk-dir-count", 400, "A10 随机深目录条目数（每 10 条附带 1 条 64KB 同名深路径，是体积主要来源）")
+	fs.IntVar(&c.junkDirDepth, "junk-dir-depth", 16, "A10 深目录最大层数")
+	fs.IntVar(&c.junkMetaCount, "junk-meta-count", 20, "A10 畸形 META-INF 条目数")
+	fs.IntVar(&c.zipAtkCount, "zip-atk-count", 150, "A12 路径攻击条目数（轮转分给 5 类前缀，故 150 约等于每类 30 条）")
+	fs.IntVar(&c.classPadCount, "class-pad-count", 100, "A13 膨胀类数量")
+	fs.StringVar(&c.stampTime, "stamp-time", "", "A14 统一时间戳（RFC3339，留空用固定值）")
+	fs.IntVar(&c.manifestPadMB, "manifest-pad-mb", 0, "A15 巨型 Manifest 填充量（MB，0=用默认 100，上限 1024）")
+	fs.IntVar(&c.decoyCoreCount, "decoy-core-count", 0, "A16 假核心文件组数（0=用默认）")
+	fs.IntVar(&c.decoyAPKMB, "decoy-apk-mb", 0, "A17 假内层 APK 体积（MB，0=用默认）")
+	fs.IntVar(&c.decoyMetaCount, "decoy-meta-count", 0, "A18 假权限/元数据条数（0=用默认）")
+	fs.IntVar(&c.strJunkCount, "str-junk-count", 0, "A19 每个 DEX 注入的垃圾字符串条数（0=用默认）")
+	fs.IntVar(&c.junkInsnCount, "junk-insn-count", 0, "A20 每个方法插入的花指令组数（0=用默认）")
+	fs.BoolVar(&c.returnNops, "return-nops", true,
+		"A20 在每条 return 前插入 1 条 nop（参考样本形态，全部单发、无连续段）。启用 A20 时默认开启，用 -return-nops=false 关闭")
+	fs.StringVar(&c.libFakeName, "lib-name", "", "C7 把守卫库改成的新名字（如 libsqlite3x.so）")
+	fs.BoolVar(&c.libStripSections, "lib-strip-sections", false, "C7 清除守卫库的 ELF 节头（readelf -S 会失败，不影响加载）")
+	fs.BoolVar(&c.zipLocalDecoy, "zip-local-decoy", false,
+		"本地头假加密 flag：仅对 AndroidManifest.xml/classes*.dex/resources.arsc 在本地头写 bit0(加密)+bit6(强加密)，中央目录不变。依据：参考样本同款手法，在 Android 16/API 36 实测可正常安装启动，平台按中央目录读取不受影响；但本工具自己的产物尚未在真机验证，默认关闭，开启后请自行验证安装与启动")
+
+	fs.StringVar(&c.dexKey, "dex-key", "", "B1 加密密钥（留空自动生成）")
+	fs.StringVar(&c.decoyPkg, "decoy-pkg", "", "B8 诱饵配置里的假包名（留空用默认 dummy.installed.check）")
+	fs.BoolVar(&c.payloadMAC, "payload-mac", false, "B1 的 DEX 载荷与 C2 的原生库载荷都附加 HMAC-SHA256，壳解密前先校验（纵深防御）")
+	fs.BoolVar(&c.soEncrypt, "so-encrypt", false, "C2 原生库整体加密存 assets，启动时解密到私有目录再加载")
+	fs.StringVar(&c.shellPkg, "shell-pkg", "com.apkguard.shell", "B2/B3 壳类所在包名")
+	fs.IntVar(&c.splitCount, "split-count", 0, "B4 拆分 DEX 个数（0=按原样）")
+	fs.IntVar(&c.extractRatio, "extract-ratio", 0, "B5 抽取方法比例（1~100）")
+	fs.BoolVar(&c.debugShell, "debug-shell", false, "排障：壳启动时逐步弹 Toast 报告进度（含 ClassLoader 接管回读校验）")
+
+	fs.StringVar(&c.sigHash, "sig-hash", "", "D1 签名证书的 SHA-256（十六进制；留空则取密钥库中的证书）")
+	fs.StringVar(&c.bindDev, "bind-device", "", "D5 绑定的设备标识：用 -debug-shell 出排障版，在目标设备上跑一次，从 adb logcat -s APKGUARD-D5 读取（Android 8+ 的 ANDROID_ID 按应用签名作用域化，settings get secure android_id 取到的是原始值，不是应用看到的那个）")
+	fs.StringVar(&c.channels, "channels", "", "E4 渠道列表，逗号分隔")
+	fs.IntVar(&c.jobs, "jobs", 0, "E5 并发数（0=CPU 核数）")
+}
+
 func run() error {
 	var c cliConfig
-
-	flag.StringVar(&c.in, "in", "", "输入 APK 路径")
-	flag.StringVar(&c.out, "out", "", "输出 APK 路径（默认 <输入名>-protected.apk）")
-
-	flag.StringVar(&c.ksPath, "ks", "", "密钥库路径（.jks / .pfx / .p12）")
-	flag.StringVar(&c.ksPass, "ks-pass", "", "密钥库口令")
-	flag.StringVar(&c.keyPass, "key-pass", "", "私钥口令（默认同密钥库口令）")
-	flag.StringVar(&c.ksType, "ks-type", "", "密钥库类型：jks / pkcs12（默认自动探测）")
-	flag.StringVar(&c.alias, "alias", "", "JKS 条目别名（默认取第一个私钥条目）")
-	flag.BoolVar(&c.noV1, "no-v1", false, "禁用 v1 (JAR) 签名")
-	flag.BoolVar(&c.noV2, "no-v2", false, "禁用 v2 签名")
-	flag.BoolVar(&c.noV3, "no-v3", false, "禁用 v3 签名")
-	flag.BoolVar(&c.withV4, "v4", false, "额外生成 v4 签名文件（.idsig）")
-	flag.UintVar(&c.minSDK, "min-sdk", 24, "v3 签名块中的 minSdkVersion")
-	flag.UintVar(&c.maxSDK, "max-sdk", 0x7fffffff, "v3 签名块中的 maxSdkVersion")
-
-	flag.StringVar(&c.enable, "enable", "", "启用功能项，逗号分隔（如 A1,A2,A4,E1）")
-	flag.StringVar(&c.disable, "disable", "", "禁用功能项，逗号分隔")
-	flag.BoolVar(&c.list, "list", false, "列出全部功能项后退出")
-	flag.BoolVar(&c.web, "web", false, "启动内嵌 Web UI")
-	flag.StringVar(&c.addr, "addr", "127.0.0.1:8787", "Web UI 监听地址")
-
-	flag.StringVar(&c.namePrefix, "name-prefix", "", "A1 混淆后名称前缀")
-	flag.BoolVar(&c.packageShrink, "package-shrink", false, "A1 把每个原包整体映射为无意义短包名（隐藏包结构线索，保持同包 package-private 访问）")
-	flag.StringVar(&c.keepRules, "keep-rules", "", "A1 保留白名单文件（每行一条，支持 * 通配）")
-	flag.IntVar(&c.obfStringMin, "obf-string-min", 0, "A2 仅加密长度不小于该值的字符串")
-	flag.StringVar(&c.seed, "seed", "", "随机种子（留空则每次随机）")
-	flag.IntVar(&c.fakeDexCount, "fake-dex-count", 1, "A9 伪 DEX 块数量")
-	flag.IntVar(&c.fakeDexSize, "fake-dex-size", 80000, "A9 每块字节数")
-	flag.IntVar(&c.junkTopCount, "junk-top-count", 800, "A10 非 ASCII 顶层文件数（默认对齐参考样本的 884）")
-	flag.IntVar(&c.junkDirCount, "junk-dir-count", 400, "A10 随机深目录条目数（每 10 条附带 1 条 64KB 同名深路径，是体积主要来源）")
-	flag.IntVar(&c.junkDirDepth, "junk-dir-depth", 16, "A10 深目录最大层数")
-	flag.IntVar(&c.junkMetaCount, "junk-meta-count", 20, "A10 畸形 META-INF 条目数")
-	flag.IntVar(&c.zipAtkCount, "zip-atk-count", 150, "A12 路径攻击条目数（轮转分给 5 类前缀，故 150 约等于每类 30 条）")
-	flag.IntVar(&c.classPadCount, "class-pad-count", 100, "A13 膨胀类数量")
-	flag.StringVar(&c.stampTime, "stamp-time", "", "A14 统一时间戳（RFC3339，留空用固定值）")
-	flag.IntVar(&c.manifestPadMB, "manifest-pad-mb", 0, "A15 巨型 Manifest 填充量（MB，0=用默认 100）")
-	flag.IntVar(&c.decoyCoreCount, "decoy-core-count", 0, "A16 假核心文件组数（0=用默认）")
-	flag.IntVar(&c.decoyAPKMB, "decoy-apk-mb", 0, "A17 假内层 APK 体积（MB，0=用默认）")
-	flag.IntVar(&c.decoyMetaCount, "decoy-meta-count", 0, "A18 假权限/元数据条数（0=用默认）")
-	flag.IntVar(&c.strJunkCount, "str-junk-count", 0, "A19 每个 DEX 注入的垃圾字符串条数（0=用默认）")
-	flag.IntVar(&c.junkInsnCount, "junk-insn-count", 0, "A20 每个方法插入的花指令组数（0=用默认）")
-	flag.StringVar(&c.libFakeName, "lib-name", "", "C7 把守卫库改成的新名字（如 libsqlite3x.so）")
-	flag.BoolVar(&c.libStripSections, "lib-strip-sections", false, "C7 清除守卫库的 ELF 节头（readelf -S 会失败，不影响加载）")
-
-	flag.StringVar(&c.dexKey, "dex-key", "", "B1 加密密钥（留空自动生成）")
-	flag.StringVar(&c.decoyPkg, "decoy-pkg", "", "B8 诱饵配置里的假包名（留空用默认 dummy.installed.check）")
-	flag.BoolVar(&c.payloadMAC, "payload-mac", false, "B1 的 DEX 载荷与 C2 的原生库载荷都附加 HMAC-SHA256，壳解密前先校验（纵深防御）")
-	flag.BoolVar(&c.soEncrypt, "so-encrypt", false, "C2 原生库整体加密存 assets，启动时解密到私有目录再加载")
-	flag.StringVar(&c.shellPkg, "shell-pkg", "com.apkguard.shell", "B2/B3 壳类所在包名")
-	flag.IntVar(&c.splitCount, "split-count", 0, "B4 拆分 DEX 个数（0=按原样）")
-	flag.IntVar(&c.extractRatio, "extract-ratio", 0, "B5 抽取方法比例（1~100）")
-	flag.BoolVar(&c.debugShell, "debug-shell", false, "排障：壳启动时逐步弹 Toast 报告进度（含 ClassLoader 接管回读校验）")
-
-	flag.StringVar(&c.sigHash, "sig-hash", "", "D1 签名证书的 SHA-256（十六进制；留空则取密钥库中的证书）")
-	flag.StringVar(&c.bindDev, "bind-device", "", "D5 绑定的设备标识：用 -debug-shell 出排障版，在目标设备上跑一次，从 adb logcat -s APKGUARD-D5 读取（Android 8+ 的 ANDROID_ID 按应用签名作用域化，settings get secure android_id 取到的是原始值，不是应用看到的那个）")
-	flag.StringVar(&c.channels, "channels", "", "E4 渠道列表，逗号分隔")
-	flag.IntVar(&c.jobs, "jobs", 0, "E5 并发数（0=CPU 核数）")
+	registerFlags(flag.CommandLine, &c)
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "apkguard —— 纯 Go APK 加固工具\n\n")
@@ -422,36 +441,41 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		MinSDK:  c.minSDK,
 		MaxSDK:  c.maxSDK,
 
-		NamePrefix:    c.namePrefix,
-		PackageShrink: c.packageShrink,
-		ObfStringMin:  c.obfStringMin,
-		Seed:          seedOrRandom(c.seed),
-		FakeDexCount:  c.fakeDexCount,
-		FakeDexSize:   c.fakeDexSize,
-		JunkTopCount:  c.junkTopCount,
-		JunkDirCount:  c.junkDirCount,
-		JunkDirDepth:  c.junkDirDepth,
-		JunkMetaCount: c.junkMetaCount,
-		ZipAtkCount:   c.zipAtkCount,
-		ClassPadCount: c.classPadCount,
-		StampTime:     c.stampTime,
-		ManifestPadMB: c.manifestPadMB,
+		NamePrefix:        c.namePrefix,
+		PackageShrink:     c.packageShrink,
+		RenameResourceIDs: c.renameResourceIDs,
+		ObfStringMin:      c.obfStringMin,
 
-		DexKey:           c.dexKey,
-		DecoyPkg:         c.decoyPkg,
-		DecoyCoreCount:   c.decoyCoreCount,
-		DecoyAPKMB:       c.decoyAPKMB,
-		DecoyMetaCount:   c.decoyMetaCount,
-		StrJunkCount:     c.strJunkCount,
-		JunkInsnCount:    c.junkInsnCount,
-		LibFakeName:      c.libFakeName,
-		LibStripSections: c.libStripSections,
-		PayloadMAC:       c.payloadMAC,
-		SOEncrypt:        c.soEncrypt,
-		ShellPkg:         c.shellPkg,
-		SplitCount:       c.splitCount,
-		ExtractRatio:     c.extractRatio,
-		DebugShell:       c.debugShell,
+		ObfStringSingleRefOnly: c.obfStringSingleRef,
+		Seed:                   seedOrRandom(c.seed),
+		FakeDexCount:           c.fakeDexCount,
+		FakeDexSize:            c.fakeDexSize,
+		JunkTopCount:           c.junkTopCount,
+		JunkDirCount:           c.junkDirCount,
+		JunkDirDepth:           c.junkDirDepth,
+		JunkMetaCount:          c.junkMetaCount,
+		ZipAtkCount:            c.zipAtkCount,
+		ClassPadCount:          c.classPadCount,
+		StampTime:              c.stampTime,
+		ManifestPadMB:          c.manifestPadMB,
+
+		DexKey:            c.dexKey,
+		DecoyPkg:          c.decoyPkg,
+		DecoyCoreCount:    c.decoyCoreCount,
+		DecoyAPKMB:        c.decoyAPKMB,
+		DecoyMetaCount:    c.decoyMetaCount,
+		StrJunkCount:      c.strJunkCount,
+		JunkInsnCount:     c.junkInsnCount,
+		ReturnNops:        c.returnNops,
+		LibFakeName:       c.libFakeName,
+		LibStripSections:  c.libStripSections,
+		ZipLocalFlagDecoy: c.zipLocalDecoy,
+		PayloadMAC:        c.payloadMAC,
+		SOEncrypt:         c.soEncrypt,
+		ShellPkg:          c.shellPkg,
+		SplitCount:        c.splitCount,
+		ExtractRatio:      c.extractRatio,
+		DebugShell:        c.debugShell,
 
 		Jobs: c.jobs,
 	}

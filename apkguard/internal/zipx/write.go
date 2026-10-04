@@ -7,12 +7,55 @@ import (
 	"time"
 )
 
-// AlignOptions 控制重写归档时的对齐行为。
+// 数据描述符与假加密 flag 相关的常量。
+const (
+	// sigDataDescriptor 是数据描述符的签名（PK\x07\x08）。
+	sigDataDescriptor = 0x08074b50
+	// dataDescriptorLen 是数据描述符的固定长度：4 字节签名 +
+	// CRC32 + 压缩大小 + 原始大小，各 4 字节小端。
+	dataDescriptorLen = 16
+	// flagDataDescriptor 是 ZIP 通用标志位 bit 3：条目数据后带数据描述符。
+	flagDataDescriptor = 0x0008
+	// flagUTF8 是 ZIP 通用标志位 bit 11：条目名按 UTF-8 解码。
+	flagUTF8 = 0x0800
+
+	// LocalDecoyMask 是「本地头假加密」写入的 flag 位：bit0（加密）+
+	// bit6（强加密）。只写本地头，中央目录保持原样，见 AlignOptions.LocalFlagDecoy。
+	LocalDecoyMask = 0x0001 | 0x0040
+)
+
+// AlignOptions 控制重写归档时的对齐与 ZIP 层写法。
 type AlignOptions struct {
 	// Align 指定普通 Stored 条目的对齐字节数，0 表示使用默认值 4。
 	Align int
 	// SoAlign 指定未压缩 .so 条目的对齐字节数，0 表示使用 Align。
 	SoAlign int
+
+	// NoDataDescriptors 关闭压缩条目的数据描述符（默认 false，即写出）。
+	//
+	// 默认行为与参考样本一致：全部非 Stored 条目在本地头与中央目录都置
+	// bit3，并在条目数据后追加 16 字节
+	//
+	//	PK\x07\x08 + CRC32 + 压缩大小 + 原始大小（小端）
+	//
+	// 同时本地头里的 CRC/大小字段仍写正确值（规范允许为 0，但样本写的是真值），
+	// 因此「按本地头读」与「按中央目录读」两种实现都能正确解出内容。
+	// Stored 条目不加描述符，与样本一致。
+	//
+	// 置 true 可完全恢复旧行为（清除 bit3、不追加描述符），供测试做对照。
+	NoDataDescriptors bool
+
+	// LocalFlagDecoy 为四个核心条目在**本地头**附加假加密 flag
+	// （bit0 加密 + bit6 强加密，见 LocalDecoyMask），中央目录保持原样。
+	//
+	// 判定按条目名：AndroidManifest.xml、resources.arsc、classes.dex 及
+	// classesN.dex（N 为纯数字）。与参考样本一致：读本地头的工具会要求口令，
+	// 而 Android 平台按中央目录读取，照常安装。
+	//
+	// 默认关闭（零值）。这里是按名字判定的策略而非逐条目标记，是因为 v1
+	// 签名会用 zipx.Read 读中央目录后重写整个归档，逐条目字段在那次重写中
+	// 会丢失；只有随对齐参数一起传递的策略才能让标志位在重写后仍然存在。
+	LocalFlagDecoy bool
 }
 
 // DefaultAlign 返回与 Android zipalign 默认行为一致的对齐参数。
@@ -32,11 +75,15 @@ func DefaultAlign() AlignOptions {
 // 其返回的 error，而不是依赖 panic。
 //
 // 所有条目数据原样复制，不重新压缩，因此 CRC 与压缩大小保持有效。
-// 若原条目设置了 bit 3（数据描述符），此处会清除该位并把长度写回本地头，
-// 使结构更规范（Android 对此完全兼容）。
+//
+// 默认对全部非 Stored 条目置 bit3 并追加 16 字节数据描述符（本地头里的
+// CRC/大小仍写正确值），与参考样本的 2258/2258 个 deflate 条目一致；
+// AlignOptions.NoDataDescriptors 可关闭该行为。
 //
 // 对齐通过向本地头与中央目录的扩展字段各追加一条 padding 记录（ID 0xd935）实现，
-// 其载荷前 2 字节为该条目的对齐倍数。
+// 其载荷前 2 字节为该条目的对齐倍数。数据描述符被计入后续条目的偏移计算
+// （前缀条目的数据 + 描述符之后才是下一个本地头），因此 .so 的数据起点对齐
+// 仍然成立。
 func Write(a *Archive, opts AlignOptions) []byte {
 	out, err := WriteChecked(a, opts)
 	if err != nil {
@@ -98,6 +145,8 @@ func WriteChecked(a *Archive, opts AlignOptions) ([]byte, error) {
 		centralExtra := sanitizeExtra(e.CentralExtra)
 
 		// 数据区起始偏移 = 本地头 + 文件名 + 本地扩展字段。
+		// lho 是 len(out)，已包含前一条目数据之后的数据描述符（若有），
+		// 因此描述符自然被计入本条目的对齐与偏移计算。
 		base := lho + localHeaderLen + len(e.Name) + len(localExtra)
 		padTotal := alignmentRecordSize(base, align)
 		if padTotal > 0 {
@@ -111,20 +160,34 @@ func WriteChecked(a *Archive, opts AlignOptions) ([]byte, error) {
 			return nil, fmt.Errorf("zipx: 条目 %q 中央目录扩展字段长度 %d 超过上限 65535", e.Name, len(centralExtra))
 		}
 
-		flags := e.Flags &^ 0x0008 // 清除数据描述符位
+		// 数据描述符只加在压缩条目上（与参考样本一致）：本地头与中央目录
+		// 都置 bit3，条目数据后追加 16 字节；Stored 条目不加，避免与对齐/
+		// 签名逻辑冲突。
+		writeDD := !opts.NoDataDescriptors && !e.IsStored()
+		flags := e.Flags &^ flagDataDescriptor
+		if writeDD {
+			flags |= flagDataDescriptor
+		}
 		// 条目名含非 ASCII 字节时必须置 UTF-8 标志（ZIP 规范 bit 11）。
 		//
 		// 否则读方按 CP437 解码文件名，A10 刻意注入的非 ASCII 名字会变成
 		// 乱码；参考样本中全部 885 个非 ASCII 条目都带该标志，缺了它本身
 		// 就是一处可被识别的差异。
 		if hasNonASCII(e.Name) {
-			flags |= 0x0800
+			flags |= flagUTF8
+		}
+
+		// 本地头可附加仅本地的假加密位：中央目录写 flags（不含这些位），
+		// 于是「读本地头」与「读中央目录」看到不同的加密状态。
+		localFlags := flags
+		if opts.LocalFlagDecoy && isCoreDecoyName(e.Name) {
+			localFlags |= LocalDecoyMask
 		}
 
 		var hdr [localHeaderLen]byte
 		binary.LittleEndian.PutUint32(hdr[0:], sigLocal)
 		binary.LittleEndian.PutUint16(hdr[4:], e.VersionNeed)
-		binary.LittleEndian.PutUint16(hdr[6:], flags)
+		binary.LittleEndian.PutUint16(hdr[6:], localFlags)
 		binary.LittleEndian.PutUint16(hdr[8:], e.Method)
 		binary.LittleEndian.PutUint16(hdr[10:], e.ModTime)
 		binary.LittleEndian.PutUint16(hdr[12:], e.ModDate)
@@ -138,6 +201,16 @@ func WriteChecked(a *Archive, opts AlignOptions) ([]byte, error) {
 		out = append(out, e.Name...)
 		out = append(out, localExtra...)
 		out = append(out, e.Raw...)
+		if writeDD {
+			// 数据描述符：PK\x07\x08 + CRC32 + 压缩大小 + 原始大小（小端）。
+			// 本地头里同时保留了正确值，两种读法都自洽（与样本一致）。
+			var dd [dataDescriptorLen]byte
+			binary.LittleEndian.PutUint32(dd[0:], sigDataDescriptor)
+			binary.LittleEndian.PutUint32(dd[4:], e.CRC32)
+			binary.LittleEndian.PutUint32(dd[8:], e.CompSize)
+			binary.LittleEndian.PutUint32(dd[12:], e.UncompSize)
+			out = append(out, dd[:]...)
+		}
 
 		records = append(records, record{e: e, lho: lho, localExtra: localExtra, centralExtra: centralExtra, flags: flags})
 	}
@@ -203,6 +276,29 @@ func alignOf(e *Entry, opts AlignOptions) int {
 		return opts.SoAlign
 	}
 	return opts.Align
+}
+
+// isCoreDecoyName 判断条目名是否属于「核心文件」。
+//
+// 与参考样本的本地头假加密目标一致：AndroidManifest.xml、resources.arsc、
+// classes.dex 以及 classesN.dex（N 为纯数字，如 classes2.dex）。
+// 大小写敏感：A16 注入的 ANDROIDMANIFEST.XML 等诱饵核心文件不应被误标。
+func isCoreDecoyName(name []byte) bool {
+	s := string(name)
+	if s == "AndroidManifest.xml" || s == "resources.arsc" {
+		return true
+	}
+	const prefix, suffix = "classes", ".dex"
+	if len(s) < len(prefix)+len(suffix) || s[:len(prefix)] != prefix || s[len(s)-len(suffix):] != suffix {
+		return false
+	}
+	mid := s[len(prefix) : len(s)-len(suffix)]
+	for i := 0; i < len(mid); i++ {
+		if mid[i] < '0' || mid[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // sanitizeExtra 截掉扩展字段中无法构成完整记录的尾部字节。

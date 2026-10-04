@@ -528,6 +528,151 @@ func TestDecryptorSemantics(t *testing.T) {
 	}
 }
 
+// TestStringEncryptTargetsMatchesRebuild 验证纯分析计数与真实重建统计一致。
+//
+// Pass 层依赖 StringEncryptTargets 判断「本 DEX 要不要注入解密器」：
+// 若它与 planStringEncrypt 的实际口径不一致，会出现「注入了解密器却无密文」
+// 或「有密文却没注入解密器」两种坏产物。这里在真实样本上对单引用开关
+// 两种取值逐一比对。
+func TestStringEncryptTargetsMatchesRebuild(t *testing.T) {
+	data := sampleDex(t)
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	for _, single := range []bool{false, true} {
+		se := &StringEncrypt{
+			Class: "Lt/Dec;", MethodName: "a", Key: testKey(0x77),
+			MinLen: 4, SingleRefOnly: single, InjectClass: true,
+		}
+		n, err := StringEncryptTargets(f, se)
+		if err != nil {
+			t.Fatalf("SingleRefOnly=%v 统计失败: %v", single, err)
+		}
+		_, st, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se})
+		if err != nil {
+			t.Fatalf("SingleRefOnly=%v 重建失败: %v", single, err)
+		}
+		if n != st.StringsEncrypted {
+			t.Fatalf("SingleRefOnly=%v：分析计数 %d 与重建统计 %d 不一致", single, n, st.StringsEncrypted)
+		}
+		if n == 0 {
+			t.Fatalf("SingleRefOnly=%v：样本上不应为 0（测试失去意义）", single)
+		}
+	}
+}
+
+// TestStringEncryptSingleRefOnly 验证 SingleRefOnly 只加密恰好被 1 条
+// const-string 引用的串，多引用串留明文且指令不变。
+//
+// 逐条断言的对象是「仅被 const-string 使用、长度达标、非 try 端点内部、
+// 非解密器自身常量」的字符串：单引用串必须被移出池，多引用串必须原样保留。
+func TestStringEncryptSingleRefOnly(t *testing.T) {
+	data := sampleDex(t)
+	f, err := Parse(data)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	usage, err := f.StringUsage()
+	if err != nil {
+		t.Fatalf("用法统计失败: %v", err)
+	}
+	idxs, refs, blocked, err := collectConstStrings(f)
+	if err != nil {
+		t.Fatalf("const-string 统计失败: %v", err)
+	}
+	self := map[string]bool{}
+	for _, s := range DecryptorStrings() {
+		self[s] = true
+	}
+	const minLen = 4
+	var singles, multis []string
+	for _, i := range idxs {
+		s, err := f.String(i)
+		if err != nil || len(s) < minLen || blocked[i] || self[s] {
+			continue
+		}
+		if usage.Type[i] || usage.MethodName[i] || usage.FieldName[i] ||
+			usage.Anno[i] || usage.SourceFile[i] || usage.Debug[i] || usage.Shorty[i] {
+			continue
+		}
+		switch {
+		case refs[i] == 1:
+			singles = append(singles, s)
+		case refs[i] >= 2:
+			multis = append(multis, s)
+		}
+	}
+	if len(singles) == 0 || len(multis) == 0 {
+		t.Skip("样本中没有同时具备单引用与多引用候选，跳过")
+	}
+
+	key := testKey(0x21)
+	one := &StringEncrypt{
+		Class: "Lt/Dec;", MethodName: "a", Key: key,
+		MinLen: minLen, SingleRefOnly: true, InjectClass: true,
+	}
+	all := *one
+	all.SingleRefOnly = false
+
+	nOne, err := StringEncryptTargets(f, one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nAll, err := StringEncryptTargets(f, &all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nOne >= nAll {
+		t.Fatalf("SingleRefOnly 应减少加密目标：单引用 %d，全部 %d", nOne, nAll)
+	}
+
+	poolOf := func(se *StringEncrypt) map[string]bool {
+		out, _, err := RebuildWithStats(f, RebuildOptions{StringEncrypt: se})
+		if err != nil {
+			t.Fatalf("重建失败: %v", err)
+		}
+		g, err := Parse(out)
+		if err != nil {
+			t.Fatalf("重建结果解析失败: %v", err)
+		}
+		pool := map[string]bool{}
+		for i := uint32(0); i < g.NString; i++ {
+			s, _ := g.String(i)
+			pool[s] = true
+		}
+		return pool
+	}
+
+	// 开启：单引用串加密（明文移出池），多引用串原样留明文。
+	poolOne := poolOf(one)
+	for _, s := range singles {
+		if poolOne[s] {
+			t.Fatalf("SingleRefOnly=true 时单引用串 %q 仍留明文", s)
+		}
+	}
+	for _, s := range multis {
+		if !poolOne[s] {
+			t.Fatalf("SingleRefOnly=true 时多引用串 %q 被加密（样本形态应留明文）", s)
+		}
+	}
+
+	// 关闭（现状）：两类串都加密、明文都移出池——证明默认行为未被削弱。
+	poolAll := poolOf(&all)
+	for _, s := range singles {
+		if poolAll[s] {
+			t.Fatalf("SingleRefOnly=false 时单引用串 %q 仍留明文", s)
+		}
+	}
+	for _, s := range multis {
+		if poolAll[s] {
+			t.Fatalf("SingleRefOnly=false 时多引用串 %q 仍留明文（默认强度不应下降）", s)
+		}
+	}
+	t.Logf("单引用串 %d 个、多引用串 %d 个；加密目标 单引用模式=%d 默认模式=%d",
+		len(singles), len(multis), nOne, nAll)
+}
+
 // TestDecryptorSemanticsNoClass 确认非主 DEX 只引用不注入时，
 // 该 DEX 中不存在可执行的解密器（引用由主 DEX 提供）。
 func TestDecryptorSemanticsNoClass(t *testing.T) {

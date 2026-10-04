@@ -68,13 +68,32 @@ type StringEncrypt struct {
 	Key [32]byte
 	// MinLen 是参与加密的最短字符串长度（按 UTF-8 字节计）。
 	MinLen int
+	// SingleRefOnly 为 true 时只加密「恰好被 1 条 const-string 指令引用」的
+	// 字符串（对齐参考样本的选择性加密分布：样本 463 个候选中只加密 206 个，
+	// 多引用串一律留明文）。
+	//
+	// 这是**降低保护强度**的形态选项：多引用串继续以明文留在字符串池，
+	// 静态扫描器可直接提取。默认 false：长度达到 MinLen 的串一律加密，
+	// 与既有行为一致。
+	SingleRefOnly bool
 	// InjectClass 为 true 时把解密器类本体写入本 DEX。
 	//
-	// 多 DEX 场景下只能有一个 DEX 落地该类（否则运行时类重复定义），
-	// 其余 DEX 置 false：只登记类型/方法引用，不生成 class_def。
+	// 多 DEX 场景下每个含密文的 DEX 都应各自注入一份**类名互不相同**的
+	// 解密器（参考样本的强指纹：每个 DEX 自带解密器、两两零交叉引用），
+	// 因此该字段通常为 true；false 只用于「只登记类型/方法引用、不生成
+	// class_def」的窄场景。
 	InjectClass bool
 	// Skip 返回 true 表示该字符串不参与加密；可为 nil。
 	Skip func(s string) bool
+	// ForceEncrypt 中的字符串**无条件加密**：跳过 MinLen 与 SingleRefOnly。
+	// A7 用它强制加密反射成员名——这类名字往往很短（"get"/"a"/"isTagEnabled"），
+	// 低于 MinLen 时会被留在明文，正是 A7 要补的洞。
+	//
+	// 与 Skip 的关系：Skip 表示「该串必须留在池里」（解密器自身的方法名、
+	// 类型名、"SHA-256" 等）。强制集合里的串即使命中 Skip 也仍会改写
+	// const-string 引用（cipher），但不会把池内条目整体替换掉（replace）——
+	// 既保证反射调用点不再明文，也不破坏解密器对池项的引用。
+	ForceEncrypt map[string]bool
 }
 
 // stringEncryptPlan 是加密方案的最终形态（池索引已解析）。
@@ -187,13 +206,17 @@ func DecryptorStrings() []string {
 	return out
 }
 
-// collectConstStrings 返回全部被 const-string 指令引用的旧字符串索引（升序去重），
-// 以及「存在无法改写引用」的字符串集合。
+// collectConstStrings 返回全部被 const-string 指令引用的旧字符串索引（升序去重）、
+// 「每个索引被多少条 const-string 指令引用」的计数，以及「存在无法改写引用」的
+// 字符串集合。
 //
 // 所谓「无法改写」：某条 const-string 恰好位于 try 区间端点所在字的内部。
 // 这类字符串的明文必须留在池中，否则无法改写的那些指令会读到密文。
-func collectConstStrings(f *File) (idxs []uint32, blocked map[uint32]bool, err error) {
-	seen := map[uint32]bool{}
+//
+// 引用计数用于 SingleRefOnly 选择性加密；计数的是**指令条数**而不是去重后的
+// 使用点数，与参考样本「按 const-string 引用点判定」的口径一致。
+func collectConstStrings(f *File) (idxs []uint32, refs map[uint32]int, blocked map[uint32]bool, err error) {
+	seen := map[uint32]int{}
 	blocked = map[uint32]bool{}
 	err = f.walkAllCode(func(codeOff uint32) error {
 		ci, err := f.ParseCodeItem(codeOff)
@@ -216,7 +239,7 @@ func collectConstStrings(f *File) (idxs []uint32, blocked map[uint32]bool, err e
 			} else {
 				idx = uint32(w[pos+1]) | uint32(w[pos+2])<<16
 			}
-			seen[idx] = true
+			seen[idx]++
 			if boundary[pos+1] || (op == 0x1b && boundary[pos+2]) {
 				blocked[idx] = true
 			}
@@ -224,13 +247,15 @@ func collectConstStrings(f *File) (idxs []uint32, blocked map[uint32]bool, err e
 		})
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	for i := range seen {
+	refs = make(map[uint32]int, len(seen))
+	for i, n := range seen {
 		idxs = append(idxs, i)
+		refs[i] = n
 	}
 	sort.Slice(idxs, func(a, b int) bool { return idxs[a] < idxs[b] })
-	return idxs, blocked, nil
+	return idxs, refs, blocked, nil
 }
 
 // planStringEncrypt 在池构建前确定加密集合。
@@ -244,7 +269,7 @@ func planStringEncrypt(f *File, se *StringEncrypt, values []string) (cipher, rep
 	if err != nil {
 		return nil, nil, err
 	}
-	idxs, blocked, err := collectConstStrings(f)
+	idxs, refs, blocked, err := collectConstStrings(f)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -266,10 +291,23 @@ func planStringEncrypt(f *File, se *StringEncrypt, values []string) (cipher, rep
 	}
 	for _, i := range idxs {
 		s := values[i]
-		if len(s) < se.MinLen {
+		forced := se.ForceEncrypt[s]
+		if len(s) < se.MinLen && !forced {
 			continue
 		}
-		if se.Skip != nil && se.Skip(s) {
+		// SingleRefOnly：只处理恰好被 1 条 const-string 引用的串。
+		// 多引用串保持明文与原始指令不变（对齐参考样本的选择性加密形态）。
+		// 强制集合（A7 反射成员名）不受该形态选项影响。
+		if se.SingleRefOnly && refs[i] != 1 && !forced {
+			continue
+		}
+		// Skip 的语义是「这条字符串必须留在池里」——典型是解密器自身引用的
+		// 常量：方法名 "a"、类型名、"SHA-256"/"UTF-8"。强制集合里的串仍然要
+		// 改写 const-string 引用（否则反射成员名会以明文常量暴露），只是不能
+		// 把池内条目整体替换成密文（否则解密器方法名等会找不到池项）。
+		// 因此 kept 时跳过 replace，但仍写入 cipher。
+		kept := se.Skip != nil && se.Skip(s)
+		if kept && !forced {
 			continue
 		}
 		if _, ok := cipher[s]; ok {
@@ -287,17 +325,51 @@ func planStringEncrypt(f *File, se *StringEncrypt, values []string) (cipher, rep
 		}
 		existing[ct] = true
 		cipher[s] = ct
-		if constOnly(i) && !blocked[i] {
+		if !kept && constOnly(i) && !blocked[i] {
 			replace[s] = ct
 		}
 	}
 	return cipher, replace, nil
 }
 
+// StringEncryptTargets 返回按 se 参数会被加密的字符串条数（纯分析，不改写 DEX）。
+//
+// Pass 层用它判断某个 DEX 是否含密文：返回 0 时该 DEX 不应注入解密器类，
+// 也不值得触发一次重建。计数口径与构建期的 planStringEncrypt 完全一致
+// （直接复用同一函数与同一套自身串排除逻辑），因此不会与实际重建结果偏差。
+func StringEncryptTargets(f *File, se *StringEncrypt) (int, error) {
+	values, err := f.AllStrings()
+	if err != nil {
+		return 0, err
+	}
+	// 与 buildPlan 的 StringEncrypt 分支一致：解密器自身的字符串常量
+	// 不参与加密，否则会形成「解密前先解密」的死循环。
+	decAdd, err := stringDecryptorAddition(se)
+	if err != nil {
+		return 0, err
+	}
+	s := *se
+	inner := s.Skip
+	self := map[string]bool{}
+	collectAdditionStrings(&decAdd, self)
+	s.Skip = func(str string) bool {
+		if self[str] {
+			return true
+		}
+		return inner != nil && inner(str)
+	}
+	cipher, _, err := planStringEncrypt(f, &s, values)
+	if err != nil {
+		return 0, err
+	}
+	return len(cipher), nil
+}
+
 // stringDecryptorAddition 构造注入解密器所需的全部索引表条目与类定义。
 //
 // 当 se.InjectClass 为 false 时只登记类型/原型/方法引用（供 invoke 指令使用），
-// 不生成 class_def —— 用于多 DEX 场景下「非主 DEX 引用主 DEX 的解密器」。
+// 不生成 class_def —— 供「只引用、不落地类体」的窄场景使用（A2 Pass 现为每个
+// 含密文 DEX 各注入一份类名不同的类体，因此传 true）。
 func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 	protoStr := ProtoSpec{Ret: "Ljava/lang/String;", Params: []string{"Ljava/lang/String;"}}
 	protoInit := ProtoSpec{Ret: "V", Params: []string{"[B", "Ljava/lang/String;"}}

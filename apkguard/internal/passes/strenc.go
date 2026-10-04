@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	mathrand "math/rand"
 	"sort"
 	"strings"
 
@@ -18,10 +19,14 @@ import (
 
 // encryptString 把 DEX 中的 const-string 常量加密为密文，运行时调用解密方法还原。
 //
-// 多 DEX 场景的处理方式与 A1 类似：解密器类必须**全局唯一**，
-// 否则每个 DEX 都会注入一份同名类，导致 MultiDex 加载时出现
-// 「类重复定义」或「不同 DEX 引用不同实现」的问题。
-// 因此只有主 DEX 注入解密器，其余 DEX 仅生成对该方法的引用。
+// 多 DEX 场景的处理方式对齐参考样本：**每个含密文的 DEX 各自注入一份解密器**
+// （类名随 seed 随机、DEX 之间两两不同），密钥全包共用一枚。这样：
+//   - 任意一个 DEX 单独取出/分析时都自带解密器，不存在跨 DEX 依赖；
+//   - 单个 DEX 内只有自己的类名引用，DEX 之间零交叉引用（样本的强指纹）；
+//   - 运行期不会出现「类重复定义」（名字互不相同）或「引用不到实现」。
+//
+// 旧实现只在主 DEX 落地类体、其余 DEX 引用主 DEX 的固定类名，与样本形态不符，
+// 且在「单独搬运某个 DEX」的场景下解密器缺失。
 type encryptString struct{}
 
 func (encryptString) ID() config.FeatureID { return "A2" }
@@ -49,32 +54,73 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 	if len(units) == 0 {
 		return fmt.Errorf("没有任何 DEX 条目可被解析")
 	}
-	// 主 DEX 即名字排序最靠前的那个（classes.dex < classes2.dex < ...）。
+	// 仍按名字排序遍历，保证随机类名的分配顺序、统计顺序与产物可复现。
 	sort.Slice(units, func(i, j int) bool {
 		return dexNameOrder(units[i].entry.NameString()) < dexNameOrder(units[j].entry.NameString())
 	})
-	host := units[0]
 
 	key, err := deriveKey(opts.DexKey, opts.Seed)
 	if err != nil {
 		return err
 	}
-	cls := fmt.Sprintf("L%s/Dec;", shellPkgOf(opts))
 	minLen := opts.ObfStringMin
 	if minLen < 0 {
 		minLen = 0
 	}
 
-	totalBefore, totalAfter, totalEnc := 0, 0, 0
-	ok := 0
+	// 解密器类名由 seed 派生（同一 seed 可复现），形态对齐样本
+	// （Lcom/rjurepzl/cf/iimlqh;）：随机包1/随机包2/随机短名，全小写。
+	// used 先装入**全部 DEX 的全部字符串**（类型描述符也在池内），再逐 DEX
+	// 分配互不相同的名字：既避免与既有类/字符串撞车，也保证 DEX 两两不重名。
+	rnd := newRand(opts.Seed + "/strenc")
+	used := map[string]bool{}
 	for _, u := range units {
+		for i := uint32(0); i < u.file.NString; i++ {
+			if s, err := u.file.String(i); err == nil {
+				used[s] = true
+			}
+		}
+	}
+	// 解密方法名同样不用 "a" 这类极短固定名：解密器自身用到的字符串会被排
+	// 除出加密集合（否则会「解密前先解密」），而 "a" 恰是混淆应用里常见的
+	// 短常量/反射成员名，撞车会让那条应用字符串静默留明文。随机名同时更接近
+	// 样本的 u() 形态。名字确定性地由 seed 派生，且不与任何既有字符串撞车。
+	methodName, err := randomMethodName(newRand(opts.Seed+"/strencmethod"), used)
+	if err != nil {
+		return err
+	}
+
+	totalBefore, totalAfter, totalEnc, totalCls := 0, 0, 0, 0
+	ok := 0
+	var names []string
+	for _, u := range units {
+		cls, err := randomDecryptorClass(rnd, used)
+		if err != nil {
+			return err
+		}
 		se := &dex.StringEncrypt{
 			Class:      cls,
-			MethodName: "a",
+			MethodName: methodName,
 			Key:        key,
 			MinLen:     minLen,
-			// 只有主 DEX 落地解密器类，其余 DEX 仅引用它。
-			InjectClass: u == host,
+			// 每个含密文的 DEX 自带一份解密器类本体。
+			InjectClass: true,
+			// 形态选项：只加密单引用串（默认 false，维持现有强度）。
+			SingleRefOnly: opts.ObfStringSingleRefOnly,
+		}
+		// A7 登记的反射成员名：无论长度与引用次数，一律纳入本 DEX 的加密集合。
+		// 键与写入方见 passes/reflect.go 的 reflectionNameKey。
+		if v, ok := art.Get(reflectionNameKey).(map[string]bool); ok && len(v) > 0 {
+			se.ForceEncrypt = v
+		}
+		// 先纯分析出本 DEX 的加密目标数：为 0 时既不该注入解密器，也不该
+		// 触发无谓的重建（否则会往池里塞一堆用不到的引用）。
+		n, err := dex.StringEncryptTargets(u.file, se)
+		if err != nil {
+			return fmt.Errorf("统计 %s 可加密字符串失败: %w", u.entry.NameString(), err)
+		}
+		if n == 0 {
+			continue
 		}
 		out, stats, err := dex.RebuildWithStats(u.file, dex.RebuildOptions{StringEncrypt: se})
 		if err != nil {
@@ -89,6 +135,8 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		totalBefore += len(u.data)
 		totalAfter += len(out)
 		totalEnc += stats.StringsEncrypted
+		totalCls++
+		names = append(names, cls)
 		ok++
 	}
 
@@ -98,13 +146,70 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 	// 这也是审计曾发现的问题（A2.key 曾等于空口令回退常量）。
 	// 指纹足以核对「两次构建是否用了同一把密钥」，但不泄露密钥本身。
 	keyFP := fmt.Sprintf("%x", key[:4])
-	art.Note("A2 字符串加密：%d 个 DEX，加密 %d 个字符串，解密器 %s->a（密钥指纹 %s，最短长度 %d）；%d → %d 字节（增加 %d）",
-		ok, totalEnc, cls, keyFP, minLen, totalBefore, totalAfter, totalAfter-totalBefore)
+	art.Note("A2 字符串加密：%d 个含密文 DEX，每个自带解密器类（共 %d 个，形如 %s），加密 %d 个字符串（密钥指纹 %s，最短长度 %d，仅单引用串 %v）；%d → %d 字节（增加 %d）",
+		ok, totalCls, decryptorNamesBrief(names), totalEnc, keyFP, minLen, opts.ObfStringSingleRefOnly,
+		totalBefore, totalAfter, totalAfter-totalBefore)
 	art.Stat("A2.dex", fmt.Sprint(ok))
 	art.Stat("A2.strings", fmt.Sprint(totalEnc))
+	art.Stat("A2.decryptors", fmt.Sprint(totalCls))
 	art.Stat("A2.key.fp", keyFP)
 	art.Stat("A2.grow", fmt.Sprint(totalAfter-totalBefore))
 	return nil
+}
+
+// decryptorNamesBrief 把类名列表压缩成日志用示例（最多 3 个，其余以 +N 概括）。
+func decryptorNamesBrief(names []string) string {
+	if len(names) == 0 {
+		return "无"
+	}
+	out := strings.Join(names[:min(3, len(names))], "、")
+	if len(names) > 3 {
+		out += fmt.Sprintf(" 等 +%d", len(names)-3)
+	}
+	return out
+}
+
+// randomDecryptorClass 生成一个尚未被任何字符串/类型占用的解密器类描述符。
+//
+// 生成的名字会写入 used，因此：同一个 DEX 内的全部调用点确定性地共用同一名字；
+// 不同 DEX 的名字两两不同（且不与任何 DEX 的既有字符串撞车——跨 DEX 零引用的
+// 前提）。类名全部由小写字母组成，不含任何产品/壳包名信息。
+func randomDecryptorClass(rnd *mathrand.Rand, used map[string]bool) (string, error) {
+	const alpha = "abcdefghijklmnopqrstuvwxyz"
+	seg := func(n int) string {
+		out := make([]byte, n)
+		for i := range out {
+			out[i] = alpha[rnd.Intn(len(alpha))]
+		}
+		return string(out)
+	}
+	for try := 0; try < 128; try++ {
+		cls := "L" + seg(5+rnd.Intn(5)) + "/" + seg(2+rnd.Intn(5)) + "/" + seg(4+rnd.Intn(7)) + ";"
+		if !used[cls] {
+			used[cls] = true
+			return cls, nil
+		}
+	}
+	return "", fmt.Errorf("A2：连续 128 次未能生成未被占用的解密器类名")
+}
+
+// randomMethodName 生成一个不与任何既有字符串撞车的解密方法名。
+//
+// 只用小写字母（合法 DEX 成员名），长度 5~9；生成后写入 used。
+func randomMethodName(rnd *mathrand.Rand, used map[string]bool) (string, error) {
+	const alpha = "abcdefghijklmnopqrstuvwxyz"
+	for try := 0; try < 128; try++ {
+		out := make([]byte, 5+rnd.Intn(5))
+		for i := range out {
+			out[i] = alpha[rnd.Intn(len(alpha))]
+		}
+		s := string(out)
+		if !used[s] {
+			used[s] = true
+			return s, nil
+		}
+	}
+	return "", fmt.Errorf("A2：连续 128 次未能生成未被占用的解密方法名")
 }
 
 // dexUnit 是一个已解析的 DEX 条目。

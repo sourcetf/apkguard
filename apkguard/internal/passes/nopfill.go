@@ -21,6 +21,11 @@ import (
 //   - 本 Pass 的插入**只含 nop 与 goto/16，不写任何寄存器**，因此不存在类型
 //     冲突，几乎可对全部方法生效。代价是它不改变控制流图，强度低于谓词。
 //
+// 两种并存形态：
+//   - 入口形态（JunkInsnCount 控制）：方法开头 nop×N + 两条不可达 goto/16；
+//   - return 前形态（ReturnNops 开关）：每条 return* 之前 1 条 nop，
+//     对齐参考样本 classes.dex/classes2.dex 的 2862/3539 条单发 nop。
+//
 // 本 Pass **只定义类型，不在 Registry 注册**：注册由 passes.go 统一维护。
 // 建议注册位置在 A6（controlFlow）之后、A9（fakeDex）之前，理由与 A6 相同：
 //   - 必须在 A4（dropDebugInfo）之后——花指令会平移指令地址，debug_info 若还在
@@ -60,12 +65,14 @@ func (n *nopFill) Run(_ context.Context, art *pipeline.Artifact, opts *config.Op
 
 	nops := opts.JunkInsnCount
 	before, after := 0, 0
-	var methods, totalNops, fakes, skipped int
+	var methods, totalNops, returnNops, fakes, skipped int
 	ok := 0
 	for _, u := range units {
 		cf := &dex.ControlFlow{
 			JunkFill: true,
 			JunkNops: nops,
+			// 第二种形态：每条 return 前 1 条 nop（参考样本形态），由选项控制。
+			ReturnNops: opts.ReturnNops,
 			// 关掉谓词与替换：A20 只做花指令，绝不能变成「偷偷开 A6」。
 			// 谓词会写 vP/vT，替换会写临时寄存器——两者都不是本功能项的语义，
 			// 也都会重新引入「写活跃寄存器」的风险面。
@@ -93,18 +100,20 @@ func (n *nopFill) Run(_ context.Context, art *pipeline.Artifact, opts *config.Op
 		after += len(out)
 		methods += st.ControlFlow.MethodsRewritten
 		totalNops += st.ControlFlow.Nops
+		returnNops += st.ControlFlow.ReturnNops
 		fakes += st.ControlFlow.FakeJumps
 		skipped += st.ControlFlow.SkippedTry + st.ControlFlow.SkippedPayload +
 			st.ControlFlow.SkippedInit + st.ControlFlow.SkippedShape
 		ok++
 	}
 
-	art.Note("A20 无害花指令填充：%d 个 DEX，改写 %d 个方法（nop %d 条、不可达跳转块 %d 个），"+
+	art.Note("A20 无害花指令填充：%d 个 DEX，改写 %d 个方法（入口 nop %d 条、return 前 nop %d 条、不可达跳转块 %d 个），"+
 		"跳过 %d 个方法（含 try/payload/构造器/形状不符）；%d → %d 字节（增加 %d）",
-		ok, methods, totalNops, fakes, skipped, before, after, after-before)
+		ok, methods, totalNops-returnNops, returnNops, fakes, skipped, before, after, after-before)
 	art.Stat("A20.dex", fmt.Sprint(ok))
 	art.Stat("A20.methods", fmt.Sprint(methods))
 	art.Stat("A20.nops", fmt.Sprint(totalNops))
+	art.Stat("A20.return_nops", fmt.Sprint(returnNops))
 	art.Stat("A20.fake_jumps", fmt.Sprint(fakes))
 	art.Stat("A20.skipped", fmt.Sprint(skipped))
 	return nil

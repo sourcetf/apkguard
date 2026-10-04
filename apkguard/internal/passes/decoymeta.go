@@ -3,9 +3,13 @@ package passes
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/rand"
+	"strconv"
+	"strings"
+	"time"
 
 	"apkguard/internal/axml"
 	"apkguard/internal/config"
@@ -27,6 +31,10 @@ import (
 // package / android:name / exported / uses-sdk 等语义关键属性。
 //
 // 全部四类注入都刻意选成「零运行影响」的形态，逐类的安全理由见 Run 内注释。
+// 在通用 meta-data 之外，还刻意复刻参考样本的三组标志性噪音：
+//   - 构建水印 cfg_mark_<UTC 时间戳>_<序号>_<随机串>（12~16 条）；
+//   - 同名不同值四组 cfg_nonce / build_lane / seq_mark(int) / compile_ms；
+//   - 9 条 com.<随机>.<随机>。名字在 DEX 里零引用，纯噪音。
 type decoyMeta struct{}
 
 func (decoyMeta) ID() config.FeatureID { return "A18" }
@@ -71,6 +79,10 @@ func (d *decoyMeta) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 	usedFeat := map[string]bool{}
 	usedMeta := map[string]bool{}
 	usedPkg := map[string]bool{}
+	// origMeta 只记录**原 Manifest 已有**的 meta-data 名：同名不同值四组
+	// 需要故意重复，但若应用本来就有同名键，再多插一条不同值会让读取方
+	// 拿到不确定的值，因此对这类键整组跳过（见 decoyMetaExtras）。
+	origMeta := map[string]bool{}
 	for _, e := range mf.Elements {
 		switch e.Name {
 		case "uses-permission":
@@ -79,6 +91,7 @@ func (d *decoyMeta) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 			usedFeat[e.AttrString("name")] = true
 		case "meta-data":
 			usedMeta[e.AttrString("name")] = true
+			origMeta[e.AttrString("name")] = true
 		case "package":
 			usedPkg[e.AttrString("name")] = true
 		}
@@ -86,6 +99,8 @@ func (d *decoyMeta) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 
 	var add []axml.NewElement
 	addedPerm, addedMeta, addedFeat, addedQuery := 0, 0, 0, 0
+	markCount, dupeCount, comCount := 0, 0, 0
+	var intPatches []intMetaPatch
 	budget := func(want int) int { return want*50 + 100 }
 
 	// ① <uses-permission android:name="com.<假包名>.permission.<大写名>">
@@ -183,6 +198,32 @@ func (d *decoyMeta) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 			})
 			addedMeta++
 		}
+
+		// ③b 样本标志性的三组额外 meta-data（构建水印 / 同名不同值 / 随机
+		// 命名空间）。时间戳必须取 opts.UnifiedStamp()——用 time.Now() 会破坏
+		// 「同 seed 完全可复现」，也会与 A14 统一后的 ZIP 时间线脱节。
+		stamp, serr := opts.UnifiedStamp()
+		if serr != nil {
+			return fmt.Errorf("A18 获取统一时间戳失败: %w", serr)
+		}
+		extras, cnt := decoyMetaExtras(rnd, stamp, origMeta)
+		for _, ex := range extras {
+			add = append(add, axml.NewElement{
+				Parent:      "application",
+				ParentIndex: 0,
+				Name:        "meta-data",
+				Attrs: []axml.NewAttr{
+					axml.StringAttr(axml.AndroidNS, "name", ex.name),
+					axml.StringAttr(axml.AndroidNS, "value", ex.value),
+				},
+			})
+			usedMeta[ex.name] = true
+			if ex.asInt {
+				intPatches = append(intPatches, intMetaPatch{name: ex.name, val: ex.intv})
+			}
+		}
+		addedMeta += len(extras)
+		markCount, dupeCount, comCount = cnt.marks, cnt.dupes, cnt.coms
 	}
 
 	// ④ <queries><package android:name="..."/></queries>
@@ -245,10 +286,20 @@ func (d *decoyMeta) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 		addedQuery = len(queryNames)
 	}
 
+	// int 型 meta-data（seq_mark）需要把已按字符串写入的属性就地改成
+	// Res_value.dataType=TYPE_INT_DEC：axml 包的 NewAttr 目前只支持字符串与
+	// 布尔属性，而 int 是样本里最「不像诱饵」的细节，必须在最终字节上回填。
+	// 必须排在 <queries> 第二遍 Rewrite 之后（那时 out 的布局才会定型）。
+	out, err = patchIntMetaValue(out, intPatches)
+	if err != nil {
+		return fmt.Errorf("A18 写入 int 型 meta-data 失败: %w", err)
+	}
+
 	// 硬约束：写回后必须能用 axml.Parse 重新解析。Manifest 一旦写坏（字符串池
 	// 越界、块长度错位），系统在启动时解析失败会让应用启动即死（实测样本与
 	// 真实应用都出现过 ClassNotFoundException 一类的一启动就崩），因此这里在
-	// 落盘前再解析一次，宁可报错也不产出坏包。
+	// 落盘前再解析一次，宁可报错也不产出坏包。int 回填后的 dataType=0x10
+	// 也在这次解析的覆盖范围内。
 	if _, err := axml.Parse(out); err != nil {
 		return fmt.Errorf("A18 写入后 Manifest 无法解析（拒绝产出坏包）: %w", err)
 	}
@@ -257,11 +308,17 @@ func (d *decoyMeta) Run(_ context.Context, art *pipeline.Artifact, opts *config.
 	}
 
 	art.Note("A18 Manifest 诱饵元数据：自定义权限 %d 条（系统未定义、安装器完全忽略，零运行影响）、"+
-		"meta-data %d 条（只选无人读取的键）、uses-feature %d 条（全部 required=false，不影响商店设备筛选）、"+
+		"meta-data %d 条（通用键 %d 条只选无人读取的；构建水印 cfg_mark_<UTC 时间戳>_… %d 条；"+
+		"同名不同值四组 %d 条：cfg_nonce/build_lane/seq_mark(int)/compile_ms；com.<随机>.<随机> %d 条）、"+
+		"uses-feature %d 条（全部 required=false，不影响商店设备筛选）、"+
 		"<queries> 包名 %d 条（均为不存在的包名）；只追加，不改动 A8/B2 已写入的元素",
-		addedPerm, addedMeta, addedFeat, addedQuery)
+		addedPerm, addedMeta, addedMeta-markCount-dupeCount-comCount, markCount, dupeCount, comCount,
+		addedFeat, addedQuery)
 	art.Stat("A18.perms", fmt.Sprint(addedPerm))
 	art.Stat("A18.meta", fmt.Sprint(addedMeta))
+	art.Stat("A18.mark", fmt.Sprint(markCount))
+	art.Stat("A18.dupes", fmt.Sprint(dupeCount))
+	art.Stat("A18.commeta", fmt.Sprint(comCount))
 	art.Stat("A18.features", fmt.Sprint(addedFeat))
 	art.Stat("A18.queries", fmt.Sprint(addedQuery))
 	return nil
@@ -409,6 +466,242 @@ var decoyQueryVendors = []string{
 	"com.umeng", "com.tencent", "com.baidu", "com.alibaba",
 	"com.huawei", "com.xiaomi", "com.meizu", "com.vivo",
 	"com.oppo", "com.netease",
+}
+
+// ---- 样本标志性的三组额外 meta-data ----
+
+const (
+	// decoyMarkTimeLayout 是构建水印时间戳的格式，对齐样本
+	// cfg_mark_20260919220102_…。时间取 UTC，来源必须是 opts.UnifiedStamp()。
+	decoyMarkTimeLayout = "20060102150405"
+	// decoyMarkMin/decoyMarkSpan：水印条数 = 12 + rnd.Intn(5) ∈ [12,16]，
+	// 与样本的 12+ 条一致。
+	decoyMarkMin  = 12
+	decoyMarkSpan = 5
+	// decoyComMetaCount 是 com.<随机>.<随机> 形式的条数（样本 9 条）。
+	decoyComMetaCount = 9
+)
+
+// decoyMetaExtra 是一条额外 meta-data。
+type decoyMetaExtra struct {
+	name  string
+	value string // 十进制文本；asInt 为 true 时同值按 int32 写入
+	asInt bool
+	intv  int32
+}
+
+// decoyMetaCounts 汇总额外 meta-data 的分类条数（写入统计与日志）。
+type decoyMetaCounts struct {
+	marks, dupes, coms int
+}
+
+// reservedMetaKeys 是「确定会被系统或流行 SDK 读取」的 meta-data 精确键名。
+// 注入的任何名字（含随机合成的 com.<x>.<y>）都不得命中这些键，否则会改变
+// 真实行为甚至导致启动失败。
+var reservedMetaKeys = []string{
+	"com.google.android.gms.version",
+	"com.google.android.gms.ads.APPLICATION_ID",
+	"com.google.android.gms.ads.AD_MANAGER_APP",
+	"firebase_analytics_collection_enabled",
+	"firebase_crashlytics_collection_enabled",
+	"com.facebook.sdk.ApplicationId",
+	"com.facebook.sdk.ClientToken",
+	"UMENG_APPKEY",
+	"UMENG_CHANNEL",
+	"BUGLY_APP_VERSION",
+	"BUGLY_APPID",
+	"com.amap.api.v2.apikey",
+	"com.baidu.lbsapi.API_KEY",
+	"com.tencent.mm.opensdk.open_appid",
+	"com.google.firebase.messaging.default_notification_channel_id",
+}
+
+// reservedMetaPrefixes 是保留命名空间前缀：随机生成的名字一旦落入这些前缀，
+// 即便不是已知精确键也可能被对应 SDK 扫描，直接换名。
+var reservedMetaPrefixes = []string{
+	"com.google.android.gms.",
+	"com.google.firebase.",
+	"com.facebook.",
+	"com.tencent.mm.opensdk.",
+	"com.amap.api.",
+	"com.baidu.lbsapi.",
+	"com.umeng.",
+	"com.tencent.bugly.",
+}
+
+// metaKeyReserved 报告 meta-data 键名是否落在保留名单内。
+// 大小写不敏感比较：aapt/读取方对键名大小写的处理并不一致，保守取严。
+func metaKeyReserved(name string) bool {
+	low := strings.ToLower(name)
+	for _, k := range reservedMetaKeys {
+		if low == strings.ToLower(k) {
+			return true
+		}
+	}
+	for _, p := range reservedMetaPrefixes {
+		if strings.HasPrefix(low, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// decoyMetaExtras 构造参考样本的三组额外 meta-data：
+//
+//	① 构建水印 cfg_mark_<UTC 时间戳>_<序号>_<随机串>，值也是随机串；
+//	② 同名不同值四组：cfg_nonce / build_lane / seq_mark(int) / compile_ms；
+//	③ 9 条 com.<随机>.<随机>，值为 28~50 字符随机串。
+//
+// 全部由 seed 与 stamp 确定性派生（不能用 time.Now()，否则同 seed 不可复现）；
+// origMeta 是原 Manifest 已有的 meta-data 名，四组重名键若与它撞名则整组跳过
+// ——那属于应用的真实配置，插不同值会让读取方拿到不确定的结果。
+func decoyMetaExtras(rnd *rand.Rand, stamp time.Time, origMeta map[string]bool) ([]decoyMetaExtra, decoyMetaCounts) {
+	var out []decoyMetaExtra
+	var cnt decoyMetaCounts
+	markTS := stamp.UTC().Format(decoyMarkTimeLayout)
+
+	// ① 构建水印：同一条水印的时间戳与序号都相同（样本 12+ 条共用
+	// 20260919220102），用随机后缀保证条目之间不重名。
+	marks := decoyMarkMin + rnd.Intn(decoyMarkSpan)
+	for i := 0; i < marks; i++ {
+		out = append(out, decoyMetaExtra{
+			name:  fmt.Sprintf("cfg_mark_%s_%02d_%s", markTS, i+1, randSeg(rnd, 6)),
+			value: randSeg(rnd, 28+rnd.Intn(23)), // 28~50 字符
+		})
+	}
+	cnt.marks = marks
+
+	// ② 同名不同值四组，名字取样本同款语义名。
+	appendPair := func(name string, a, b decoyMetaExtra) {
+		if origMeta[name] {
+			return
+		}
+		a.name, b.name = name, name
+		out = append(out, a, b)
+		cnt.dupes += 2
+	}
+	hexVal := func() string { return hex.EncodeToString(randBytes(rnd, 16)) }
+	appendPair("cfg_nonce", decoyMetaExtra{value: hexVal()}, decoyMetaExtra{value: hexVal()})
+	laneVal := func() string { return "lane_" + hex.EncodeToString(randBytes(rnd, 4)) }
+	appendPair("build_lane", decoyMetaExtra{value: laneVal()}, decoyMetaExtra{value: laneVal()})
+	// seq_mark 必须是 int 类型（TYPE_INT_DEC）——样本里最「不像诱饵」的细节。
+	seq1 := 100000 + rnd.Int31n(900000)
+	seq2 := 100000 + rnd.Int31n(900000)
+	for seq2 == seq1 {
+		seq2 = 100000 + rnd.Int31n(900000)
+	}
+	appendPair("seq_mark",
+		decoyMetaExtra{value: strconv.FormatInt(int64(seq1), 10), asInt: true, intv: seq1},
+		decoyMetaExtra{value: strconv.FormatInt(int64(seq2), 10), asInt: true, intv: seq2})
+	// compile_ms 与统一时间戳同一条时间线，偏差控制在 ±45 秒内，两个值不同。
+	base := stamp.UnixMilli()
+	ms1 := base + int64(rnd.Intn(91)-45)*1000
+	ms2 := base + int64(rnd.Intn(91)-45)*1000
+	for ms2 == ms1 {
+		ms2 = base + int64(rnd.Intn(91)-45)*1000
+	}
+	msVal := func(v int64) decoyMetaExtra {
+		return decoyMetaExtra{value: strconv.FormatInt(v, 10)}
+	}
+	appendPair("compile_ms", msVal(ms1), msVal(ms2))
+
+	// ③ com.<随机>.<随机>：小写字母段，避开保留 SDK 命名空间与已有名字。
+	for i := 0; i < decoyComMetaCount; {
+		name := fmt.Sprintf("com.%s.%s", randLower(rnd, 5+rnd.Intn(6)), randLower(rnd, 5+rnd.Intn(6)))
+		if origMeta[name] || metaKeyReserved(name) {
+			continue
+		}
+		out = append(out, decoyMetaExtra{name: name, value: randSeg(rnd, 28+rnd.Intn(23))})
+		i++
+	}
+	cnt.coms = decoyComMetaCount
+	return out, cnt
+}
+
+// randLower 生成由小写字母组成的随机段（用于包名段，保证是合法 Java 包片段）。
+func randLower(r *rand.Rand, n int) string {
+	const alpha = "abcdefghijklmnopqrstuvwxyz"
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = alpha[r.Intn(len(alpha))]
+	}
+	return string(out)
+}
+
+// intMetaPatch 描述一条要编码成 TYPE_INT_DEC 的 <meta-data>。
+// 同名条目按 Manifest 中的出现顺序依次匹配（seq_mark 两条值不同）。
+type intMetaPatch struct {
+	name string
+	val  int32
+}
+
+// patchIntMetaValue 把已写入 Manifest 的指定 <meta-data> 的 android:value
+// 从字符串就地改成十进制整数（Res_value.dataType = TYPE_INT_DEC，0x10）。
+//
+// 为什么走字节级回填：internal/axml 的 NewAttr 目前只支持字符串/布尔属性，
+// 而 seq_mark 用 int 是参考样本里最难伪装的细节之一（同名不同值 + 类型多样）。
+// 属性区布局由 AXML 规范固定：start element 块 = 16 字节 node + attrExt
+// （attributeStart 通常 20）+ 每条属性 20 字节；Element.HeaderOff 是公开字段。
+// 只改 Res_value 的 rawValue/size/dataType/data 四个字段，字符串池与
+// resource map 完全不受影响；写完后调用方还会用 axml.Parse 再校验一次。
+func patchIntMetaValue(data []byte, patches []intMetaPatch) ([]byte, error) {
+	if len(patches) == 0 {
+		return data, nil
+	}
+	f, err := axml.Parse(data)
+	if err != nil {
+		return nil, err
+	}
+	queue := map[string][]int32{}
+	for _, p := range patches {
+		queue[p.name] = append(queue[p.name], p.val)
+	}
+	for _, e := range f.Elements {
+		if e.Name != "meta-data" {
+			continue
+		}
+		name := e.AttrString("name")
+		q := queue[name]
+		if len(q) == 0 {
+			continue
+		}
+		val := q[0]
+		queue[name] = q[1:]
+
+		idx := -1
+		for i := range e.Attrs {
+			if e.Attrs[i].Name == "value" {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("int 型 meta-data %q 缺少 android:value", name)
+		}
+		if e.HeaderOff+36 > len(data) {
+			return nil, fmt.Errorf("int 型 meta-data %q 的块偏移越界", name)
+		}
+		attrStart := int(binary.LittleEndian.Uint16(data[e.HeaderOff+24:]))
+		off := e.HeaderOff + 16 + attrStart + idx*20
+		if off+20 > len(data) {
+			return nil, fmt.Errorf("int 型 meta-data %q 的属性越界", name)
+		}
+		if data[off+15] != axml.TypeString {
+			return nil, fmt.Errorf("int 型 meta-data %q 的 value 不是字符串（type=0x%02x），拒绝改写",
+				name, data[off+15])
+		}
+		binary.LittleEndian.PutUint32(data[off+8:], 0xffffffff) // rawValue 无原始文本
+		binary.LittleEndian.PutUint16(data[off+12:], 8)         // Res_value.size
+		data[off+14] = 0                                        // res0
+		data[off+15] = axml.TypeIntDec
+		binary.LittleEndian.PutUint32(data[off+16:], uint32(val))
+	}
+	for name, q := range queue {
+		if len(q) > 0 {
+			return nil, fmt.Errorf("有 %d 条 int 型 meta-data %q 未找到可改写的元素", len(q), name)
+		}
+	}
+	return data, nil
 }
 
 // metaValue 按形态生成一个「合法但随机」的 meta-data 值。

@@ -94,7 +94,7 @@ type Feature struct {
 // 一份会过期的声明。
 var implementedIDs = map[FeatureID]bool{
 	// 阶段2 L1 混淆
-	"A1": true, "A2": true, "A3": true, "A4": true, "A5": true, "A8": true, "A11": true,
+	"A1": true, "A2": true, "A3": true, "A4": true, "A5": true, "A7": true, "A8": true, "A11": true,
 	"A9": true, "A10": true, "A12": true, "A13": true, "A15": true, "A6": true,
 	"A16": true, "A17": true, "A18": true, "A19": true, "A20": true,
 	// 阶段1 签名 / 对齐 / 元数据
@@ -152,30 +152,30 @@ func All() []Feature {
 		{ID: "A6", Name: "控制流混淆", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
 			Desc: "基本块平坦化、虚假分支（不透明谓词）、指令替换",
 			Note: "仅做可证明安全的两类改写：恒真不透明谓词与不可达前向跳转块；不做基本块平坦化。改寄存器此前会触发 ART 宽值类型冲突，已修为「只选未被任何指令引用的寄存器」并计入宽值相邻格，三个真实应用实测正常"},
-		{ID: "A7", Name: "反射化调用", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
-			Desc: "将敏感 API 调用改为 Class.forName + getMethod + invoke",
-			Note: "性能下降明显，且是逆向者的强信号"},
+		{ID: "A7", Name: "反射成员名强制加密", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
+			Desc: "扫描被直接用作反射成员名参数的字符串（Class.getMethod/getDeclaredMethod/getField/getDeclaredField），登记给 A2 无条件加密（不受最短长度限制）；类名入口 forName/loadClass 不在此列",
+			Note: "补齐 A2 的短串漏洞：反射成员名往往很短（get/a/isTagEnabled），低于最短长度时会被留在明文。只登记、不改写 DEX；A2 未启用时仅在报告中说明已识别的条数，不报错也不加密"},
 		{ID: "A8", Name: "诱饵类注入", Group: GroupObf, Stage: StageL4, Risk: RiskDangerous, Default: false,
-			Desc: "注入若干命名具误导性的空实现类（如 SecurityMonitor、IntegrityChecker）",
-			Note: "增加体积，且可能被识别为刻意混淆"},
+			Desc: "注入命名具误导性的空实现类：主题包与 activity/receiver/service 三个名族全部由 seed 派生（形如 vault.monitor 下的 CoreAtlas/SignalBeacon/QuietAnnex），组件声明与 DEX 类一一对应",
+			Note: "增加体积，且可能被识别为刻意混淆；命名随 seed 变化、不写死产品名，避免固定指纹"},
 		{ID: "A9", Name: "伪 DEX magic 填充块", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
 			Desc: "注入仅伪造 dex magic 的随机数据块，命名与真实 DEX 相似",
 			Note: "可能使部分分析工具崩溃；随机数据不可压缩，每块约 80KB"},
 		{ID: "A10", Name: "垃圾条目注入", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
-			Desc: "注入非 ASCII 顶层文件、随机名深目录、畸形 META-INF 路径",
-			Note: "可能触发 Windows MAX_PATH 与解包工具异常"},
+			Desc: "注入非 ASCII 顶层假 AXML、空格填充深目录、kotlin/ 伪装、畸形 META-INF（含 4 位 hex 近重名、空格名、伪装构件名）与「真资源路径当目录」的畸形变体",
+			Note: "成族设计对齐参考样本：884 条顶层非 ASCII 假 AXML（内容各不相同）、837 条空格深目录、24 条 kotlin/ 假货、323 条共用 176B 随机载荷；可能触发 Windows MAX_PATH 与解包工具异常"},
 		{ID: "A11", Name: "资源路径全量扁平化", Group: GroupObf, Stage: StageL2, Risk: RiskSafe, Default: false,
 			Desc: "将 res/ 下所有语义目录替换为单字母目录名，同步改写 resources.arsc 与 DEX 引用",
 			Note: "A5 的完整形态；实证样本已做到零语义残留"},
 		{ID: "A12", Name: "ZIP 路径攻击", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
-			Desc: "注入路径前缀滥用条目、绝对路径条目、重复条目名",
-			Note: "可能触发解压路径越界（Zip Slip 变体）与工具解析差异"},
+			Desc: "注入路径前缀滥用条目、绝对路径条目、重复条目名；内容与 A10 的畸形族共用同一份 176B 随机载荷",
+			Note: "样本的 323 条共用载荷横跨 7 个命名空间（res/values、绝对路径、META-INF、classes.dex/、resources.arsc/、AndroidManifest.xml/、kotlin/），按内容哈希聚类会先命中这一族；可能触发解压路径越界（Zip Slip 变体）与工具解析差异"},
 		{ID: "A13", Name: "类膨胀与类名策略", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
 			Desc: "生成默认包类、超长类名路径（30+ 层）、类数量膨胀",
 			Note: "显著增大体积；注入空类会被识破，需生成真实类"},
 		{ID: "A14", Name: "时间戳与元数据统一化", Group: GroupObf, Stage: StageSign, Risk: RiskSafe, Default: true,
-			Desc: "统一 ZIP 条目的时间戳与 create_system，并清除条目注释与时间类扩展字段",
-			Note: "零体积成本；消除「被重新打包」的取证痕迹。刻意不改 flag_bits——UTF-8 名称位（bit 11）必须保留，否则非 ASCII 条目名会被读方按 CP437 解码"},
+			Desc: "按注入阶段派生三组时间戳（基准 / +32s / +44s），统一 create_system，并清除条目注释与时间类扩展字段",
+			Note: "零体积成本；三组对齐参考样本 22:01:08/22:01:40/22:01:52（全部条目同一秒本身就是重打包指纹）。刻意不改 flag_bits——UTF-8 名称位（bit 11）必须保留，否则非 ASCII 条目名会被读方按 CP437 解码"},
 
 		{ID: "A15", Name: "巨型 Manifest 填充", Group: GroupObf, Stage: StageL1, Risk: RiskDangerous, Default: false,
 			Desc: "把 AndroidManifest.xml 膨胀到数百 MB（零填充 + 巨型假 chunk，真实内容置于末尾）",
@@ -189,14 +189,14 @@ func All() []Feature {
 			Desc: "在 assets 下放一个结构完整、可被 apktool/jadx 打开的假 APK（自带假 Manifest/arsc/dex），与真载荷同构",
 			Note: "对样本「内层真 APK」的反向利用：自动化脱壳脚本会满载而归地拿到假应用"},
 		{ID: "A18", Name: "Manifest 诱饵元数据", Group: GroupObf, Stage: StageL1, Risk: RiskSafe, Default: false,
-			Desc: "向 Manifest 注入假 uses-permission / meta-data / uses-feature（只用系统未定义的自定义权限名，零运行影响）",
-			Note: "与 A8 的假组件互补：让权限视图与组件表都充满噪音"},
+			Desc: "向 Manifest 注入假 uses-permission / meta-data / uses-feature（只用系统未定义的自定义权限名，零运行影响）；meta-data 含构建水印 cfg_mark_<UTC 时间戳>_…、同名不同值四组（seq_mark 为 int 类型）与 com.<随机>.<随机>",
+			Note: "与 A8 的假组件互补：让权限视图与组件表都充满噪音；水印/同名键全部由 seed + 统一时间戳确定性派生"},
 		{ID: "A19", Name: "字符串池垃圾注入", Group: GroupObf, Stage: StageL2, Risk: RiskSafe, Default: false,
 			Desc: "往每个 DEX 的字符串池注入大量未被引用的字符串（形似业务常量/URL/密钥片段），推高 strings 输出噪音",
 			Note: "会增大 DEX 体积；池接近 16 位上限的 DEX 会自动跳过"},
 		{ID: "A20", Name: "无害花指令填充", Group: GroupObf, Stage: StageL4, Risk: RiskSafe, Default: false,
 			Desc: "向方法体插入 nop 填充与不可达前向跳转——不写任何寄存器，因此无类型冲突风险",
-			Note: "只增加反编译噪音、不改变控制流图，属低强度手法但覆盖面大"},
+			Note: "只增加反编译噪音、不改变控制流图，属低强度手法但覆盖面大；默认同时启用参考样本的 return 前单发 nop 形态（-return-nops=false 可关）"},
 		{ID: "B1", Name: "DEX 整体加密", Group: GroupPack, Stage: StageL2, Risk: RiskSafe, Default: false,
 			Desc: "将原始 DEX 加密后存入 assets/，壳 DEX 运行时解密并加载",
 			Note: "所有加固的第一道防线；必须与 B2/B3 同时启用"},
@@ -343,21 +343,45 @@ type Options struct {
 	MaxSDK  uint   `json:"max_sdk"`
 
 	// 混淆参数
-	NamePrefix    string `json:"name_prefix"`     // A1 混淆后名称前缀
-	PackageShrink bool   `json:"package_shrink"`  // A1 每个原包整体压成无意义短包名（隐藏包结构）
-	KeepRules     string `json:"keep_rules"`      // A1 保留白名单（每行一条，支持通配）
-	ObfStringMin  int    `json:"obf_string_min"`  // A2 仅加密长度 >= 该值的字符串
-	Seed          string `json:"seed"`            // 随机种子（留空则随机）
-	FakeDexCount  int    `json:"fake_dex_count"`  // A9 伪 DEX 块数量
-	FakeDexSize   int    `json:"fake_dex_size"`   // A9 每块字节数
-	JunkTopCount  int    `json:"junk_top_count"`  // A10 非 ASCII 顶层文件数
-	JunkDirCount  int    `json:"junk_dir_count"`  // A10 随机深目录条目数
-	JunkDirDepth  int    `json:"junk_dir_depth"`  // A10 深目录最大层数
-	JunkMetaCount int    `json:"junk_meta_count"` // A10 畸形 META-INF 条目数
-	ZipAtkCount   int    `json:"zip_atk_count"`   // A12 每类路径攻击条目数
-	ClassPadCount int    `json:"class_pad_count"` // A13 膨胀类数量
-	StampTime     string `json:"stamp_time"`      // A14 统一时间戳（RFC3339，留空用固定值）
-	ManifestPadMB int    `json:"manifest_pad_mb"` // A15 巨型 Manifest 填充量（MB，0=默认 100）
+	NamePrefix    string `json:"name_prefix"`    // A1 混淆后名称前缀
+	PackageShrink bool   `json:"package_shrink"` // A1 每个原包整体压成无意义短包名（隐藏包结构）
+	KeepRules     string `json:"keep_rules"`     // A1 保留白名单（每行一条，支持通配）
+
+	// RenameResourceIDs 让 A1 把 aapt 生成的资源 ID 类（R / R$Type）与其中的
+	// 静态字段一起改名；字段的 static_values（资源 ID 常量）保持原样（对齐参考样本）。
+	//
+	// 默认开启：CLI 的 -rename-resource-ids 默认 true，Web UI 对应复选框默认勾选。
+	// 显式关闭：-rename-resource-ids=false 或取消勾选。另有应急开关：环境变量
+	// APKGUARD_KEEP_RCLASS_IDS=1|true|yes|on 可强制关闭，优先级最高
+	// （见 internal/passes/rename.go 的 renameResourceIDsEnabled）。
+	//
+	// 与 ReturnNops 相同的零值语义：字段是普通 bool，JSON 零值为 false，反序列化
+	// 无法区分「未设置」与「显式 false」；直接构造 Options 的 API 调用方不设置本
+	// 字段时等同于**关闭**。默认开启只能由 CLI flag 默认值与 Web UI 复选框的默认
+	// 勾选提供——不能在 Options 层把零值强制翻成 true，否则会剥夺 API 调用方显式
+	// 关闭的能力。
+	RenameResourceIDs bool `json:"rename_resource_ids"`
+
+	ObfStringMin int `json:"obf_string_min"` // A2 仅加密长度 >= 该值的字符串
+	// ObfStringSingleRefOnly 让 A2 只加密「恰好被 1 条 const-string 指令引用」
+	// 的字符串（对齐参考样本的选择性加密分布：样本 463 个候选中只加密 206 个，
+	// 多引用串一律留明文）。
+	//
+	// 默认 false：维持现有强度，长度达标的串一律加密。开启会**降低**保护强度
+	// （多引用串以明文留在字符串池，strings/grep 可直接提取），仅用于让产物的
+	// 加密分布更像样本，不建议常规使用。
+	ObfStringSingleRefOnly bool   `json:"obf_string_single_ref"`
+	Seed                   string `json:"seed"`            // 随机种子（留空则随机）
+	FakeDexCount           int    `json:"fake_dex_count"`  // A9 伪 DEX 块数量
+	FakeDexSize            int    `json:"fake_dex_size"`   // A9 每块字节数
+	JunkTopCount           int    `json:"junk_top_count"`  // A10 非 ASCII 顶层文件数
+	JunkDirCount           int    `json:"junk_dir_count"`  // A10 随机深目录条目数
+	JunkDirDepth           int    `json:"junk_dir_depth"`  // A10 深目录最大层数
+	JunkMetaCount          int    `json:"junk_meta_count"` // A10 畸形 META-INF 条目数
+	ZipAtkCount            int    `json:"zip_atk_count"`   // A12 每类路径攻击条目数
+	ClassPadCount          int    `json:"class_pad_count"` // A13 膨胀类数量
+	StampTime              string `json:"stamp_time"`      // A14 统一时间戳（RFC3339，留空用固定值）
+	ManifestPadMB          int    `json:"manifest_pad_mb"` // A15 巨型 Manifest 填充量（MB，0=默认 100）
 
 	// ---- 欺骗类手法（A16~A20 / C7）的参数 ----
 
@@ -371,6 +395,18 @@ type Options struct {
 	StrJunkCount int `json:"str_junk_count"`
 	// JunkInsnCount 是 A20 每个方法插入的花指令组数。
 	JunkInsnCount int `json:"junk_insn_count"`
+	// ReturnNops 让 A20 在「入口 nop + 不可达跳转」之外启用第二种形态：
+	// 在每条 return 之前插入 1 条 nop（参考样本形态，全部单发、无连续段）。
+	//
+	// 默认开启：A20 本身是非默认功能（见 All() 里 A20 的 Default: false），
+	// 一旦用户启用 A20，就按参考样本的形态产出 return 前 nop；要关掉这层
+	// 形态用 -return-nops=false。
+	//
+	// 注意字段的 JSON 零值仍是 false：Web/配置文件反序列化时无法区分
+	// 「未设置」与「显式 false」，若在这里强制打开会剥夺显式关闭的能力。
+	// 默认值由 CLI（cmd/apkguard 的 flag 默认值）与 Web UI 的复选框默认
+	// 勾选提供，Options 本身保持零值语义不变。
+	ReturnNops bool `json:"return_nops"`
 	// LibFakeName 是 C7 把守卫库改成的新名字（形如 "libsqlite3x.so"；留空用默认）。
 	LibFakeName string `json:"lib_fake_name"`
 	// LibStripSections 是**已废弃**的选项：曾用于清除 ELF 节头，但实测证明
@@ -378,6 +414,18 @@ type Options struct {
 	// 直接失败），且 C6 的完整性校验依赖节名定位 .text/.rodata。
 	// 保留字段只为让显式请求能被**拒绝并给出原因**，而不是静默忽略。
 	LibStripSections bool `json:"lib_strip_sections"`
+
+	// ZipLocalFlagDecoy 在**本地头**为四个核心条目（AndroidManifest.xml、
+	// resources.arsc、classes.dex 与 classesN.dex）写入假加密 flag：
+	// bit0（加密）+ bit6（强加密）；中央目录保持原样。
+	//
+	// 后果：按本地头读取的工具（部分解包器、自制解析器、按本地头遍历的检测器）
+	// 会以为这些文件已加密而索要口令；Android 平台按中央目录读取，照常安装。
+	//
+	// 默认关闭。参考样本使用了同款手法且在 Android 16/API 36 上实测可正常
+	// 安装启动，但那是别人的包；我们自己的产物尚未在真机验证过，
+	// 因此不默认开启。开启后请自行在目标设备上验证安装与启动。
+	ZipLocalFlagDecoy bool `json:"zip_local_decoy"`
 
 	// 加壳参数
 	DexKey   string `json:"dex_key"`   // B1 加密密钥（留空自动生成）
@@ -601,9 +649,13 @@ func (o *Options) Validate() error {
 	if o.ExtractRatio < 0 || o.ExtractRatio > 100 {
 		errs = append(errs, "B5 抽取比例须在 0~100 之间")
 	}
-	// 上限取 4095：4096<<20 == 2^32，会让填充量的字节运算在 uint32 上回绕为 0。
-	if o.ManifestPadMB < 0 || o.ManifestPadMB > 4095 {
-		errs = append(errs, "A15 填充量须在 0~4095 MB 之间（4096MB 会使 uint32 字节数溢出）")
+	// 上限取 1024：A15 的峰值内存约为填充量的 3.4 倍（审计按 4095MB 实测估算：
+	// ~4.3GB 输出 + ~3.4GB 巨串 + ~3.4GB 新池，会先 OOM 而不是干净报错）。
+	// 1024MB 对应峰值约 3.5GB，在常见 8GB 机器上可干净完成；更大的值应被
+	// 明确拒绝，而不是让进程在分配到一半时被系统杀掉。旧的 4095/4096 边界
+	// 只防了 uint32 溢出，防不住 OOM。
+	if o.ManifestPadMB < 0 || o.ManifestPadMB > 1024 {
+		errs = append(errs, "A15 填充量须在 0~1024 MB 之间（峰值内存约为填充量的 3.4 倍，超过 1024MB 有 OOM 风险）")
 	}
 	if o.FakeDexCount < 0 || o.JunkTopCount < 0 || o.JunkDirCount < 0 || o.ClassPadCount < 0 {
 		errs = append(errs, "数量类参数不能为负")

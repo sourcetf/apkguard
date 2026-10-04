@@ -3,6 +3,7 @@ package passes
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -13,6 +14,24 @@ import (
 	"apkguard/internal/pipeline"
 	"apkguard/internal/zipx"
 )
+
+// renameResourceIDsEnabled 返回是否让 R / R$Type 资源 ID 类参与 A1 混淆。
+//
+// 默认开启（对齐参考样本：R 类字段名被抹成 A..Z,a..z 短名，资源 ID 常量
+// 原样保留在 static_values 里）。取值优先级（高 → 低）：
+//
+//  1. 环境变量 APKGUARD_KEEP_RCLASS_IDS=1|true|yes|on：强制关闭。这是排障与
+//     应急通道，即使 Options.RenameResourceIDs=true 也不改名；
+//  2. Options.RenameResourceIDs：CLI 的 -rename-resource-ids 默认 true，
+//     Web UI 对应复选框默认勾选；JSON/API 调用方未设置时为 Go 零值 false
+//     （= 关闭），与 ReturnNops 的既定零值语义一致（见 config.Options 注释）。
+func renameResourceIDsEnabled(opts *config.Options) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("APKGUARD_KEEP_RCLASS_IDS"))) {
+	case "1", "true", "yes", "on":
+		return false
+	}
+	return opts.RenameResourceIDs
+}
 
 // ---- A1 名字混淆 ----
 
@@ -80,6 +99,9 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 		return fmt.Errorf("没有任何 DEX 条目可被解析")
 	}
 
+	// R 类改名开关在三个 Renamer 构造点必须一致，这里只求值一次。
+	renameResIDs := renameResourceIDsEnabled(opts)
+
 	keep := splitKeepRules(opts.KeepRules)
 	keepClasses := manifestComponents(art)
 	// 非 DEX 内容里按名字引用的类（布局中的自定义 View、资源字符串、assets 里的
@@ -141,10 +163,11 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	}
 	for _, u := range units {
 		rn, err := dex.NewRenamer(u.file, dex.RenameConfig{
-			Keep:             keep,
-			ExtraKeepClasses: keepClasses,
-			ReflectedNames:   reflected,
-			ObfuscateFields:  true,
+			Keep:              keep,
+			ExtraKeepClasses:  keepClasses,
+			ReflectedNames:    reflected,
+			ObfuscateFields:   true,
+			RenameResourceIDs: renameResIDs,
 		})
 		if err != nil {
 			return fmt.Errorf("%s 构造重命名器失败: %w", u.entry.NameString(), err)
@@ -255,11 +278,12 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 			usedNames[n] = true
 		}
 		rn, err := dex.NewRenamer(u.file, dex.RenameConfig{
-			Keep:             keep,
-			ExtraKeepClasses: keepClasses,
-			ReflectedNames:   reflected,
-			ObfuscateFields:  true,
-			ClassMap:         classMap,
+			Keep:              keep,
+			ExtraKeepClasses:  keepClasses,
+			ReflectedNames:    reflected,
+			ObfuscateFields:   true,
+			RenameResourceIDs: renameResIDs,
+			ClassMap:          classMap,
 		})
 		if err != nil {
 			return fmt.Errorf("%s 构造重命名器失败: %w", u.entry.NameString(), err)
@@ -373,13 +397,14 @@ func (r *renameClass) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	byIDMethods, byIDFields := 0, 0
 	for ui, u := range units {
 		rn, err := dex.NewRenamer(u.file, dex.RenameConfig{
-			Keep:             keep,
-			ExtraKeepClasses: keepClasses,
-			ReflectedNames:   reflected,
-			ObfuscateFields:  true,
-			ClassMap:         classMap,
-			MemberMap:        memberMap,
-			MemberKeep:       memberKeep,
+			Keep:              keep,
+			ExtraKeepClasses:  keepClasses,
+			ReflectedNames:    reflected,
+			ObfuscateFields:   true,
+			RenameResourceIDs: renameResIDs,
+			ClassMap:          classMap,
+			MemberMap:         memberMap,
+			MemberKeep:        memberKeep,
 		})
 		if err != nil {
 			return fmt.Errorf("%s 构造重命名器失败: %w", u.entry.NameString(), err)

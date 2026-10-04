@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"testing"
@@ -189,16 +190,22 @@ func TestValidateRejectsExtractRatio(t *testing.T) {
 	}
 }
 
-// TestManifestPadMBUpperBound 验证 A15 填充量上限收紧到 4095（4096MB 会使 uint32 溢出）。
+// TestManifestPadMBUpperBound 验证 A15 填充量上限收紧到 1024MB。
+//
+// 旧上限 4095 只防 uint32 溢出，防不住 OOM：A15 的峰值内存约为填充量的
+// 3.4 倍（审计按 4095MB 估算 ~4.3GB 输出 + ~3.4GB 巨串 + ~3.4GB 新池）。
 func TestManifestPadMBUpperBound(t *testing.T) {
 	base := func(mb int) *Options {
 		return &Options{Enabled: map[FeatureID]bool{"E1": false}, In: "a.apk", ManifestPadMB: mb}
 	}
-	if err := base(4096).Validate(); err == nil || !strings.Contains(err.Error(), "4095") {
-		t.Fatalf("ManifestPadMB=4096 应被拒绝（uint32 溢出），实际: %v", err)
+	if err := base(1025).Validate(); err == nil || !strings.Contains(err.Error(), "1024") {
+		t.Fatalf("ManifestPadMB=1025 应被拒绝（峰值内存约 3.4×填充量，有 OOM 风险），实际: %v", err)
 	}
-	if err := base(4095).Validate(); err != nil {
-		t.Fatalf("ManifestPadMB=4095 应通过: %v", err)
+	if err := base(1024).Validate(); err != nil {
+		t.Fatalf("ManifestPadMB=1024（新上限）应通过: %v", err)
+	}
+	if err := base(0).Validate(); err != nil {
+		t.Fatalf("ManifestPadMB=0（用默认值）应通过: %v", err)
 	}
 }
 
@@ -265,5 +272,38 @@ func TestValidateC1SignatureDependencyIsConditional(t *testing.T) {
 	o.KS = "k.jks"
 	if err := o.Validate(); err != nil {
 		t.Errorf("启用 E1 并给了密钥库时应放行，实际: %v", err)
+	}
+}
+
+// TestRenameResourceIDsJSONSemantics 钉住 A1 R 类改名开关的 JSON 契约与零值语义。
+//
+// 与 ReturnNops 同一既定模式：Options 零值（JSON/API 未传 rename_resource_ids）
+// 等于关闭，默认开启由 CLI 的 -rename-resource-ids 默认值与 Web UI 复选框的
+// 默认勾选提供。不能在 Options 层把零值强制翻成 true，否则 API 调用方会失去
+// 显式关闭的能力。
+func TestRenameResourceIDsJSONSemantics(t *testing.T) {
+	b, err := json.Marshal(Options{})
+	if err != nil {
+		t.Fatalf("序列化零值 Options 失败: %v", err)
+	}
+	if !strings.Contains(string(b), `"rename_resource_ids":false`) {
+		t.Fatalf("零值应序列化为 rename_resource_ids=false，实际: %s", b)
+	}
+
+	b, err = json.Marshal(Options{RenameResourceIDs: true})
+	if err != nil {
+		t.Fatalf("序列化 Options 失败: %v", err)
+	}
+	if !strings.Contains(string(b), `"rename_resource_ids":true`) {
+		t.Fatalf("true 应序列化为 rename_resource_ids=true，实际: %s", b)
+	}
+
+	// 反序列化：缺键 = 零值 false（与「显式 false」在下游同义，见字段注释）。
+	var o Options
+	if err := json.Unmarshal([]byte(`{"in":"a.apk"}`), &o); err != nil {
+		t.Fatalf("反序列化失败: %v", err)
+	}
+	if o.RenameResourceIDs {
+		t.Fatal("JSON 缺键时不应被强制翻成 true（否则 API 无法显式关闭）")
 	}
 }

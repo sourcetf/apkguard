@@ -35,9 +35,32 @@ const (
 	blockIDV2   = 0x7109871a
 	blockIDV3   = 0xf05368c0
 	blockIDV31  = 0x1b93ad61
-	blockIDPad  = 0x42726577
+	blockIDPad  = 0x42726577 // verity padding（apksig VERITY_PADDING_BLOCK_ID）
 	sigBlockMag = "APK Sig Block 42"
 )
+
+// v2 signed data 的防剥离（anti-stripping）附加属性。
+//
+// apksig 常量：V2SchemeConstants.STRIPPING_PROTECTION_ATTR_ID；值写
+// ApkSigningBlockUtils.VERSION_APK_SIGNATURE_SCHEME_V3（=3），语义是
+// 「本包还必须带一个能通过校验的 v3 签名块」。平台验签 v2 时发现该属性，
+// 但整个 APK 里找不到对应方案的签名块，就会以 V2_SIG_MISSING_APK_SIG_REFERENCED
+// 拒绝，攻击者无法靠删掉 v3 块把包降级回 v2 验签。
+//
+// 注意：apksig 只在同时启用 v3 签名时才写该属性（generateAdditionalAttributes
+// 的 v3SigningEnabled 参数）；只签 v2 时写空属性——否则没有 v3 块可供引用，
+// 合规的验证方会直接判包无效。
+const (
+	strippingProtectionAttrID = 0xbeeff00d
+	schemeVersionV3           = 3
+)
+
+// signingBlockAlign 是签名块与签名块起点的对齐粒度（4 KiB）。
+//
+// 与 apksig ANDROID_COMMON_PAGE_ALIGNMENT_BYTES 一致：数据区尾部补零使签名块
+// 起点落在页边界，块内再用 verity padding 使块长为 4096 的整数倍；于是中央
+// 目录与 EOCD 的偏移也落在页边界，便于 fs-verity（v4）按页校验与增量安装。
+const signingBlockAlign = 1 << 12
 
 // SDK 版本边界。
 const (
@@ -172,10 +195,13 @@ func sigPair(id uint32, value []byte) []byte {
 }
 
 // buildSignerV2 构造一个 v2 signer 结构。
-func buildSignerV2(algo signerAlgo, key crypto.PrivateKey, certsDER [][]byte, contentDigest []byte) ([]byte, error) {
+//
+// v3Enabled 表示本次签名是否同时产出 v3 块：只有在「存在 v3 可供引用」时
+// 才写入防剥离属性（见 strippingProtectionAttrID 的说明）。
+func buildSignerV2(algo signerAlgo, key crypto.PrivateKey, certsDER [][]byte, contentDigest []byte, v3Enabled bool) ([]byte, error) {
 	digests := u32seq(algo.ID, contentDigest)
 	certSeq := seq(certsDER...)
-	signedData := append(append(digests, certSeq...), seq()...) // 第三个元素为空的 additional attributes
+	signedData := append(append(digests, certSeq...), v2AdditionalAttributes(v3Enabled)...)
 
 	digestOfSigned, err := hashBytes(algo.Hash, signedData)
 	if err != nil {
@@ -190,6 +216,26 @@ func buildSignerV2(algo signerAlgo, key crypto.PrivateKey, certsDER [][]byte, co
 		return nil, err
 	}
 	return append(append(lp(signedData), u32seq(algo.ID, sig)...), lp(spki)...), nil
+}
+
+// v2AdditionalAttributes 编码 v2 signed data 的 additional attributes 段。
+//
+// 格式（apksig V2SchemeSigner.generateAdditionalAttributes，均为小端）：
+//
+//	u32 属性元素长度 = 8（ID 4 + 值 4）
+//	u32 属性 ID = 0xbeeff00d
+//	u32 值     = 3（v3 方案号）
+//
+// seq 再为整个属性列表补一层 u32 长度前缀（=12），因此 signed_data 中该段共
+// 16 字节；未启用 v3 时为空序列（外层前缀 0），与 apksig 一致。
+func v2AdditionalAttributes(v3Enabled bool) []byte {
+	if !v3Enabled {
+		return seq()
+	}
+	attr := make([]byte, 8)
+	binary.LittleEndian.PutUint32(attr[0:], strippingProtectionAttrID)
+	binary.LittleEndian.PutUint32(attr[4:], schemeVersionV3)
+	return seq(attr)
 }
 
 // buildSignerV3 构造一个 v3 signer 结构。

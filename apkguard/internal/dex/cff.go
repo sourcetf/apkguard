@@ -45,6 +45,13 @@ type ControlFlow struct {
 	// 「每个方法插很多」。设上限可避免小方法被撑大数倍、增加 dex2oat 与运行时
 	// 校验负担，也避免入口附近的短距 goto 被迫加宽、进而扰动更多指令布局。
 	JunkNops int
+	// ReturnNops 为 true 时，在 JunkFill 之外再启用第二种花指令形态：
+	// **每条 return* 之前插入 1 条 nop**（参考样本形态，全部单发、无连续段）。
+	//
+	// 与入口形态并存但互不依赖：入口形态负责「方法开头有噪音」，本形态
+	// 负责把噪音铺到每个返回点。每条 return 只插 1 条，数量按方法原字长的
+	// 8% 封顶（至少 1），不会出现连续 nop 段，也不改变控制流图。
+	ReturnNops bool
 }
 
 // ControlFlowStats 汇总一次 A6 改写的量化结果与跳过原因分布。
@@ -63,8 +70,10 @@ type ControlFlowStats struct {
 	SkippedRegisters int
 	// FakeJumps 是插入「不可达跳转块」的方法数（无空闲寄存器时的兜底形态）。
 	FakeJumps int
-	// Nops 是 JunkFill 模式下插入的 nop 指令总数（A20）。
+	// Nops 是 JunkFill 模式下插入的 nop 指令总数（A20，含入口与 return 前两种形态）。
 	Nops int
+	// ReturnNops 是其中「return 前单发 nop」形态插入的条数（A20，ReturnNops 开启时）。
+	ReturnNops int
 	// SkippedInit 是因是 <init>/<clinit> 而跳过的方法数。
 	SkippedInit int
 	// SkippedShape 是因方法体过小/过大、结尾非终结指令或含
@@ -677,6 +686,19 @@ func (b *builder) junkFillCodeItem(pl *plan, ci *CodeItemFull, l *InsnList) ([]b
 	st.Nops += nops
 	st.FakeJumps++
 	st.MethodsRewritten++
+
+	// A20 第二种形态：return 前单发 nop（可选）。
+	//
+	// 预算按方法**原**指令流字长的 8% 封顶（至少 1 条）：样本的 3.7~4.0%
+	// 正是「一条 return 一条 nop」的结果，8% 是防止小方法里 return 密集时
+	// 被撑大的上限。预算不扣减入口形态的插入量——入口形态的规模由
+	// JunkNops（硬上限 8）独立控制，两者相加仍远小于被改写方法体的常规规模。
+	if cf.ReturnNops {
+		if n := insertReturnNops(l, returnNopBudget(l.total)); n > 0 {
+			st.ReturnNops += n
+			st.Nops += n
+		}
+	}
 
 	out, m, fresh, eerr := l.EncodeChecked()
 	if eerr != nil {

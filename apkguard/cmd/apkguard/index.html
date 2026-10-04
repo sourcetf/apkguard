@@ -103,7 +103,9 @@
         <label class="row"><span>名称前缀</span><input type="text" id="name_prefix" placeholder="A1 混淆类名前缀"></label>
         <label class="row"><span>压缩包名</span><input type="checkbox" id="package_shrink"></label>
         <label class="row"><span>保留白名单</span><input type="text" id="keep_rules" placeholder="A1 规则文件路径（每行一条）"></label>
+        <label class="row"><span>R 类改名</span><input type="checkbox" id="rename_resource_ids" checked title="A1 把 aapt 生成的资源 ID 类（R/R$Type）与字段一起改名，static_values 中的资源 ID 常量保持原样（对齐参考样本）。默认开启，取消勾选即 -rename-resource-ids=false；应急可用环境变量 APKGUARD_KEEP_RCLASS_IDS=1 强制关闭。"></label>
         <label class="row"><span>最短加密</span><input type="number" id="obf_string_min" value="0" placeholder="0 = 全部（A2）"></label>
+        <label class="row"><span>仅单引用串</span><input type="checkbox" id="obf_string_single_ref" title="A2 只加密恰好被 1 条 const-string 引用的字符串。会降低保护强度：多引用串将留明文，仅为让加密分布更像参考样本，不建议常规使用。"></label>
         <label class="row"><span>垃圾顶文件</span><input type="number" id="junk_top_count" value="800" placeholder="800（A10）"></label>
         <label class="row"><span>垃圾深目录</span><input type="number" id="junk_dir_count" value="400" placeholder="400（A10）"></label>
         <label class="row"><span>深目录层数</span><input type="number" id="junk_dir_depth" value="16" placeholder="16（A10）"></label>
@@ -113,12 +115,13 @@
         <label class="row"><span>ZIP 攻击条数</span><input type="number" id="zip_atk_count" value="150" placeholder="150（A12）"></label>
         <label class="row"><span>类膨胀数</span><input type="number" id="class_pad_count" value="100" placeholder="100（A13）"></label>
         <label class="row"><span>时间戳</span><input type="text" id="stamp_time" placeholder="2024-01-01T00:00:00Z（A14）"></label>
-        <label class="row"><span>Manifest 填充</span><input type="number" id="manifest_pad_mb" value="0" placeholder="0=默认100MB（A15，危险区）"></label>
+        <label class="row"><span>Manifest 填充</span><input type="number" id="manifest_pad_mb" value="0" placeholder="0=默认100MB，上限1024（A15，危险区）"></label>
         <label class="row"><span>诱饵核心组</span><input type="number" id="decoy_core_count" value="0" placeholder="0=默认（A16）"></label>
         <label class="row"><span>诱饵 APK MB</span><input type="number" id="decoy_apk_mb" value="0" placeholder="0=默认（A17）"></label>
         <label class="row"><span>诱饵元数据</span><input type="number" id="decoy_meta_count" value="0" placeholder="0=默认（A18）"></label>
         <label class="row"><span>垃圾字符串</span><input type="number" id="str_junk_count" value="0" placeholder="0=默认（A19）"></label>
         <label class="row"><span>花指令组数</span><input type="number" id="junk_insn_count" value="0" placeholder="0=默认（A20）"></label>
+        <label class="row"><span>return 前 nop</span><input type="checkbox" id="return_nops" checked title="A20 在每条 return 之前插入 1 条 nop（参考样本形态：全部单发、无连续段）。启用 A20 时默认开启，取消勾选即 -return-nops=false。"></label>
       </details>
       <details><summary>加壳 / Native 参数</summary>
         <label class="row"><span>DEX 密钥</span><input type="text" id="dex_key" placeholder="B1 加密密钥（留空自动生成）"></label>
@@ -131,6 +134,7 @@
         <label class="row"><span>排障壳</span><input type="checkbox" id="debug_shell"></label>
         <label class="row"><span>假库名</span><input type="text" id="lib_fake_name" placeholder="libsqlite3x.so（C7）"></label>
         <label class="row"><span>清 ELF 节头</span><input type="checkbox" id="lib_strip_sections"></label>
+        <label class="row"><span>本地头假加密</span><input type="checkbox" id="zip_local_decoy" title="仅对 AndroidManifest.xml/classes*.dex/resources.arsc 在本地头写 bit0+bit6，中央目录不变。参考样本同款手法（样本在 Android 16 实测可安装），但本工具产物尚未真机验证，默认关闭。"></label>
       </details>
     </div>
     <div class="card">
@@ -227,7 +231,9 @@ function collect() {
     name_prefix: val('name_prefix'),
     package_shrink: checked('package_shrink'),
     keep_rules: val('keep_rules'),
+    rename_resource_ids: checked('rename_resource_ids'),
     obf_string_min: num('obf_string_min', 0),
+    obf_string_single_ref: checked('obf_string_single_ref'),
     seed: val('seed'),
     fake_dex_count: num('fake_dex_count', 1),
     fake_dex_size: num('fake_dex_size', 80000),
@@ -244,8 +250,10 @@ function collect() {
     decoy_meta_count: num('decoy_meta_count', 0),
     str_junk_count: num('str_junk_count', 0),
     junk_insn_count: num('junk_insn_count', 0),
+    return_nops: checked('return_nops'),
     lib_fake_name: val('lib_fake_name'),
     lib_strip_sections: checked('lib_strip_sections'),
+    zip_local_decoy: checked('zip_local_decoy'),
     dex_key: val('dex_key'),
     decoy_pkg: val('decoy_pkg'),
     payload_mac: checked('payload_mac'),

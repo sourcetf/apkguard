@@ -63,6 +63,13 @@ func (DefaultSink) Finish(ctx context.Context, art *Artifact, opts *config.Optio
 	} else {
 		alignOpts = zipx.AlignOptions{Align: 1, SoAlign: 1}
 	}
+	// 本地头假加密 flag 必须随对齐参数一起传给 zipx：它同时会经
+	// sign.Options.Align 流入 v1 签名阶段的重写，逐条目字段在那次
+	// 「读中央目录后重写」中会丢失，只有写在选项里的策略能保留到最终产物。
+	if opts.ZipLocalFlagDecoy {
+		alignOpts.LocalFlagDecoy = true
+		art.Note("本地头假加密 flag：AndroidManifest.xml/classes*.dex/resources.arsc 的本地头写入 bit0+bit6（中央目录不变；读本地头的工具会索要口令）")
+	}
 	raw, err := zipx.WriteChecked(art.Archive, alignOpts)
 	if err != nil {
 		return nil, fmt.Errorf("重写归档失败: %w", err)

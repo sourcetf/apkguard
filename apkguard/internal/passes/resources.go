@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"sort"
 	"strings"
 
 	"apkguard/internal/arsc"
 	"apkguard/internal/config"
+	"apkguard/internal/dex"
 	"apkguard/internal/pipeline"
 	"apkguard/internal/zipx"
 )
@@ -29,8 +31,13 @@ import (
 //
 // 已知代价（与设计文档一致）：
 //   - 依赖 `getIdentifier("icon","drawable",pkg)` 这类**按名字**查资源的代码会失效；
-//     本实现不动 arsc 内部的 keyStrings（资源条目名），因此按名字查仍然可用，
-//     失效的只是「按路径拼字符串」这种少见写法；
+//     为此条目名（keyStrings）随机化会把「原始输入 APK 或当前产物中任何 DEX
+//     字符串池里出现过的名字」全部保留原名（见 collectDexStrings）。
+//     之所以必须扫原始输入：A1（改 R 类字段名）与 A2（字符串加密，默认启用）
+//     排在 A5/A11 之前，会把按名查表的字面量从产物 DEX 池里抹掉——只扫产物时
+//     实测 testapp 全默认组合下 A11.keysdex=0、sample 保留数从 12 掉到 10。
+//     输入 APK 不可读时退化为只扫产物，并在报告中如实说明保留集可能偏小。
+//     运行时按规则拼出来的名字仍然看不到（无法静态覆盖的固有残余风险）；
 //   - 依赖资源名的第三方 SDK 与热修复框架可能受影响，因此默认关闭。
 type resourceObf struct{}
 
@@ -70,6 +77,9 @@ func (f *resourceFlatten) Run(_ context.Context, art *pipeline.Artifact, opts *c
 }
 
 // renameResources 执行资源改名；flatten 为 true 时同时压平目录。
+//
+// 除路径改名外，本函数还执行 A5/A11 的子行为「条目名（keyStrings）随机化」，
+// 两者共用同一个 resources.arsc 解析结果与一次写回。
 func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool, tag string) error {
 	entry := pipeline.Find(art, arscName)
 	if entry == nil {
@@ -84,29 +94,29 @@ func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool,
 		return fmt.Errorf("解析 %s 失败: %w", arscName, err)
 	}
 	paths := tbl.ResPaths()
-	if len(paths) == 0 {
-		art.Note("%s 资源混淆：%s 中没有 res/ 路径，跳过", tag, arscName)
-		return nil
-	}
 
-	// 既有条目名集合：新名字绝不能与任何现存条目（含 assets/、lib/ 等）冲突。
-	used := map[string]bool{}
-	for _, e := range art.Entries() {
-		used[e.NameString()] = true
-	}
-	// 映射的生成必须与顺序无关：先排序再生成，保证同一输入产出可复现。
-	sort.Strings(paths)
+	// 1) 生成 res/ 路径 → 新路径映射。没有路径时不改路径，但 keyStrings
+	//    随机化照常执行（它是独立子行为）。
 	mapping := map[string]string{}
-	for _, p := range paths {
-		n := newResPath(p, flatten, opts.Seed)
-		for used[n] || mappingConflicts(mapping, n) {
-			n = newResPath(p+"#", flatten, opts.Seed)
+	if len(paths) > 0 {
+		// 既有条目名集合：新名字绝不能与任何现存条目（含 assets/、lib/ 等）冲突。
+		used := map[string]bool{}
+		for _, e := range art.Entries() {
+			used[e.NameString()] = true
 		}
-		mapping[p] = n
-		used[n] = true
+		// 映射的生成必须与顺序无关：先排序再生成，保证同一输入产出可复现。
+		sort.Strings(paths)
+		for _, p := range paths {
+			n := newResPath(p, flatten, opts.Seed)
+			for used[n] || mappingConflicts(mapping, n) {
+				n = newResPath(p+"#", flatten, opts.Seed)
+			}
+			mapping[p] = n
+			used[n] = true
+		}
 	}
 
-	// 1) 改写 ARSC 里的路径字符串。
+	// 2) 改写 ARSC 里的路径字符串，再随机化条目名（keyStrings）。
 	changed := 0
 	for old, nw := range mapping {
 		changed += tbl.Replace(old, nw)
@@ -114,6 +124,10 @@ func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool,
 	out, err := tbl.Encode()
 	if err != nil {
 		return fmt.Errorf("重写 %s 失败: %w", arscName, err)
+	}
+	out, err = randomizeArscKeys(art, opts, out, tag)
+	if err != nil {
+		return err
 	}
 	// 压缩方式必须保持原样，**不能**强制压缩：
 	// Android 11+（targetSdk ≥ 30）要求 resources.arsc 以未压缩方式存放，
@@ -125,7 +139,7 @@ func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool,
 		return fmt.Errorf("写回 %s 失败: %w", arscName, err)
 	}
 
-	// 2) 同步改名 ZIP 条目。
+	// 3) 同步改名 ZIP 条目。
 	renamed := 0
 	for _, e := range art.Entries() {
 		n := e.NameString()
@@ -149,20 +163,191 @@ func renameResources(art *pipeline.Artifact, opts *config.Options, flatten bool,
 		}
 	}
 
-	mode := "重命名"
-	if flatten {
-		mode = "全量扁平化"
+	if len(paths) == 0 {
+		art.Note("%s 资源混淆：%s 中没有 res/ 路径，跳过路径改名（条目名随机化单独执行）", tag, arscName)
+	} else {
+		mode := "重命名"
+		if flatten {
+			mode = "全量扁平化"
+		}
+		if renamed != len(mapping) {
+			art.Note("%s 提示：ARSC 中有 %d 条 res/ 路径，实际改名的条目为 %d 条（其余路径在 APK 中没有对应文件）",
+				tag, len(mapping), renamed)
+		}
+		art.Note("%s 资源路径%s：改写 %d 条路径（ARSC 中替换 %d 处），同步改名 %d 个条目；另有 %d 个 res/ 条目不被 ARSC 引用，按原样保留",
+			tag, mode, len(mapping), changed, renamed, untouched)
 	}
-	if renamed != len(mapping) {
-		art.Note("%s 提示：ARSC 中有 %d 条 res/ 路径，实际改名的条目为 %d 条（其余路径在 APK 中没有对应文件）",
-			tag, len(mapping), renamed)
-	}
-	art.Note("%s 资源路径%s：改写 %d 条路径（ARSC 中替换 %d 处），同步改名 %d 个条目；另有 %d 个 res/ 条目不被 ARSC 引用，按原样保留",
-		tag, mode, len(mapping), changed, renamed, untouched)
 	art.Stat(tag+".paths", fmt.Sprint(len(mapping)))
 	art.Stat(tag+".entries", fmt.Sprint(renamed))
 	art.Stat(tag+".untouched", fmt.Sprint(untouched))
 	return nil
+}
+
+// arscKeysDoneKey 标记本产物已完成 keyStrings 随机化。
+//
+// A5 与 A11 是同一机制的两种强度，可能先后被调用（例如流水线把两者都启用，
+// 或调用方手工各跑一次）；标记存于 Artifact.Shared，保证条目名只随机化一次。
+const arscKeysDoneKey = "A5.keysdone"
+
+// randomizeArscKeys 执行资源条目名（keyStrings）随机化——A5/A11 的子行为，
+// 默认开启，无需单独开关（随 A5/A11 一起启用/关闭）。
+//
+// 保留集合来自两处只读扫描（取并集，见 collectDexStrings）：
+//   - **原始输入 APK**（opts.In，未经任何 Pass 改写）的全部 DEX 字符串池，
+//     这是主来源，A1/A2 的改写抹不掉它；
+//   - 当前产物中可解析 DEX 的池，作为兜底（输入缺失/不可读时退化，并可覆盖
+//     输入之后新产生的字符串）。
+//
+// B1 加密 DEX 的 Pass 排在 A5/A11 之后，因此产物侧通常能读到明文；读不到的
+// 条目（伪装 DEX、已加密载荷）自然拿不到字符串，其引用无法被保护——这是
+// 必须如实说明的残余风险。
+func randomizeArscKeys(art *pipeline.Artifact, opts *config.Options, data []byte, tag string) ([]byte, error) {
+	if done, _ := art.Get(arscKeysDoneKey).(bool); done {
+		art.Note("%s 资源条目名：本产物已执行过 keyStrings 随机化，跳过（幂等）", tag)
+		return data, nil
+	}
+	keep := collectDexStrings(art, opts)
+	out, st, err := arsc.RandomizeKeys(data, arsc.KeyRenameOptions{
+		Seed: opts.Seed + "/arsckeys",
+		Keep: keep.set,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("随机化 %s 的 keyStrings 失败: %w", arscName, err)
+	}
+	art.Put(arscKeysDoneKey, true)
+	if keep.inErr != nil {
+		art.Note("%s 资源条目名：输入 APK 不可读（%v），退化为仅扫描运行时产物 DEX，保留集可能偏小", tag, keep.inErr)
+	}
+	art.Note("%s 资源条目名随机化：keyStrings 改写 %d 条 / 保留 %d 条（DEX 引用 %d 条、库名/点分等 %d 条；%d 个包，其中 %d 条带 vx_*_ 类型前缀）；保留集来源 = 输入 APK %d 条 + 运行时产物 %d 条（并集 %d 条）",
+		tag, st.Renamed, st.Kept, st.KeptDex, st.KeptShape, st.Packages, st.Prefixed,
+		keep.fromIn, keep.fromArt, len(keep.set))
+	art.Stat(tag+".keys", fmt.Sprint(st.Renamed))
+	art.Stat(tag+".keyskept", fmt.Sprint(st.Kept))
+	// keysdex 报告保留集的来源构成「输入N+运行时M」（N+M 即去重后的保留集大小）；
+	// keysdexhit 保留旧口径：命中保留集而未被改名的 ARSC 条目数。
+	art.Stat(tag+".keysdex", fmt.Sprintf("%d+%d", keep.fromIn, keep.fromArt))
+	art.Stat(tag+".keysdexhit", fmt.Sprint(st.KeptDex))
+	art.Stat(tag+".keysprefixed", fmt.Sprint(st.Prefixed))
+	return out, nil
+}
+
+// dexKeepSources 是保留集合的两个来源及其计数。
+//
+// 计数口径：先把输入 APK 的字符串并入集合（fromIn = 输入池大小），再并入
+// 产物字符串（fromArt = 产物新增、输入中不存在的条数）。因此 fromIn+fromArt
+// 恰好等于去重后的保留集大小，不会把两边都出现的名字重复计数。
+type dexKeepSources struct {
+	set     map[string]bool
+	fromIn  int
+	fromArt int
+	// inErr 非 nil 表示输入 APK 不可读/解析失败，已退化为只扫产物。
+	inErr error
+}
+
+// collectDexStrings 收集 keyStrings 保留集合：原始输入 APK ∪ 当前产物。
+//
+// 顺序固定为「先输入、后产物」，保证同一输入下统计口径可复现。
+func collectDexStrings(art *pipeline.Artifact, opts *config.Options) dexKeepSources {
+	src := dexKeepSources{set: map[string]bool{}}
+	if in, err := inputDexStrings(opts.In); err != nil {
+		src.inErr = err
+	} else {
+		src.fromIn = addStrings(src.set, in)
+	}
+	src.fromArt = addArtifactDexStrings(src.set, art)
+	return src
+}
+
+// addStrings 把 strs 并入 dst，返回新增（原先不存在）的条数。
+func addStrings(dst map[string]bool, strs map[string]bool) int {
+	n := 0
+	for s := range strs {
+		if !dst[s] {
+			dst[s] = true
+			n++
+		}
+	}
+	return n
+}
+
+// inputDexStrings 只读扫描**原始输入 APK**（opts.In）中全部 DEX 的字符串池。
+//
+// 这是保留集的主来源：执行到这里时，产物 DEX 里的
+// `Resources.getIdentifier("app_name", ...)` 一类字面量已被排在前面的
+// A1/A2 改名或加密，只有输入文件仍保有原始池。
+//
+// 任何不可读/不可解析的情况都返回错误而不中断：调用方据此退化为只扫产物，
+// 并写入 art.Note 说明保留集可能偏小。
+func inputDexStrings(path string) (map[string]bool, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("未提供输入 APK 路径")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	a, err := zipx.Read(data)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	parsed := 0
+	for _, e := range a.Entries {
+		if !isDexEntry(e) {
+			continue
+		}
+		raw, err := e.Data()
+		if err != nil {
+			continue
+		}
+		f, err := dex.Parse(raw)
+		if err != nil {
+			continue
+		}
+		strs, err := f.AllStrings()
+		if err != nil {
+			continue
+		}
+		parsed++
+		for _, s := range strs {
+			out[s] = true
+		}
+	}
+	if parsed == 0 {
+		return nil, fmt.Errorf("输入 APK 中没有可解析的 DEX")
+	}
+	return out, nil
+}
+
+// addArtifactDexStrings 把当前产物中全部可解析 DEX 的字符串池并入 dst，
+// 返回新增条数。解析失败（伪装 DEX、加密载荷、损坏文件）时跳过该条目，
+// 不阻断资源混淆。
+func addArtifactDexStrings(dst map[string]bool, art *pipeline.Artifact) int {
+	n := 0
+	for _, e := range art.Entries() {
+		if !isDexEntry(e) {
+			continue
+		}
+		data, err := e.Data()
+		if err != nil {
+			continue
+		}
+		f, err := dex.Parse(data)
+		if err != nil {
+			continue
+		}
+		strs, err := f.AllStrings()
+		if err != nil {
+			continue
+		}
+		for _, s := range strs {
+			if !dst[s] {
+				dst[s] = true
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // mappingConflicts 判断新路径是否已被本次映射占用。
@@ -259,6 +444,3 @@ func resZipEntryNames(art *pipeline.Artifact) []string {
 	sort.Strings(out)
 	return out
 }
-
-// 保证 zipx 仍被引用（本文件在部分构建组合下可能只用到其类型）。
-var _ = zipx.NewStored

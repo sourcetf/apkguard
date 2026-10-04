@@ -1,3 +1,30 @@
+// 本文件负责把 v2/v3 signer 组装成完整签名块。以下两个细节与 apksig
+// （Android build-tools 的 apksigner）逐字节对齐，缺失会在平台上留下指纹：
+//
+// 1) v2 的防剥离属性（anti-stripping，apksig V2SchemeConstants.
+//    STRIPPING_PROTECTION_ATTR_ID = 0xBEEFF00D）：写在 v2 signer 的
+//    signed_data.additional_attributes 里，值为 4 字节小端 3
+//    （ApkSigningBlockUtils.VERSION_APK_SIGNATURE_SCHEME_V3）。语义是
+//    「本包还必须带一个有效的 v3 签名块」：平台验 v2 时读到该属性却找不到
+//    v3 块，会以 V2_SIG_MISSING_APK_SIG_REFERENCED 拒绝，攻击者无法删掉
+//    v3 块把包降级到 v2 验签。apksig 仅在同时启用 v3 时写它；只签 v2 时
+//    additional_attributes 为空（否则引用一个不存在的方案反而是坏包）。
+//
+// 2) 4 KiB 对齐与 verity padding（apksig generateApkSigningBlockPadding +
+//    generateApkSigningBlock）：
+//      - 数据区尾部补零，使签名块起点落在 4096 边界。补的零属于内容摘要
+//        覆盖范围（v2 规范的第 1 段「ZIP 条目内容」），摘要与产物一致；
+//      - 签名块内追加一个 ID 0x42726577（apksig VERITY_PADDING_BLOCK_ID）、
+//        值全零的 verity padding ID-value 对，使「首尾两个 u64 长度字段 +
+//        magic + 各 ID-value 对」的总长为 4096 的整数倍（不足 12 字节即一个
+//        ID-value 对的最小尺寸时，补到下一个 4096 倍数）；
+//      - 于是中央目录与 EOCD 的偏移也落在 4096 边界，v4/fs-verity 可按页
+//        校验，增量安装不必重排。
+//
+// 内容摘要计算不受影响的要点：摘要覆盖「数据区（含补零）+ 中央目录 + EOCD」，
+// 签名块本身被排除；EOCD 参与摘要时其「中央目录偏移」字段写签名块起点
+// （即补零后的数据区长度），写出时才改回真实 CD 位置。
+
 package sign
 
 import (
@@ -102,25 +129,30 @@ func Sign(apk []byte, mat *keystore.Material, opts Options) (*Result, error) {
 			return nil, fmt.Errorf("sign: 切分归档失败: %w", err)
 		}
 
+		// 先把数据区补零到 4096 边界，使签名块起点与页对齐（apksig
+		// generateApkSigningBlockPadding）。补零位于数据区之后、签名块之前，
+		// 因此计入内容摘要的第 1 段。
+		beforeBlock := padToAlign(sec.BeforeBlock, signingBlockAlign)
+
 		certsDER := make([][]byte, 0, len(mat.CertChain))
 		for _, c := range mat.CertChain {
 			certsDER = append(certsDER, c.Raw)
 		}
 
-		// 内容摘要覆盖三段：条目数据区、中央目录、EOCD。
+		// 内容摘要覆盖三段：条目数据区（含对齐补零）、中央目录、EOCD。
 		// 依据规范，摘要计算时 EOCD 的「中央目录偏移」字段应取「真实中央目录位置」
-		// 在插入签名块之前的原值，即签名块起点。
+		// 在插入签名块之前的原值，即签名块起点（补零后的数据区长度）。
 		eocd := make([]byte, len(sec.EOCD))
 		copy(eocd, sec.EOCD)
-		binary.LittleEndian.PutUint32(eocd[16:], uint32(len(sec.BeforeBlock)))
+		binary.LittleEndian.PutUint32(eocd[16:], uint32(len(beforeBlock)))
 
-		contentDigest = chunkedDigest([][]byte{sec.BeforeBlock, sec.CentralDir, eocd})
+		contentDigest = chunkedDigest([][]byte{beforeBlock, sec.CentralDir, eocd})
 
 		var body []byte
 		var schemes []string
 
 		if opts.V2 {
-			signer, err := buildSignerV2(algo, mat.PrivateKey, certsDER, contentDigest)
+			signer, err := buildSignerV2(algo, mat.PrivateKey, certsDER, contentDigest, opts.V3)
 			if err != nil {
 				return nil, err
 			}
@@ -141,10 +173,10 @@ func Sign(apk []byte, mat *keystore.Material, opts Options) (*Result, error) {
 		// 写出时 EOCD 的「中央目录偏移」指向签名块之后的真实中央目录位置。
 		outEOCD := make([]byte, len(sec.EOCD))
 		copy(outEOCD, sec.EOCD)
-		binary.LittleEndian.PutUint32(outEOCD[16:], uint32(len(sec.BeforeBlock)+len(block)))
+		binary.LittleEndian.PutUint32(outEOCD[16:], uint32(len(beforeBlock)+len(block)))
 
-		out := make([]byte, 0, len(sec.BeforeBlock)+len(block)+len(sec.CentralDir)+len(outEOCD))
-		out = append(out, sec.BeforeBlock...)
+		out := make([]byte, 0, len(beforeBlock)+len(block)+len(sec.CentralDir)+len(outEOCD))
+		out = append(out, beforeBlock...)
 		out = append(out, block...)
 		out = append(out, sec.CentralDir...)
 		out = append(out, outEOCD...)
@@ -177,7 +209,20 @@ func Sign(apk []byte, mat *keystore.Material, opts Options) (*Result, error) {
 //
 // 布局：uint64(块长) | 各 ID-value 对 | uint64(块长) | "APK Sig Block 42"
 // 其中块长字段的值等于「各 ID-value 对长度 + 8 + 16」，两侧一致。
+//
+// apksig 的 generateApkSigningBlock 还会在末尾追加一个 verity padding 对
+// （ID 0x42726577、值全零），使整块长度为 4096 的整数倍；不足一个
+// ID-value 对的最小尺寸（12 字节）时补到下一个 4096 倍数。这里照做。
 func assembleBlock(body []byte) []byte {
+	if rem := (len(body) + 8 + 8 + len(sigBlockMag)) % signingBlockAlign; rem != 0 {
+		pad := signingBlockAlign - rem
+		const minPair = 8 + 4 // u64 长度 + u32 ID
+		if pad < minPair {
+			pad += signingBlockAlign
+		}
+		body = append(body, sigPair(blockIDPad, make([]byte, pad-minPair))...)
+	}
+
 	blockLen := uint64(len(body) + 8 + len(sigBlockMag))
 	out := make([]byte, 0, 8+len(body)+8+len(sigBlockMag))
 	var hdr [8]byte
@@ -187,6 +232,19 @@ func assembleBlock(body []byte) []byte {
 	binary.LittleEndian.PutUint64(hdr[:], blockLen)
 	out = append(out, hdr[:]...)
 	out = append(out, sigBlockMag...)
+	return out
+}
+
+// padToAlign 在 b 末尾补零，使长度成为 align 的整数倍。
+//
+// 已对齐时原样返回，不产生拷贝。
+func padToAlign(b []byte, align int) []byte {
+	if align <= 1 || len(b)%align == 0 {
+		return b
+	}
+	pad := align - len(b)%align
+	out := make([]byte, len(b)+pad)
+	copy(out, b)
 	return out
 }
 

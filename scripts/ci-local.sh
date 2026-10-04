@@ -108,11 +108,11 @@ printf 'x' > /tmp/ag-fake.apk
 #
 # 断言必须匹配**错误文案**而不是功能项 ID：`-enable A7` 的输出里
 # 「启用功能项: …A7…」这一行也含 A7，只匹配 ID 会让「根本没校验」也算通过
-# （旧版对 A6 就是一条这样的空断言）。A7 是确定未实现的项（见 config 注册表）。
-out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable A7 2>&1 || true)"
+# （旧版对 A6 就是一条这样的空断言）。B6（VMP）是确定未实现的项（见 config 注册表）。
+out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable B6 2>&1 || true)"
 case "$out" in
-  *尚未实现*A7*) ok "未实现的功能项被正确拒绝" ;;
-  *)             bad "启用未实现的 A7 没有按要求报错" ;;
+  *尚未实现*B6*) ok "未实现的功能项被正确拒绝" ;;
+  *)             bad "启用未实现的 B6 没有按要求报错" ;;
 esac
 out="$("$LOCAL_BIN" -in /tmp/ag-fake.apk -enable E1 2>&1 || true)"
 case "$out" in

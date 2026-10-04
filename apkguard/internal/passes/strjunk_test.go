@@ -390,3 +390,75 @@ func TestNopFillPass(t *testing.T) {
 		art.Stats["A20.methods"], art.Stats["A20.nops"],
 		art.Stats["A20.fake_jumps"], art.Stats["A20.skipped"])
 }
+
+// TestNopFillReturnNopsOption 验证 A20 的 ReturnNops 选项在 Pass 层真的接线：
+// 开启后每条 return 前有 nop 且统计 >0；未开启时统计为 0（零回归）。
+func TestNopFillReturnNopsOption(t *testing.T) {
+	orig := strJunkFixture(t)
+	run := func(returnNops bool) (*pipeline.Artifact, []byte) {
+		t.Helper()
+		art := newArtifact(zipx.NewStored("classes.dex", orig))
+		p := &nopFill{}
+		if err := p.Run(context.Background(), art, &config.Options{Seed: "np-2", ReturnNops: returnNops}); err != nil {
+			t.Fatalf("A20 执行失败: %v", err)
+		}
+		out, err := pipeline.Find(art, "classes.dex").Data()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := dex.Verify(out); err != nil {
+			t.Fatalf("A20 产物校验失败: %v", err)
+		}
+		return art, out
+	}
+
+	artOn, outOn := run(true)
+	if artOn.Stats["A20.return_nops"] == "" || artOn.Stats["A20.return_nops"] == "0" {
+		t.Fatalf("开启 ReturnNops 后 A20.return_nops 应 >0，实际 %v", artOn.Stats)
+	}
+	artOff, _ := run(false)
+	if artOff.Stats["A20.return_nops"] != "0" {
+		t.Fatalf("未开启 ReturnNops 时 A20.return_nops 应为 0，实际 %s", artOff.Stats["A20.return_nops"])
+	}
+
+	f, err := dex.Parse(outOn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	covered, returns := 0, 0
+	if err := f.AllMethods(func(_, desc string, m dex.EncodedMethod) error {
+		if m.CodeOff == 0 {
+			return nil
+		}
+		ci, err := f.ParseCodeItem(m.CodeOff)
+		if err != nil {
+			return nil
+		}
+		l, err := dex.ParseInsns(ci.Insns)
+		if err != nil {
+			return nil
+		}
+		for i := 0; i < l.ItemCount(); i++ {
+			if !l.ItemIsInsn(i) {
+				continue
+			}
+			op := byte(l.ItemWords(i)[0] & 0xff)
+			if op < 0x0e || op > 0x11 {
+				continue
+			}
+			returns++
+			if i > 0 && l.ItemIsInsn(i-1) && byte(l.ItemWords(i - 1)[0]&0xff) == 0x00 {
+				covered++
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if returns == 0 {
+		t.Fatalf("fixture 中没有 return，测试样本失效")
+	}
+	if covered != returns {
+		t.Fatalf("%d 条 return 中只有 %d 条前面有 nop（预算足够时应全覆盖）", returns, covered)
+	}
+}

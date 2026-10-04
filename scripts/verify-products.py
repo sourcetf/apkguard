@@ -23,15 +23,13 @@ import zipfile
 # 与 internal/passes/shell.go 的 ChannelAssetName 保持一致。
 CHANNEL_ASSET = "assets/apkguard_channel.txt"
 
-# 与 internal/dex/decoy.go 的 DecoyClassNames 保持一致（取前若干个即可判定）。
-# 与 internal/dex/decoy.go 的 DecoyClassNames 保持一致（漏项会让断言形同虚设）。
-DECOY_NAMES = [
-    "SecurityMonitor", "IntegrityChecker", "ThreatDetector",
-    "RootGuard", "EnvironmentProbe", "LicenseValidator",
-    "NativeBridge", "CryptoProvider", "SignatureVerifier",
-    "DebugWatcher", "MemoryShield", "ProcessInspector",
-    "AntiTamper", "PolicyEngine", "AuditTrail",
-    "TrustAnchor", "KeyCustodian", "SealVerifier",
+# A8 的诱饵类名已改为由 seed 派生（主题包 + 三个名族），不再有固定类名清单；
+# 这里保留的是族内名词词表（与 internal/passes/passes.go 的 decoyNouns 对齐），
+# 用于「类名是否像诱饵」的结构化判定：简单名 = 名族前缀 + 词表名词（如 CoreAtlas）。
+DECOY_NOUNS = [
+    "Atlas", "Forge", "Hatch", "Orbit", "Ridge", "Spire",
+    "Beacon", "Courier", "Drift", "Echo", "Flux", "Gauge",
+    "Annex", "Basin", "Creek", "Dune", "Field", "Lattice",
 ]
 
 # 与 internal/dex/shell.go 的壳类名保持一致。
@@ -340,12 +338,103 @@ def manifest_component_of(raw, needle):
     return None
 
 
+def _axml_pool_strings(raw):
+    """读 AXML 字符串池，返回 [文本]（按池索引）。
+
+    与 manifest_component_of 内的 pool_strings 同实现；A8 的类名由 seed 派生、
+    无法预先枚举，按结构识别组件时需要自己枚举 start element 与属性名。
+    """
+    if len(raw) < 12:
+        return []
+    off = 8  # 跳过根块头
+    while off + 8 <= len(raw):
+        typ = int.from_bytes(raw[off:off + 2], "little")
+        size = int.from_bytes(raw[off + 4:off + 8], "little")
+        if size < 8 or off + size > len(raw):
+            return []
+        if typ == 0x0001:  # RES_STRING_POOL_TYPE
+            count = int.from_bytes(raw[off + 8:off + 12], "little")
+            flags = int.from_bytes(raw[off + 16:off + 20], "little")
+            sstart = int.from_bytes(raw[off + 20:off + 24], "little")
+            utf8 = bool(flags & 0x100)
+            base = off + sstart
+            out, p = [], base
+            for _ in range(count):
+                if utf8:
+                    # UTF-8 池：字符数（变长） + 字节数（变长） + 数据 + NUL
+                    def _u8len(q):
+                        b = raw[q]
+                        if b & 0x80:
+                            return ((b & 0x7F) << 8) | raw[q + 1], q + 2
+                        return b, q + 1
+                    _, p2 = _u8len(p)
+                    blen, p3 = _u8len(p2)
+                    out.append(raw[p3:p3 + blen].decode("utf-8", "replace"))
+                    p = p3 + blen + 1
+                else:
+                    # UTF-16 池：码元数（变长） + 数据 + NUL
+                    n = int.from_bytes(raw[p:p + 2], "little")
+                    if n & 0x8000:
+                        n = int.from_bytes(raw[p + 2:p + 4], "little")
+                        p += 4
+                    else:
+                        p += 2
+                    out.append(raw[p:p + n * 2].decode("utf-16-le", "replace"))
+                    p += n * 2 + 2
+            return out
+        off += size
+    return []
+
+
+def _manifest_components(raw):
+    """返回 Manifest 里全部 (元素名, android:name 文本) 对（仅字符串型属性）。"""
+    pool = _axml_pool_strings(raw)
+    if not pool:
+        return []
+    out = []
+    off = 8
+    while off + 8 <= len(raw):
+        typ = int.from_bytes(raw[off:off + 2], "little")
+        size = int.from_bytes(raw[off + 4:off + 8], "little")
+        if size < 8 or off + size > len(raw):
+            break
+        if typ == 0x0102 and off + 36 <= len(raw):  # RES_XML_START_ELEMENT_TYPE
+            name_idx = int.from_bytes(raw[off + 20:off + 24], "little")
+            attr_start = int.from_bytes(raw[off + 24:off + 26], "little")
+            attr_size = int.from_bytes(raw[off + 26:off + 28], "little")
+            attr_count = int.from_bytes(raw[off + 28:off + 30], "little")
+            elem = pool[name_idx] if name_idx < len(pool) else None
+            p = off + 16 + attr_start
+            for _ in range(attr_count):
+                if p + attr_size > off + size:
+                    break
+                attr_name_idx = int.from_bytes(raw[p + 4:p + 8], "little")
+                data_idx = int.from_bytes(raw[p + 16:p + 20], "little")
+                dtype = raw[p + 15]
+                if (dtype == 0x03 and attr_name_idx < len(pool) and pool[attr_name_idx] == "name"
+                        and data_idx < len(pool)):
+                    out.append((elem, pool[data_idx]))
+                p += attr_size
+        off += size
+    return out
+
+
+def _decoy_like_class(cls):
+    """A8 诱饵类的简单名 = 名族前缀 + 词表名词（如 CoreAtlas / SignalBeacon）。"""
+    if "." not in cls:
+        return False
+    simple = cls.rsplit(".", 1)[-1]
+    return any(simple.endswith(n) and simple != n for n in DECOY_NOUNS)
+
+
+def _decoy_components(raw):
+    """返回 Manifest 里所有「像 A8 诱饵」的 (元素名, 类名) 对。"""
+    return [(kind, cls) for kind, cls in _manifest_components(raw) if _decoy_like_class(cls)]
+
+
 def _decoy_is_provider(raw):
     """是否有诱饵类被声明成 <provider>（会在应用启动时被实例化）。"""
-    for n in DECOY_NAMES:
-        if manifest_component_of(raw, "com.apkguard.shell." + n) == "provider":
-            return True
-    return False
+    return any(kind == "provider" for kind, _ in _decoy_components(raw))
 
 
 class Checker:
@@ -395,19 +484,36 @@ class Checker:
                        "resources.arsc 是压缩存放（compress_type=%d）——Android 11+ 会拒绝安装该 APK"
                        % info.compress_type)
 
-        # ---- A14 元数据统一化：产物只允许存在一个时间戳 ----
+        # ---- A14 元数据统一化：产物最多允许三组时间戳 ----
         #
         # 签名阶段会新增 MANIFEST.MF / CERT.SF / CERT.RSA 三个条目，它们晚于
         # A14。若它们退回 ZIP 的 1980 默认值，产物里就出现「唯独签名文件是
         # 1980」这一枚独有的重打包指纹——恰好与 A14 消除痕迹的目的相反。
         # 这条断言曾经抓到一次真实回归（3 个签名条目全是 1980）。
+        #
+        # A14 现在按注入阶段派生三组时间戳：基准 / +32s / +44s（对齐参考样本的
+        # 22:01:08 / 22:01:40 / 22:01:52）。启用 A10/A12 等注入类功能时最多出现
+        # 3 个；只有原始条目时退化为 1 个（全部条目同一秒本身就是重打包指纹）。
         if self.want("A14"):
             stamps = {}
             for info in zf.infolist():
                 stamps.setdefault(info.date_time, []).append(info.filename)
-            self.check(len(stamps) == 1, "A14",
-                       "产物出现 %d 个不同时间戳（A14 要求统一为 1 个）：%s"
+            self.check(len(stamps) <= 3, "A14",
+                       "产物出现 %d 个不同时间戳（A14 最多派生 3 个：基准/+32s/+44s）：%s"
                        % (len(stamps), {k: v[:4] for k, v in stamps.items()}))
+
+            def _dos_secs(t):
+                return ((((t[0] * 12 + t[1] - 1) * 31 + t[2] - 1) * 24 + t[3]) * 3600
+                        + t[4] * 60 + t[5])
+
+            keys = sorted(stamps)
+            if keys:
+                base = _dos_secs(keys[0])
+                for k in keys[1:]:
+                    delta = (_dos_secs(k) - base) % 86400
+                    self.check(delta in (32, 44), "A14",
+                               "时间戳 %s 与最早时间戳 %s 相差 %d 秒，不在 A14 的 +32s/+44s 派生内"
+                               % (k, keys[0], delta))
             for k, names in stamps.items():
                 if k[0] == 1980:
                     self.check(False, "A14",
@@ -472,8 +578,15 @@ class Checker:
                        "res/layout/main.xml 未被改名（资源混淆没生效）")
             self.check(bool(res_entries), "A5", "res/ 条目全部消失了")
         if self.want("A11"):
+            # A10 的「真资源路径变体」垃圾族（对齐样本）故意用 aapt2 源文件名当
+            # 目录前缀（res/values/integers.xml//\///.xml 这类畸形路径）；它们是
+            # 注入的诱饵、不是真实资源，判据必须先排除含 \ 或 // 的畸形名，
+            # 否则 A10 与 A11 会互相误报。
+            def _clean_res(n):
+                return "\\" not in n and "//" not in n
             semantic = [n for n in res_entries
-                        if len(n.split("/")) >= 3 and len(n.split("/")[1]) != 1]
+                        if _clean_res(n) and len(n.split("/")) >= 3
+                        and len(n.split("/")[1]) != 1]
             self.check(not semantic, "A11",
                        "res/ 下仍存在语义目录名：%s" % semantic[:5])
 
@@ -482,16 +595,21 @@ class Checker:
             # 诱饵类名必须真的声明成 Manifest 组件：否则静态分析者扫一遍组件表
             # 就能看出「没有任何安全相关组件」，立刻判定这些类是填充物。
             #
+            # 命名已由 seed 派生（主题包 + Core*/Signal*/Quiet* 三名族），无法用
+            # 固定类名断言；改为按结构识别：简单名 = 名族前缀 + 词表名词。
             # 判据用 Manifest 而不是 DEX：启用 B1 时业务 DEX 已被加密成载荷，
             # 诱饵类名不会出现在任何明文 DEX 里，靠 DEX 字符串判断会误报失败。
-            in_manifest = [n for n in DECOY_NAMES if manifest_contains(self.manifest, n)]
-            self.check(bool(in_manifest), "A8",
-                       "Manifest 里没有任何诱饵组件声明（只注入类是不够的）")
+            decoys = _decoy_components(self.manifest)
+            decoy_kinds = {kind for kind, _ in decoys}
+            self.check(len(decoys) >= 3, "A8",
+                       "Manifest 里没有诱饵组件声明（只注入类是不够的）")
+            self.check({"activity", "receiver", "service"} <= decoy_kinds, "A8",
+                       "诱饵组件缺少 activity/receiver/service 三类形态之一：%s" % sorted(decoy_kinds))
             if not self.want("B1"):
-                hit = [n for n in DECOY_NAMES if any(n in s for s in self.dex_strs)]
-                self.check(bool(hit), "A8", "DEX 里找不到任何诱饵类名（如 SecurityMonitor）")
+                hit = any(n in s for s in self.dex_strs for n in DECOY_NOUNS)
+                self.check(hit, "A8", "DEX 里找不到任何诱饵类名词（如 CoreAtlas/SignalBeacon）")
             # ContentProvider 会在应用启动时被主动实例化，诱饵绝不能声明成 provider。
-            if in_manifest:
+            if decoys:
                 self.check(not _decoy_is_provider(self.manifest),
                            "A8", "诱饵被声明成了 <provider>（会在启动时被实例化）")
 
@@ -690,11 +808,25 @@ class Checker:
             u16 = "application".encode("utf-16-le")
             self.check(needle in raw or u16 in raw, "A15",
                        "填充后 Manifest 里找不到真实内容（application 字样，UTF-8/UTF-16 均无）")
-            # 再确认末尾真实内容区存在字符串池 chunk（type=0x0001）——
+            # 再确认按 chunk 链能找到字符串池 chunk（type=0x0001）——
             # 这是「真实内容被完整保留」的结构性证据。
-            tail = raw[-65536:]
-            self.check(bytes([1, 0]) in tail, "A15",
-                       "填充后 Manifest 末尾找不到字符串池 chunk（真实内容可能被挤掉）")
+            # 注意新布局把真池放在假 chunk #1 之后（池声明 size 已把巨串算进去），
+            # 池不再位于文件末尾，因此不能只看尾部，要沿 chunk 头遍历前几个 chunk。
+            pos = 8
+            pool_found = False
+            for _ in range(4):
+                if pos + 8 > len(raw):
+                    break
+                ctype = int.from_bytes(raw[pos:pos + 2], "little")
+                csize = int.from_bytes(raw[pos + 4:pos + 8], "little")
+                if ctype == 0x0001:
+                    pool_found = True
+                    break
+                if csize < 8:
+                    break
+                pos += csize
+            self.check(pool_found, "A15",
+                       "填充后按 chunk 链找不到字符串池 chunk（真实内容可能被挤掉）")
 
         # ---- B8 载荷容器化 ----
         if self.want("B8"):

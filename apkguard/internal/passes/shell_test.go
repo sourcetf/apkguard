@@ -307,12 +307,16 @@ func TestShellChainRejectsB3WithoutB1(t *testing.T) {
 	}
 }
 
-// TestRegistryNormalizesAllEntries 验证整条流水线跑完后，**全部**条目共享
-// 同一套时间戳与 create_system。
+// TestRegistryNormalizesAllEntries 验证整条流水线跑完后，**全部**条目都落在
+// A14 的元数据统一范围内（三组派生时间戳之一，且无 1980 默认值残留）。
 //
 // 这是对 A14 注册位置的回归保护：它必须排在 B1/B2 以及 A9/A10/A12 之后。
 // 排在前面的话，加固过程中新增的条目会带着默认的 1980-01-01 时间戳发布出去，
 // 反而成为「这个包被重新打包过」的证据——正好与 A14 的目的相反。
+//
+// 注意：A14 现在按注入阶段派生**三组**时间戳（基准 / +32s / +44s，对齐样本的
+// 22:01:08/22:01:40/22:01:52），不再是「全部同一秒」；本用例启用 A10/A12，
+// 三组都会出现，因此断言的是「没有条目落在三组之外」而不是「所有条目相同」。
 func TestRegistryNormalizesAllEntries(t *testing.T) {
 	opts := &config.Options{
 		Enabled: map[config.FeatureID]bool{
@@ -336,21 +340,35 @@ func TestRegistryNormalizesAllEntries(t *testing.T) {
 	if len(za.Entries) == 0 {
 		t.Fatal("产物为空")
 	}
-	first := za.Entries[0]
+	// 期望的三组派生值（未指定 -stamp-time 时为 DefaultStamp）。
+	expected := map[[2]uint16]bool{}
+	for _, d := range []time.Duration{0, 32 * time.Second, 44 * time.Second} {
+		tm, dt := zipx.DOSDateTime(config.DefaultStamp.Add(d))
+		expected[[2]uint16{tm, dt}] = true
+	}
+	seen := map[[2]uint16]int{}
 	var bad []string
 	for _, e := range za.Entries {
-		if e.ModTime != first.ModTime || e.ModDate != first.ModDate ||
-			(e.VersionMade&0xff00) != (first.VersionMade&0xff00) {
+		key := [2]uint16{e.ModTime, e.ModDate}
+		seen[key]++
+		if !expected[key] {
 			bad = append(bad, e.NameString())
 			if len(bad) >= 5 {
 				break
 			}
 		}
+		if e.VersionMade&0xff00 != 0 {
+			t.Fatalf("条目 %s 的 create_system 未清零: 0x%04x", e.NameString(), e.VersionMade)
+		}
 	}
 	if len(bad) > 0 {
-		t.Fatalf("以下条目未与整体统一时间戳（A14 注册位置不对）: %v", bad)
+		t.Fatalf("以下条目的时间戳落在 A14 三组派生值（基准 / +32s / +44s）之外（A14 注册位置不对）: %v", bad)
 	}
-	t.Logf("A14：%d 个条目的时间戳与来源系统已全部统一，且加固新增条目在内", len(za.Entries))
+	if len(seen) > 3 {
+		t.Fatalf("产物出现 %d 个不同时间戳，A14 只应派生 3 个", len(seen))
+	}
+	t.Logf("A14：%d 个条目的时间戳全部落在 %d 组派生值内（基准/+32s/+44s），加固新增条目在内",
+		len(za.Entries), len(seen))
 }
 
 // 确保 zipx 与 bytes 仍被引用（新增测试若全部跳过，仍能编译）。

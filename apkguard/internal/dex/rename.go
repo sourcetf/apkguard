@@ -14,6 +14,28 @@ type RenameConfig struct {
 	Keep []string
 	// ObfuscateFields 为 true 时同时重命名字段。
 	ObfuscateFields bool
+	// RenameResourceIDs 为 true 时，aapt 生成的资源 ID 类（简单名为 R 或
+	// R$<Type>，且静态 int 字段带资源段常量）参与类名与字段名混淆。
+	//
+	// 为什么可以安全改名：DEX 对 R 类字段的引用走 field_ids 的显式引用，
+	// 改名由既有的字段引用改写通道（planFields + 重建重排）统一完成；字段的
+	// static_values（资源 ID 常量）由重建器逐值保留并按新字段顺序重排，
+	// 因此「字段名 -> 资源 ID」的绑定不变。
+	//
+	// 放行仍是保守的（宁少勿多）：
+	//   - Landroid/...（平台 R）与一切命中原有 keep 规则的类照旧保留；
+	//   - 只有「至少一个 static int 字段的 static_values 常量落在
+	//     0x7f/0x01 资源段」的 R$Type 才放行；R$styleable 这类纯下标
+	//     常量类不放行；
+	//   - 外层 R 只有在本 DEX 内全部 R$Type 都放行时才一起放行；
+	//   - 字段名若出现在 const-string、注解等非字段引用处，整个类不改
+	//     （引用完整性无法确认，见 resourceFieldNamesSafe）；
+	//   - DEX 含本工具无法重建的 call_site_ids / method_handles 段时，
+	//     全部 R 类不改（见 checkRebuildSupported）。
+	//
+	// 默认 false（dex 库 API 保持旧行为）；A1 pass 默认打开，可用环境变量
+	// APKGUARD_KEEP_RCLASS_IDS=1 一键关闭。
+	RenameResourceIDs bool
 	// ShrinkPackage 为 true 时，新类名不再保留原包前缀，而是落到**默认包**
 	// （如 Lcom/foo/Bar; -> La;）。
 	//
@@ -217,6 +239,13 @@ type Renamer struct {
 	// keepReasons 记录被保留的类及其原因，用于报告。
 	keepReasons map[string]string
 
+	// defOf 是「类描述符 -> class_def 下标」，读取 static_values 用。
+	defOf map[string]uint32
+	// resIDOK 是「允许参与改名的资源 ID 类描述符」集合，仅在
+	// RenameConfig.RenameResourceIDs 开启且本 DEX 含 R 类候选时计算
+	// （见 planResourceIDClasses）。nil 表示不启用。
+	resIDOK map[string]bool
+
 	// byDesc 是「类描述符 -> 类定义」，用于查父类型与成员访问标志。
 	byDesc map[string]*ClassInfo
 	// res 是在 byDesc 上做继承解析的只读视图（可复用于跨 DEX 的全局视图）。
@@ -302,6 +331,19 @@ func NewRenamer(f *File, cfg RenameConfig) (*Renamer, error) {
 		for _, fl := range infos[i].Fields() {
 			r.used["F"][fl.Name] = true
 		}
+	}
+	// class_def 下标表：static_values 挂在 class_def 上，判据需要按描述符回查。
+	r.defOf = make(map[string]uint32, len(infos))
+	for i := range infos {
+		if _, ok := r.defOf[infos[i].Desc]; !ok {
+			r.defOf[infos[i].Desc] = uint32(i)
+		}
+	}
+	// 资源 ID 类的放行集合必须在构造期一次算清：keepReason 会被每个类调用，
+	// 而它涉及 static_values 解析与整文件的 checkRebuildSupported 扫描。
+	// 先做一次廉价的名字预筛，普通 DEX（没有 R 类）完全不付这笔代价。
+	if cfg.RenameResourceIDs && r.hasResourceIDClassCandidate() {
+		r.resIDOK = r.planResourceIDClasses()
 	}
 	return r, nil
 }
@@ -498,6 +540,12 @@ func (r *Renamer) keepReason(ci *ClassInfo, extra, reflected, hasInner map[strin
 		return "类名在其它 DEX 的字符串常量中出现（可能被反射）"
 	case isEntryPoint(ci):
 		return "Android 组件/入口类"
+	case r.resIDOK[ci.Desc]:
+		// 资源 ID 类（R / R$Type）：类名可混淆，字段名走既有字段引用改写通道，
+		// static_values 原样保留（见 planResourceIDClasses 的判据与护栏）。
+		// 必须排在下面两个案例之前：R$Type 含 '$'、外层 R 含内部类，
+		// 那两条旧规则会整类拦下它们。
+		return ""
 	case strings.Contains(ci.Desc, "$"):
 		return "内部类（与外层类命名强耦合）"
 	case hasInner[ci.Desc]:
@@ -506,6 +554,294 @@ func (r *Renamer) keepReason(ci *ClassInfo, extra, reflected, hasInner map[strin
 		return "非类描述符"
 	}
 	return ""
+}
+
+// ---- 资源 ID 类（aapt 生成的 R / R$Type）----
+//
+// 参考样本对 R 类的做法是：类名与字段名全部抹成短名，字段的 static_values
+// （资源 ID 常量 0x7f08xxxx）原样保留。DEX 对 R 字段的引用是 field_ids 的显式
+// 引用，改名由既有字段引用改写通道统一完成，因此「字段名 -> 资源 ID」的绑定
+// 不会断——前提是只对**能证明是资源 ID 类、且引用完整性可确认**的类放行。
+//
+// 下面这组判据全部取交集（宁少勿多）：名字像 R 只是入场券，还要字段常量确实
+// 落在 Android 资源 ID 段、字段名没有被其它语义占用、整份 DEX 可被完整重建。
+
+// isResourceIDClassDesc 判断描述符的简单名是否为 R 或 R$<Type>
+// （aapt 生成的资源 ID 类命名，如 Lcom/x/R;、Lcom/x/R$string;）。
+func isResourceIDClassDesc(desc string) bool {
+	if len(desc) < 3 || desc[0] != 'L' || desc[len(desc)-1] != ';' {
+		return false
+	}
+	body := desc[1 : len(desc)-1]
+	if i := strings.LastIndexByte(body, '/'); i >= 0 {
+		body = body[i+1:]
+	}
+	return body == "R" || strings.HasPrefix(body, "R$")
+}
+
+// resourceFamilyKey 返回资源 ID 类所属「家族」的键（外层 R 类的描述符）。
+//
+//	Lcom/x/R$string; -> Lcom/x/R;
+//	Lcom/x/R;        -> Lcom/x/R;
+func resourceFamilyKey(desc string) string {
+	body := strings.TrimSuffix(strings.TrimPrefix(desc, "L"), ";")
+	start := 0
+	if i := strings.LastIndexByte(body, '/'); i >= 0 {
+		start = i + 1
+	}
+	if i := strings.IndexByte(body[start:], '$'); i >= 0 {
+		body = body[:start+i]
+	}
+	return "L" + body + ";"
+}
+
+// isAndroidResourceID 判断常量是否落在 Android 资源 ID 区间。
+//
+//	0x7f000000..0x7fffffff  应用资源包（aapt 给第三方应用固定分配 0x7f）
+//	0x01000000..0x01ffffff  框架资源包（android.R 的 0x01 段）
+//
+// 0x01 段只作数值判据：Landroid/ 包前缀在 planResourceIDClasses 里一律排除，
+// 平台 R 不会被放行。
+func isAndroidResourceID(v int64) bool {
+	return (v >= 0x7f000000 && v <= 0x7fffffff) ||
+		(v >= 0x01000000 && v <= 0x01ffffff)
+}
+
+// encodedInt 是一个 encoded_value 的整数视图。
+type encodedInt struct {
+	// Val 仅当 OK 为 true（数值型：byte/short/char/int/long）时有效。
+	Val int64
+	// OK 表示该值是否为数值型。
+	OK bool
+	// Raw 是该 encoded_value 的原始字节（含头字节），用于逐字节比对。
+	Raw []byte
+}
+
+// encodedArrayInts 解析一个 encoded_array，逐位置返回取值视图。
+//
+// 非数值型（字符串/数组/注解/…）OK=false，但仍会跳过其全部字节，保证
+// 后续位置的字段对齐。解析失败返回 error，调用方按「无法确认」保守处理。
+func encodedArrayInts(d []byte, off uint32) ([]encodedInt, error) {
+	p := int(off)
+	if p < 0 || p >= len(d) {
+		return nil, fmt.Errorf("%w: encoded_array 偏移越界 %d", ErrTruncated, off)
+	}
+	size, np, err := ULEB128(d, p)
+	if err != nil {
+		return nil, err
+	}
+	p = np
+	out := make([]encodedInt, 0, size)
+	for i := uint32(0); i < size; i++ {
+		var v encodedInt
+		v, p, err = decodeEncodedInt(d, p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// decodeEncodedInt 解析一个 encoded_value，返回其整数视图与新位置。
+//
+// 取值类型码遵循 DEX 规范：0x00/0x02/0x03/0x04/0x06 为数值，0x10/0x11
+// （float/double）与 0x15-0x1b（含索引类型）载荷均为 value_arg+1 字节，
+// 0x1c 数组 / 0x1d 注解递归跳过，0x1e/0x1f（null/boolean）无载荷。
+func decodeEncodedInt(d []byte, p int) (encodedInt, int, error) {
+	if p < 0 || p >= len(d) {
+		return encodedInt{}, p, fmt.Errorf("%w: encoded_value 越界", ErrTruncated)
+	}
+	start := p
+	head := d[p]
+	p++
+	vt := head & 0x1f
+	va := int((head >> 5) & 0x7)
+	switch vt {
+	case 0x00, 0x02, 0x03, 0x04, 0x06: // byte / short / char / int / long
+		n := va + 1
+		if p+n > len(d) {
+			return encodedInt{}, p, fmt.Errorf("%w: encoded_value 载荷越界", ErrTruncated)
+		}
+		var u uint64
+		for i := 0; i < n; i++ {
+			u |= uint64(d[p+i]) << (8 * i)
+		}
+		if vt != 0x03 { // char 无符号；其余按最高位做符号扩展
+			bits := uint(8 * n)
+			if bits < 64 && u&(uint64(1)<<(bits-1)) != 0 {
+				u |= ^uint64(0) << bits
+			}
+		}
+		return encodedInt{Val: int64(u), OK: true, Raw: d[start : p+n]}, p + n, nil
+	case 0x1c: // array：递归跳过全部元素
+		size, np, err := ULEB128(d, p)
+		if err != nil {
+			return encodedInt{}, p, err
+		}
+		p = np
+		for i := uint32(0); i < size; i++ {
+			if _, p, err = decodeEncodedInt(d, p); err != nil {
+				return encodedInt{}, p, err
+			}
+		}
+		return encodedInt{Raw: d[start:p]}, p, nil
+	case 0x1d: // annotation：type_idx + size + (name_idx, value)*
+		_, np, err := ULEB128(d, p)
+		if err != nil {
+			return encodedInt{}, p, err
+		}
+		size, np2, err := ULEB128(d, np)
+		if err != nil {
+			return encodedInt{}, p, err
+		}
+		p = np2
+		for i := uint32(0); i < size; i++ {
+			_, np3, err := ULEB128(d, p)
+			if err != nil {
+				return encodedInt{}, p, err
+			}
+			p = np3
+			if _, p, err = decodeEncodedInt(d, p); err != nil {
+				return encodedInt{}, p, err
+			}
+		}
+		return encodedInt{Raw: d[start:p]}, p, nil
+	case 0x1e, 0x1f: // null / boolean：无载荷（boolean 的值在 value_arg 里）
+		return encodedInt{Raw: d[start:p]}, p, nil
+	default:
+		// 0x10/0x11（float/double）与 0x15-0x1b（含索引类型）：载荷 va+1 字节。
+		n := va + 1
+		if p+n > len(d) {
+			return encodedInt{}, p, fmt.Errorf("%w: encoded_value 载荷越界", ErrTruncated)
+		}
+		return encodedInt{Raw: d[start : p+n]}, p + n, nil
+	}
+}
+
+// hasResourceIDClassCandidate 廉价预筛：本 DEX 是否定义了名字像 R/R$Type
+// 且不属于平台/三方库前缀的类。没有候选时完全不执行静态值解析与整文件扫描。
+func (r *Renamer) hasResourceIDClassCandidate() bool {
+	for i := range r.infos {
+		d := r.infos[i].Desc
+		if isResourceIDClassDesc(d) && !hasAnyPrefix(d, javaPrefixes) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasResourceIDStaticField 判断类是否带「资源 ID 常量」：至少一个 static int
+// 字段在 static_values 中的取值落在 Android 资源 ID 区间。
+//
+// static_values 的第 i 个值对应按 field_idx 升序的第 i 个静态字段；
+// ClassInfos 给出的 StaticFields 就是该顺序，按位置对齐即可。
+func (r *Renamer) hasResourceIDStaticField(ci *ClassInfo) bool {
+	di, ok := r.defOf[ci.Desc]
+	if !ok {
+		return false
+	}
+	cd, err := r.f.ClassDefAt(di)
+	if err != nil || cd.StaticValuesOff == 0 {
+		return false
+	}
+	vals, err := encodedArrayInts(r.f.data, cd.StaticValuesOff)
+	if err != nil {
+		// 畸形 static_values：无法确认字段绑定，不放行。
+		return false
+	}
+	for k, fl := range ci.StaticFields {
+		if fl.Type != "I" || k >= len(vals) {
+			continue
+		}
+		if vals[k].OK && isAndroidResourceID(vals[k].Val) {
+			return true
+		}
+	}
+	return false
+}
+
+// resourceFieldNamesSafe 判断类中字段名没有被「字段引用」之外的语义使用。
+//
+// 值键改名通道按字符串值整体替换：字段名若同时出现在 const-string、注解、
+// 类型/方法名或源文件名里，planFields 会跳过它（改一个池项会波及那些语义
+// 不同的字符串）。此时若仍改类名，字段名保持旧值，达不到隐藏资源用途的
+// 目的；强行改写又会破坏其它语义。两种做法都无法证明引用完整，因此整类
+// 不改（宁可漏改）。
+func (r *Renamer) resourceFieldNamesSafe(ci *ClassInfo) bool {
+	for _, fl := range ci.Fields() {
+		idx, ok := r.strIdx[fl.Name]
+		if !ok {
+			continue
+		}
+		if r.usage.Type[idx] || r.usage.MethodName[idx] || r.usage.Const[idx] ||
+			r.usage.Anno[idx] || r.usage.SourceFile[idx] {
+			return false
+		}
+	}
+	return true
+}
+
+// planResourceIDClasses 计算本 DEX 内允许参与改名的资源 ID 类集合。
+//
+// 判据（全部取交集）：
+//  1. 整份 DEX 可被安全重建（checkRebuildSupported）：含 call_site_ids /
+//     method_handles 段或 0xfa-0xfe 指令时，这些结构里的字段引用无法确认，
+//     全部 R 类不改；
+//  2. 类名形如 R / R$<Type>，且不属于平台/三方库前缀（Landroid/ 等一律排除）；
+//  3. R$Type：至少一个 static int 字段带资源段 static_values 常量；
+//     外层 R：本 DEX 内它的全部 R$Type 都满足第 3 条时才一起放行
+//     （外层与内部类进同一个计划，避免半个家族改名）；
+//  4. 字段名只被字段引用使用（resourceFieldNamesSafe）。
+func (r *Renamer) planResourceIDClasses() map[string]bool {
+	out := map[string]bool{}
+	if err := checkRebuildSupported(r.f); err != nil {
+		return out
+	}
+	members := map[string][]string{}
+	qualifies := map[string]bool{}
+	for i := range r.infos {
+		ci := &r.infos[i]
+		if !isResourceIDClassDesc(ci.Desc) || hasAnyPrefix(ci.Desc, javaPrefixes) {
+			continue
+		}
+		fam := resourceFamilyKey(ci.Desc)
+		members[fam] = append(members[fam], ci.Desc)
+		if r.hasResourceIDStaticField(ci) && r.resourceFieldNamesSafe(ci) {
+			qualifies[ci.Desc] = true
+		}
+	}
+	for i := range r.infos {
+		ci := &r.infos[i]
+		if !isResourceIDClassDesc(ci.Desc) || hasAnyPrefix(ci.Desc, javaPrefixes) {
+			continue
+		}
+		fam := resourceFamilyKey(ci.Desc)
+		if fam == ci.Desc {
+			// 外层 R：要求家族内全部 R$Type 都放行（外层与内部类进同一个计划）。
+			// aapt 的常态是外层 R 自身无字段；若它确实带字段，字段判据与
+			// 名称护栏对它同样生效，不得因「成员干净」而绕过。
+			all, others := true, 0
+			for _, m := range members[fam] {
+				if m == ci.Desc {
+					continue
+				}
+				others++
+				if !qualifies[m] {
+					all = false
+					break
+				}
+			}
+			if all && ((others > 0 && len(ci.Fields()) == 0) || qualifies[ci.Desc]) {
+				out[ci.Desc] = true
+			}
+			continue
+		}
+		if qualifies[ci.Desc] {
+			out[ci.Desc] = true
+		}
+	}
+	return out
 }
 
 // planMethods 决定方法名的重命名。

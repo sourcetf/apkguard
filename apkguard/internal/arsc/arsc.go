@@ -1,8 +1,14 @@
-// Package arsc 解析并重写 resources.arsc 的全局字符串池。
+// Package arsc 解析并重写 resources.arsc 的字符串池。
+//
+// 两条改写路径：
+//   - 全局字符串池里的 res/ 文件路径（本文件的 Replace/Encode，服务 A5/A11 的路径改名）；
+//   - 包内 keyStrings 池的资源条目名（keys.go 的 RandomizeKeys，服务 A5/A11
+//     的条目名随机化）。
 //
 // 为什么只需要动字符串池：A5/A11 要做的是把 res/ 下的**文件路径**改名，
 // 而资源引用走的是资源 ID（int），路径只作为「字符串值」存在全局字符串池里。
-// 因此改路径 = 改字符串池里的若干条目。
+// 因此改路径 = 改字符串池里的若干条目。条目名同理：ResTable_entry 用池下标
+// 引用 keyStrings，换掉槽位内容不影响任何资源 ID。
 //
 // 为什么不担心偏移：ARSC 是**按块顺序**解析的——
 //
@@ -10,8 +16,8 @@
 //
 // 表头只有 packageCount，没有任何绝对偏移；包块里的 typeStrings/keyStrings
 // 是**相对包块自身**的偏移；Type 块内的 entriesStart 同样相对自身。
-// 所以替换字符串池（长度可变）之后，只需回填两处长度字段：
-// 字符串池块自己的 size，以及表头的 size。其余字节可以原样搬运。
+// 所以替换字符串池（长度可变）之后，只需回填字符串池块自己的 size、所属
+// 包块的 size 与表头的 size。其余字节可以原样搬运。
 //
 // 这一点的价值在于：不必做任何重定位，出错面极小——这正是重写二进制
 // 资源表最容易踩雷的地方。
@@ -67,11 +73,43 @@ func Parse(data []byte) (*Table, error) {
 	if off < tableHeaderLen || off > len(data) {
 		return nil, fmt.Errorf("arsc: 表头长度非法 %d", off)
 	}
-	if off+poolHeaderLen > len(data) {
+	p, err := parseStringPool(data, off)
+	if err != nil {
+		return nil, err
+	}
+	return &Table{
+		data:    data,
+		poolOff: off,
+		poolEnd: off + p.size,
+		strings: p.strings,
+		utf8:    p.utf8,
+		styles:  p.styles,
+		edits:   map[int]string{},
+	}, nil
+}
+
+// stringPool 是一个已解析的 RES_STRING_POOL 块。
+type stringPool struct {
+	// strings 与池中索引一一对应。
+	strings []string
+	utf8    bool
+	// styles 是原池的 style 数据；无 style 时为 nil。
+	styles *axml.Styles
+	// size 是块总长（含头部、偏移数组与对齐填充）。
+	size int
+}
+
+// parseStringPool 解析 data[off:] 处的 RES_STRING_POOL 块。
+//
+// 全局字符串池（Parse）与包内的 keyStrings/typeStrings（keys.go）结构完全相同，
+// 因此共用这一份实现：池头校验、style 保留与两种编码的解码只写一遍，
+// 避免两处实现漂移（ARSC 解析最容易出错的就是这些边界）。
+func parseStringPool(data []byte, off int) (*stringPool, error) {
+	if off < 0 || off+poolHeaderLen > len(data) {
 		return nil, fmt.Errorf("arsc: 字符串池头部越界")
 	}
 	if binary.LittleEndian.Uint16(data[off:]) != typeStringPool {
-		return nil, fmt.Errorf("arsc: 表头之后不是字符串池")
+		return nil, fmt.Errorf("arsc: 偏移 %d 处不是字符串池（0x%04x）", off, binary.LittleEndian.Uint16(data[off:]))
 	}
 	poolSize := int(binary.LittleEndian.Uint32(data[off+4:]))
 	poolEnd := off + poolSize
@@ -124,27 +162,27 @@ func Parse(data []byte) (*Table, error) {
 		styles = &axml.Styles{Count: styleCount, Offsets: offs, Data: sdata}
 	}
 
-	t := &Table{
-		data:    data,
-		poolOff: off,
-		poolEnd: poolEnd,
+	p := &stringPool{
 		strings: make([]string, count),
 		utf8:    flags&utf8Flag != 0,
 		styles:  styles,
-		edits:   map[int]string{},
+		size:    poolSize,
 	}
+	// decode 是 Table 的方法（仍是包内唯一实现），这里借一个只带编码信息
+	// 的临时 Table 解码，不必复制解码逻辑。
+	dec := &Table{data: data, utf8: p.utf8}
 	for i := 0; i < count; i++ {
 		so := base + int(binary.LittleEndian.Uint32(data[off+poolHeaderLen+4*i:]))
 		if so < base || so >= poolEnd {
 			return nil, fmt.Errorf("arsc: 第 %d 个字符串偏移越界 %d", i, so)
 		}
-		s, err := t.decode(so)
+		s, err := dec.decode(so)
 		if err != nil {
 			return nil, fmt.Errorf("arsc: 解码第 %d 个字符串失败: %w", i, err)
 		}
-		t.strings[i] = s
+		p.strings[i] = s
 	}
-	return t, nil
+	return p, nil
 }
 
 // Strings 返回池内全部字符串（只读）。

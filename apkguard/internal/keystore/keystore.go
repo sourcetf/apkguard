@@ -5,11 +5,14 @@ package keystore
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,6 +197,113 @@ func parsePKCS8(der []byte) (crypto.PrivateKey, error) {
 		return k, nil
 	}
 	return nil, ErrUnsupportedKey
+}
+
+// ---- 自签名证书身份生成（cmd/genkey 使用） ----
+
+// 随机身份的候选表。
+//
+// 取值刻意保持「真实发布公司」的形态，且任何候选项都不得包含 apkguard /
+// example / test / demo 字样：证书 DER 会被原样复制进每个已签名产物的
+// v1 CERT.RSA 与 v2/v3/v4 签名块，主体一旦带产品名，整包字节就能被一条
+// grep（或任何 YARA 规则）命中——审计实测旧主体在产物里出现 14 次。
+var (
+	// subjectCountries 候选国家代码（≥8 个）。
+	subjectCountries = []string{"NO", "US", "DE", "NL", "SE", "SG", "IE", "CA", "GB", "FR"}
+	// subjectStates 候选省/州名（≥6 个）。
+	subjectStates = []string{
+		"Massachusetts", "California", "Washington", "Ontario", "Bavaria",
+		"Nordland", "Gauteng", "Victoria", "Utrecht", "Cork",
+	}
+	// subjectLocalities 候选城市名（≥6 个）。
+	subjectLocalities = []string{
+		"Dublin", "Boston", "San Jose", "Amsterdam", "Munich",
+		"Oslo", "Toronto", "London", "Paris", "Sydney",
+	}
+	// subjectOrgNouns 公司名里的「名词」部分（≥10 个）。
+	subjectOrgNouns = []string{
+		"Harborlight", "Quietforge", "Northline", "Bluepeak", "Silverbrook",
+		"Ironvale", "Clearpath", "Redwood", "Stonebridge", "Larkspur",
+		"Westwind", "Amberfield",
+	}
+	// subjectOrgFields 公司名里的「行业词」部分（≥10 个）。
+	subjectOrgFields = []string{
+		"Digital", "Systems", "Software", "Technologies", "Labs",
+		"Networks", "Solutions", "Analytics", "Media", "Works",
+		"Computing", "Dynamics",
+	}
+	// subjectOUs 候选组织单元名。
+	subjectOUs = []string{"Client", "Development", "Release", "Mobile", "Engineering"}
+)
+
+// randIndex 返回 [0, n) 内的均匀随机下标（crypto/rand）。
+func randIndex(n int) (int, error) {
+	if n <= 0 {
+		return 0, errors.New("keystore: 随机候选表为空")
+	}
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0, err
+	}
+	return int(v.Int64()), nil
+}
+
+// RandomSubject 生成一个随机但形如真实发布身份的证书主体：
+//
+//	C/ST/L 各自从候选表随机取（不追求地理对应），O = 随机名词 + 随机行业词
+//	（如 Quietforge Systems），OU 从 Client/Development/… 中随机取，
+//	CN 是 8~20 个小写字母的随机串。
+//
+// 全部取值来自 crypto/rand，不提供确定性开关：证书身份不需要可复现（产物形态
+// 的复现由 -seed 控制的命名族负责），而固定主体会让每个用户拿到同一张证书，
+// 比随机更糟。唯一硬约束：任何字段都不得含 apkguard/example/test/demo 字样。
+func RandomSubject() (pkix.Name, error) {
+	var err error
+	pick := func(vals []string) string {
+		if err != nil {
+			return ""
+		}
+		var i int
+		i, err = randIndex(len(vals))
+		if err != nil {
+			return ""
+		}
+		return vals[i]
+	}
+
+	country := pick(subjectCountries)
+	state := pick(subjectStates)
+	locality := pick(subjectLocalities)
+	noun := pick(subjectOrgNouns)
+	field := pick(subjectOrgFields)
+	ou := pick(subjectOUs)
+
+	// CN：8~20 个小写字母。
+	extra, cerr := randIndex(13) // 0..12
+	if err == nil {
+		err = cerr
+	}
+	cn := make([]byte, 0, 8+12)
+	for i := 0; i < 8+extra && err == nil; i++ {
+		var c int
+		c, err = randIndex(26)
+		if err != nil {
+			break
+		}
+		cn = append(cn, byte('a'+c))
+	}
+	if err != nil {
+		return pkix.Name{}, fmt.Errorf("keystore: 生成证书主体失败: %w", err)
+	}
+
+	return pkix.Name{
+		Country:            []string{country},
+		Province:           []string{state},
+		Locality:           []string{locality},
+		Organization:       []string{noun + " " + field},
+		OrganizationalUnit: []string{ou},
+		CommonName:         string(cn),
+	}, nil
 }
 
 // ToPEM 把签名材料导出为 PEM 块，便于调试与人工核对。

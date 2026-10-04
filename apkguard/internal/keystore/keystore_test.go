@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,9 +32,14 @@ func testKeyMaterial(t *testing.T) (*rsa.PrivateKey, *x509.Certificate, []byte) 
 	if err != nil {
 		t.Fatalf("生成密钥失败: %v", err)
 	}
+	subject, err := RandomSubject()
+	if err != nil {
+		t.Fatalf("生成证书主体失败: %v", err)
+	}
+	assertRealisticSubject(t, subject)
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "apkguard test"},
+		Subject:      subject,
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -46,7 +52,121 @@ func testKeyMaterial(t *testing.T) (*rsa.PrivateKey, *x509.Certificate, []byte) 
 	if err != nil {
 		t.Fatalf("解析证书失败: %v", err)
 	}
+	assertRealisticSubject(t, cert.Subject)
 	return key, cert, der
+}
+
+// forbiddenSubjectWords 是证书身份里绝不允许出现的子串。
+//
+// 这些字符串一旦出现在证书 DER 里，就会随 v1/v2/v3 签名进入每个产物，
+// 成为可被一条 grep 命中的工具/测试指纹。大小写不敏感。
+var forbiddenSubjectWords = []string{"apkguard", "example", "test", "demo"}
+
+// assertRealisticSubject 校验主体是「随机公司身份」的完整形态：
+// 六个字段齐全、取值落在候选表内、CN 为 8~20 个小写字母、无禁用词。
+func assertRealisticSubject(t *testing.T, s pkix.Name) {
+	t.Helper()
+	if len(s.Country) != 1 || !contains(subjectCountries, s.Country[0]) {
+		t.Errorf("C 应为候选国家之一，实际 %v", s.Country)
+	}
+	if len(s.Province) != 1 || !contains(subjectStates, s.Province[0]) {
+		t.Errorf("ST 应为候选省/州之一，实际 %v", s.Province)
+	}
+	if len(s.Locality) != 1 || !contains(subjectLocalities, s.Locality[0]) {
+		t.Errorf("L 应为候选城市之一，实际 %v", s.Locality)
+	}
+	if len(s.Organization) != 1 || !strings.Contains(s.Organization[0], " ") {
+		t.Errorf("O 应为「名词 + 行业词」形态，实际 %v", s.Organization)
+	}
+	if len(s.OrganizationalUnit) != 1 || !contains(subjectOUs, s.OrganizationalUnit[0]) {
+		t.Errorf("OU 应为候选部门之一，实际 %v", s.OrganizationalUnit)
+	}
+	if n := len(s.CommonName); n < 8 || n > 20 {
+		t.Errorf("CN 长度应为 8~20，实际 %d（%q）", n, s.CommonName)
+	}
+	for _, c := range s.CommonName {
+		if c < 'a' || c > 'z' {
+			t.Errorf("CN 应为小写字母串，实际 %q 含 %q", s.CommonName, c)
+			break
+		}
+	}
+	for _, vals := range [][]string{s.Country, s.Province, s.Locality, s.Organization, s.OrganizationalUnit, []string{s.CommonName}} {
+		for _, v := range vals {
+			low := strings.ToLower(v)
+			for _, bad := range forbiddenSubjectWords {
+				if strings.Contains(low, bad) {
+					t.Errorf("主体字段 %q 含禁用子串 %q（会随签名进入产物字节）", v, bad)
+				}
+			}
+		}
+	}
+}
+
+// contains 判断字符串表是否含 v（测试辅助，避免引入 slices 依赖）。
+func contains(vals []string, v string) bool {
+	for _, x := range vals {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRandomSubjectShape 连续生成多份身份：每一份都必须是完整形态，
+// 且 CN/O 有足够多样性（防止退化成固定值）。
+func TestRandomSubjectShape(t *testing.T) {
+	cnSeen := map[string]bool{}
+	orgSeen := map[string]bool{}
+	countries := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		s, err := RandomSubject()
+		if err != nil {
+			t.Fatalf("RandomSubject 失败: %v", err)
+		}
+		assertRealisticSubject(t, s)
+		cnSeen[s.CommonName] = true
+		orgSeen[s.Organization[0]] = true
+		countries[s.Country[0]] = true
+	}
+	if len(cnSeen) < 100 {
+		t.Errorf("200 次生成只得到 %d 个不同的 CN，随机性不足", len(cnSeen))
+	}
+	if len(orgSeen) < 10 {
+		t.Errorf("200 次生成只得到 %d 个不同的公司名，候选表未生效", len(orgSeen))
+	}
+	if len(countries) < 5 {
+		t.Errorf("200 次生成只覆盖 %d 个国家，候选表未生效", len(countries))
+	}
+}
+
+// TestRandomSubjectCertDERHasNoProductName 是审计要求的反例：用随机主体签发
+// 证书后，DER 字节里不得出现 apkguard/example/test/demo。证书 DER 会被签名器
+// 原样复制进产物，这是「产物字节不含产品指纹」的关键一环。
+func TestRandomSubjectCertDERHasNoProductName(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("生成密钥失败: %v", err)
+	}
+	subject, err := RandomSubject()
+	if err != nil {
+		t.Fatalf("生成证书主体失败: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      subject,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("生成证书失败: %v", err)
+	}
+	low := bytes.ToLower(der)
+	for _, bad := range forbiddenSubjectWords {
+		if bytes.Contains(low, []byte(bad)) {
+			t.Fatalf("证书 DER 含禁用子串 %q：产物会被 grep 命中", bad)
+		}
+	}
 }
 
 // TestLoadJKS 验证 JKS 密钥库的读取路径。
@@ -96,9 +216,7 @@ func TestLoadJKS(t *testing.T) {
 	if m.Leaf() == nil {
 		t.Fatal("未解析出叶子证书")
 	}
-	if m.Leaf().Subject.CommonName != "apkguard test" {
-		t.Errorf("证书主题不符: %s", m.Leaf().Subject.CommonName)
-	}
+	assertRealisticSubject(t, m.Leaf().Subject)
 
 	// 指定别名同样应能命中；不存在的别名必须报错而不是静默换一个。
 	if _, err := Load(path, pass, pass, "", alias); err != nil {
@@ -137,9 +255,10 @@ func TestLoadPKCS12(t *testing.T) {
 	if m.Source != TypePKCS12 {
 		t.Errorf("Source 应为 pkcs12，实际 %s", m.Source)
 	}
-	if m.Leaf() == nil || m.Leaf().Subject.CommonName != "apkguard test" {
-		t.Fatalf("证书解析不符: %v", m.Leaf())
+	if m.Leaf() == nil {
+		t.Fatal("证书解析失败")
 	}
+	assertRealisticSubject(t, m.Leaf().Subject)
 	// PKCS12 没有别名概念，应为空——调用方据此决定是否展示别名。
 	if m.Alias != "" {
 		t.Errorf("PKCS12 不应报告别名，实际 %q", m.Alias)
