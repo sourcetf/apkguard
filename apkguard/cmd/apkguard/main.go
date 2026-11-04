@@ -63,6 +63,7 @@ type cliConfig struct {
 	renameLibraries    bool
 	obfStringMin       int
 	obfStringSingleRef bool
+	strencLegacy       bool
 	seed               string
 	fakeDexCount       int
 	fakeDexSize        int
@@ -142,6 +143,8 @@ func registerFlags(fs *flag.FlagSet, c *cliConfig) {
 	fs.IntVar(&c.obfStringMin, "obf-string-min", 0, "A2 仅加密长度不小于该值的字符串")
 	fs.BoolVar(&c.obfStringSingleRef, "obf-string-single-ref", false,
 		"A2 只加密恰好被 1 条 const-string 引用的字符串（对齐参考样本的选择性加密分布；会降低保护强度：多引用串将留明文，仅为形态对齐，不建议常规使用）")
+	fs.BoolVar(&c.strencLegacy, "strenc-legacy-keystream", false,
+		"A2 回到旧的 SHA-256 keystream 实现（自造构造、无完整性保护），而不是默认的 AES-256-SIV；旧路径不嵌入守卫库 lib/，仅用于不方便携带原生库的兼容性场景")
 	fs.StringVar(&c.seed, "seed", "", "随机种子（留空则每次随机）")
 	fs.IntVar(&c.fakeDexCount, "fake-dex-count", 1, "A9 伪 DEX 块数量")
 	fs.IntVar(&c.fakeDexSize, "fake-dex-size", 80000, "A9 每块字节数")
@@ -464,6 +467,7 @@ func buildOptions(c cliConfig) (*config.Options, error) {
 		ObfStringMin:      c.obfStringMin,
 
 		ObfStringSingleRefOnly: c.obfStringSingleRef,
+		StrencLegacyKeystream:  c.strencLegacy,
 		Seed:                   seedOrRandom(c.seed),
 		FakeDexCount:           c.fakeDexCount,
 		FakeDexSize:            c.fakeDexSize,

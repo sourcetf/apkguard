@@ -6,53 +6,52 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
+
+	"apkguard/internal/pack"
 )
 
-// 密钥流的构造（谁改这里都必须同时改 stringDecryptorCode，二者逐字节对应）。
+// A2 的加解密方案（谁改这里都必须同时改 stringDecryptor*，二者逐字节对应）。
 //
-// 旧实现（已废弃，务必不要改回去）：
+// 现行方案（默认）：**AES-256-SIV（RFC 5297）**，与载荷/容器那条线统一。
 //
-//	func keyStream(key byte, i int) byte { return key + byte(i*17) }
+//	blob = pack.EncryptNamed(明文, key, "") = [SIV 标签 16B][AES-256-CTR 密文]
+//	池中密文 = Base64(blob)
 //
-// 它的密钥只有 1 字节，且密钥流是下标的**仿射函数**。后果：攻击者只要拿到
-// 任意一个字符串的 (明文, 密文) 对（"UTF-8"、"Android"、类名、"http://..."
-// 这类常量必然存在），就能令 pt[i]^ct[i] == key + i*17，直接解出唯一的 key，
-// 再一次性解出全 DEX 的所有字符串——A2 因此几乎等于没加密。
+// 运行时由守卫库的 JNI 入口 Native.sivDecrypt(key32, ad, blob) 解密：
+// SIV 标签既是 CTR 的计数器初值、又是 S2V 的 MAC，解密时重算 S2V 常量时间
+// 比对，篡改密钥/密文/AD 一律返回 null（注入的解密器收到 null 会抛异常，
+// 绝不静默返回原文）。AD 组件为空字符串——同一明文在同密钥下得到**相同**
+// 密文（确定性，产物可复现；这与旧实现一致，因为旧 nonce 也是明文的函数）。
 //
-// 新实现：密钥提升为 32 字节的伪随机秘密，密钥流改用 SHA-256 派生：
+// 为什么换成 SIV：审计与用户要求「全面弃用自造/CBC 类密码学，走标准 AEAD」。
+// 旧实现的 SHA-256 keystream 虽是自造构造，但它不是 AEAD（无完整性保护：
+// 密文被篡改后仍会解出一段字节，只是内容错乱），且需要把整套 MessageDigest
+// 循环注入字节码。SIV 是标准 AEAD、解密必校验、且运行时只需一次 JNI 调用，
+// 注入的解密器因此更短、更不易写错寄存器。
 //
-//	nonce    = SHA-256(secret ‖ 0x00 ‖ 明文)[0:8]
-//	keystream(i) = SHA-256(secret ‖ 0x01 ‖ nonce ‖ LE32(i))[0]
-//	ciphertext   = nonce ‖ (明文[i] XOR keystream(i))
+// 逃生开关（StrencLegacyKeystream / StringEncrypt.LegacyKeystream）为 true 时
+// 回到旧的 SHA-256 keystream 实现（不依赖原生库、无需嵌入守卫库）：
 //
-// 为什么单点已知明文攻不下它：
-//   - keystream(i) 是 SHA-256 的输出，已知某个 i 的流字节能反推 secret 或
-//     其它 i 的流字节是不可能的（需要求 SHA-256 的原像/内部状态）；
-//   - 每个字符串带独立 nonce（由明文确定性派生，见 stringNonce），因此
-//     不同字符串在相同下标处的密钥流相互独立，不存在常数差或任何线性关系，
-//     不能用两个字符串的异或消元（two-time pad）互相解密；
-//   - 下标以 32 位小端进入哈希输入，位置信息不丢失，同一字符串内不同位置也
-//     是完全独立的哈希输出。
+//	nonce = SHA-256(secret ‖ 0x00 ‖ 明文)[0:8]
+//	ks(i) = SHA-256(secret ‖ 0x01 ‖ nonce ‖ LE32(i))[0]
+//	ciphertext = Base64(nonce ‖ (明文[i] XOR ks(i)))
 //
-// 为什么用 java.security.MessageDigest/SHA-256 而不是 AES-CTR：
-//   - 不需要 Cipher/SecretKeySpec/IvParameterSpec 一整套样板，注入字节码更短、
-//     更不容易写错寄存器与宽值；
-//   - SHA-256 在 Android 全版本可用，且"摘要"语义比"加密"更不显眼。
-//
-// 确定性：secret 由 Pass 层从 seed/dex_key 派生，nonce 是明文的确定性函数，
-// 所以同一 seed/密钥必然得到同一密文，产物可复现。
+// 该路径仅用于「不方便带 .so 的兼容性场景」，安全强度弱于 SIV（无完整性），
+// 默认关闭。旧实现更早的形态是单字节密钥 + 仿射流 key+i*17，已被彻底删除。
 
 // StringEncrypt 描述 A2 字符串加密的参数。
 //
-// 加密方案：先给明文前置 8 字节 nonce，再与 SHA-256 派生的密钥流逐字节异或，
-// 最后以 **Base64** 编码成 ASCII 字符串存入字符串池，运行时由注入的解密方法还原。
+// 加密方案（默认）：用 AES-256-SIV 加密明文得到 [SIV 标签 16B][CTR 密文]，
+// 再以 **Base64** 编码成 ASCII 字符串存入字符串池，运行时由注入的解密方法
+// 经 Native.sivDecrypt 还原。LegacyKeystream 为 true 时改用旧的
+// SHA-256 keystream（见文件头说明）。
 //
 // 为什么用 Base64 而不是十六进制：
 //   - 体积：十六进制把密文撑大一倍，Base64 只多 1/3；
 //   - 特征：十六进制密文是「长串 0-9a-f」，扫描器一行正则就能把它挑出来；
 //     Base64 混入大小写字母，同样的正则命中率大幅下降；
 //   - 为什么不能直接存原始密文字节：DEX 的字符串池是 MUTF-8 编码的 UTF-16
-//     序列，任意异或结果可能产生孤立代理码元，而 Go 的 string 无法表示孤立代理。
+//     序列，任意字节序列可能产生孤立代理码元，而 Go 的 string 无法表示孤立代理。
 //
 // 安全前提（见 planStringEncrypt）：密文必须与池内既有字符串**不重复**，
 // 否则池会去重成同一项，导致别的引用解密出错误的明文。
@@ -61,10 +60,26 @@ type StringEncrypt struct {
 	Class string
 	// MethodName 是解密方法名，签名固定为 (Ljava/lang/String;)Ljava/lang/String;。
 	MethodName string
+	// LegacyKeystream 为 true 时使用旧的 SHA-256 keystream 实现（自造构造，
+	// 无完整性保护，但不需要原生库）。默认 false，走 AES-256-SIV。
+	//
+	// 该开关只影响 Go 侧加密与注入的解密器形态，二者必须一致：传 true 时
+	// stringDecryptorAddition 生成旧的 MessageDigest 解密器，否则生成
+	// 「Base64 → Native.sivDecrypt → new String」的新解密器。
+	LegacyKeystream bool
+	// LibName 是注入解密器 <clinit> 里 System.loadLibrary 的库名（不含 lib
+	// 前缀与 .so 后缀）。留空时用 NativeLibName（"apkguard"）。
+	//
+	// 必须与产物里实际加载的守卫库名一致。C7（原生库伪装）会改库名并改写
+	// 壳侧 loadLibrary 实参，但它只改写壳 DEX——因此 Pass 层在 C7 启用时必须
+	// 把 C7 派生出的假名传进来（见 passes/guardLibNameOf），否则 A2 注入的
+	// loadLibrary 会与实际文件名不符而 UnsatisfiedLinkError。
+	LibName string
 	// Key 是主密钥，32 字节。
 	//
-	// 旧实现是单字节且密钥流可被单点已知明文攻破；改用 32 字节并交给
-	// SHA-256 派生密钥流后，已知任意多组 (明文, 密文) 也无法反推密钥。
+	// 旧实现是单字节且密钥流可被单点已知明文攻破；现在是 32 字节主密钥，
+	// 交给 AES-256-SIV 使用（旧路径再 SHA-256 派生密钥流）。32 字节宽度
+	// 对两种路径都足够，已知任意多组 (明文, 密文) 都无法反推密钥。
 	Key [32]byte
 	// MinLen 是参与加密的最短字符串长度（按 UTF-8 字节计）。
 	MinLen int
@@ -110,18 +125,23 @@ type stringEncryptPlan struct {
 	methodIdx uint32
 }
 
-// stringNonceSize 是每个字符串前置的 nonce 字节数。
+// ---- 旧路径（LegacyKeystream）专用的 nonce / 密钥流 ----
+//
+// 仅在 StringEncrypt.LegacyKeystream 为 true 时使用；默认的 AES-SIV 路径
+// 完全不需要它们。保留是为了「逃生开关」能回到旧实现。
+
+// stringNonceSize 是旧路径中每个字符串前置的 nonce 字节数。
 //
 // 必须足够长以压住「不同明文撞同一 nonce」的概率：4 字节在数万字符串规模下
 // 生日碰撞已不可忽略（两个撞上 nonce 的字符串共用密钥流，退化成 two-time pad）；
 // 8 字节把碰撞概率压到 2^-64 量级，而只多 8 字节（约 11 个 Base64 字符）开销。
 const stringNonceSize = 8
 
-// stringKSInputSize 是解密器为 SHA-256 构造的输入数组长度：
+// stringKSInputSize 是旧解密器为 SHA-256 构造的输入数组长度：
 // secret(32) ‖ 域分隔(1) ‖ nonce(8) ‖ 小端下标(4)。
 const stringKSInputSize = 32 + 1 + stringNonceSize + 4
 
-// stringNonce 由密钥与明文确定性地派生 nonce。
+// stringNonce 由密钥与明文确定性地派生 nonce（旧路径）。
 //
 // 为什么 nonce 由明文派生而不是随机：
 //   - 加固必须可复现（同一 seed/密钥 → 同一密文），随机数会破坏这一点；
@@ -140,7 +160,7 @@ func stringNonce(key [32]byte, plain []byte) [stringNonceSize]byte {
 	return n
 }
 
-// keyStreamByte 返回第 i 个字节的密钥流字节。
+// keyStreamByte 返回第 i 个字节的密钥流字节（旧路径）。
 //
 // keystream = SHA-256(secret ‖ 0x01 ‖ nonce ‖ LE32(i))，取摘要首字节。
 // 每个位置一个独立哈希，已知任一位置的流字节都无法推出其它位置或密钥。
@@ -156,11 +176,10 @@ func keyStreamByte(key [32]byte, nonce [stringNonceSize]byte, i int) byte {
 	return sum[0]
 }
 
-// encryptString 把明文字符串加密为 Base64 密文。
+// legacyEncryptString 是旧路径的加密：Base64( nonce(8) ‖ 逐字节异或结果 )。
 //
-// 输出布局：Base64( nonce(8) ‖ 逐字节异或结果 )。
-// 解密方法先 Base64 解码，取出前 8 字节 nonce，再算出同一密钥流还原明文。
-func encryptString(s string, key [32]byte) string {
+// 与 injectDecryptorLegacy 生成的方法逐字节对应。
+func legacyEncryptString(s string, key [32]byte) string {
 	p := []byte(s)
 	nonce := stringNonce(key, p)
 	buf := make([]byte, stringNonceSize+len(p))
@@ -171,37 +190,68 @@ func encryptString(s string, key [32]byte) string {
 	return base64.StdEncoding.EncodeToString(buf)
 }
 
-// DecryptorStrings 返回 A2 注入的解密器类体里用到的字符串常量。
+// encryptString 把明文字符串加密为 Base64 密文。
 //
-// 为什么需要它：A2 与 A3 是两次**独立**的 Rebuild，A2 写回的 DEX 里解密器
-// 已经是既有类，于是 A3 会把解密器自己的常量也当成「应用常量」数组化，
-// 让解密器反过来依赖还原器——既白增体积，又破坏了「A2 已覆盖全部常量时
-// A3 不应当再改写」这条不变量（后者由 TestEncryptThenArrayE2E 钉住）。
+// legacy=false（默认）：AES-256-SIV，输出 Base64( [SIV 16B] ‖ CTR 密文 )；
+// legacy=true：旧 SHA-256 keystream，输出 Base64( nonce(8) ‖ 异或结果 )。
 //
-// 这里不硬编码常量表，而是真的构造一次解密器、把它的字符串引用收集出来，
-// 避免实现改动后这份清单悄悄过期。
-func DecryptorStrings() []string {
-	add, err := stringDecryptorAddition(&StringEncrypt{
-		Class: "Lx/Dec;", MethodName: "a", InjectClass: true,
-	})
-	if err != nil {
-		return nil
+// 两种形态都保证输出是纯 ASCII（可安全放进 DEX 字符串池）。SIV 的唯一
+// 失败点是 AES 密钥长度——本函数固定 32 字节，因此实践中不会失败，但仍
+// 显式返回错误而不是静默产出退化结果。
+func encryptString(s string, key [32]byte, legacy bool) (string, error) {
+	if legacy {
+		return legacyEncryptString(s, key), nil
 	}
-	var out []string
-	seen := map[string]bool{}
-	for _, c := range add.Classes {
+	blob, err := pack.EncryptNamed([]byte(s), key, "")
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(blob), nil
+}
+
+// addStringsFromClasses 把注入类的全部方法体里引用的字符串常量收集进 out。
+func addStringsFromClasses(out map[string]bool, classes []ClassSpec) {
+	for _, c := range classes {
 		for _, m := range c.Methods {
 			if m.Code == nil {
 				continue
 			}
 			for _, p := range m.Code.Patches {
-				if p.Ref.Kind != RefString || seen[p.Ref.String] {
-					continue
+				if p.Ref.Kind == RefString {
+					out[p.Ref.String] = true
 				}
-				seen[p.Ref.String] = true
-				out = append(out, p.Ref.String)
 			}
 		}
+	}
+}
+
+// DecryptorStrings 返回 A2 注入到 DEX 里的「工具自身」字符串常量。
+//
+// 为什么需要它：A2 与 A3 是两次**独立**的 Rebuild，A2 写回的 DEX 里解密器与
+// native 桥接类已经是既有类，于是 A3 会把它们的常量也当成「应用常量」数组化，
+// 让解密器/桥接类反过来依赖还原器——既白增体积，又破坏了「A2 已覆盖全部
+// 常量时 A3 不应当再改写」这条不变量（后者由 TestEncryptThenArrayE2E 钉住）。
+//
+// 这里不硬编码常量表，而是真的构造一次解密器与桥接类、把它们的字符串引用
+// 收集出来，避免实现改动后这份清单悄悄过期。返回顺序不稳定，调用方按集合用。
+func DecryptorStrings() []string {
+	seen := map[string]bool{}
+	// 解密器（默认 SIV 形态）。
+	if add, err := stringDecryptorAddition(&StringEncrypt{
+		Class: "Lx/Dec;", MethodName: "a", InjectClass: true,
+	}); err == nil {
+		addStringsFromClasses(seen, add.Classes)
+	}
+	// 桥接类由 A2 在同一次重建里一并注入（消费方见 passes/strenc.go），
+	// 它的常量（"SHA-256"、库名）同样必须排除，否则 A3 会把它们数组化。
+	if add, err := NativeBridgeAddition(&NativeBridgeSpec{
+		Class: NativeBridgeClass, LibName: NativeLibName, NeedDecrypt: true,
+	}); err == nil {
+		addStringsFromClasses(seen, add.Classes)
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
 	}
 	return out
 }
@@ -313,7 +363,10 @@ func planStringEncrypt(f *File, se *StringEncrypt, values []string) (cipher, rep
 		if _, ok := cipher[s]; ok {
 			continue
 		}
-		ct := encryptString(s, se.Key)
+		ct, err := encryptString(s, se.Key, se.LegacyKeystream)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dex: 加密字符串失败: %w", err)
+		}
 		// 密文不得与池内**任一**既有字符串相同。
 		//
 		// 字符串池是按内容去重的：若密文恰好等于另一个条目的内容，两者会合并成
@@ -367,10 +420,86 @@ func StringEncryptTargets(f *File, se *StringEncrypt) (int, error) {
 
 // stringDecryptorAddition 构造注入解密器所需的全部索引表条目与类定义。
 //
+// 默认生成 AES-256-SIV 解密器（Base64 解码 → Native.sivDecrypt → new String，
+// 校验失败抛异常），并给类加一个 <clinit> 加载守卫库；se.LegacyKeystream 为
+// true 时生成旧的 MessageDigest 解密器（见 stringDecryptorAdditionLegacy）。
+//
 // 当 se.InjectClass 为 false 时只登记类型/原型/方法引用（供 invoke 指令使用），
 // 不生成 class_def —— 供「只引用、不落地类体」的窄场景使用（A2 Pass 现为每个
 // 含密文 DEX 各注入一份类名不同的类体，因此传 true）。
 func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
+	if se.LegacyKeystream {
+		return stringDecryptorAdditionLegacy(se)
+	}
+
+	protoStr := ProtoSpec{Ret: "Ljava/lang/String;", Params: []string{"Ljava/lang/String;"}}
+	protoInit := ProtoSpec{Ret: "V", Params: []string{"[B", "Ljava/lang/String;"}}
+	// android.util.Base64.decode(String, int) -> byte[]
+	protoDecode := ProtoSpec{Ret: "[B", Params: []string{"Ljava/lang/String;", "I"}}
+	// Native.sivDecrypt(byte[], byte[], byte[]) -> byte[]（守卫库 JNI 入口）
+	protoSiv := ProtoSpec{Ret: "[B", Params: []string{"[B", "[B", "[B"}}
+	// RuntimeException.<init>()V（解密失败时抛出）
+	protoV := ProtoSpec{Ret: "V"}
+	// System.loadLibrary(String)V
+	protoLoad := ProtoSpec{Ret: "V", Params: []string{"Ljava/lang/String;"}}
+
+	strInit := MethodSpec{Class: "Ljava/lang/String;", Name: "<init>", Proto: protoInit}
+	decB64 := MethodSpec{Class: "Landroid/util/Base64;", Name: "decode", Proto: protoDecode}
+	sivDec := MethodSpec{Class: NativeBridgeClass, Name: NativeDecrypt, Proto: protoSiv}
+	rtInit := MethodSpec{Class: "Ljava/lang/RuntimeException;", Name: "<init>", Proto: protoV}
+	loadLib := MethodSpec{Class: descSystem, Name: "loadLibrary", Proto: protoLoad}
+	decrypt := MethodSpec{Class: se.Class, Name: se.MethodName, Proto: protoStr}
+	clinit := MethodSpec{Class: se.Class, Name: "<clinit>", Proto: protoV}
+
+	libName := se.LibName
+	if libName == "" {
+		libName = NativeLibName
+	}
+
+	add := Addition{
+		Types: []string{
+			se.Class, "[B", "I", "V",
+			"Ljava/lang/String;", "Landroid/util/Base64;",
+			NativeBridgeClass, "Ljava/lang/RuntimeException;", descSystem,
+		},
+		Protos:  []ProtoSpec{protoStr, protoInit, protoDecode, protoSiv, protoV, protoLoad},
+		Methods: []MethodSpec{decrypt, strInit, decB64, sivDec, rtInit, loadLib},
+	}
+	if !se.InjectClass {
+		return add, nil
+	}
+
+	code, err := stringDecryptorCodeSIV(se.Key, decB64, strInit, sivDec, rtInit)
+	if err != nil {
+		return Addition{}, err
+	}
+	clinitCode, err := stringDecryptorClinit(libName, loadLib)
+	if err != nil {
+		return Addition{}, err
+	}
+	add.Methods = append(add.Methods, clinit)
+	add.Classes = []ClassSpec{{
+		Name:  se.Class,
+		Super: descObject,
+		// 类级标志只能是「类能用的那些位」：STATIC 是**成员**标志，
+		// 写在 class_def 上属于非法组合（真实工具链产出的 DEX 里
+		// 五万多个类没有一个这么写）。纯静态工具类用 PUBLIC | FINAL。
+		Access: accPublic | accFinal, // 纯静态工具类
+		Methods: []ClassMethod{
+			// <clinit> 先加载守卫库：sivDecrypt 是 native 方法，库没加载
+			// 会以 UnsatisfiedLinkError 崩溃，且崩溃点离原因很远。
+			{Name: "<clinit>", Proto: protoV, Access: accStatic, Code: clinitCode},
+			{Name: se.MethodName, Proto: protoStr, Access: accPublic | accStatic, Code: code},
+		},
+	}}
+	return add, nil
+}
+
+// stringDecryptorAdditionLegacy 是旧的 SHA-256 keystream 解密器（逃生开关）。
+//
+// 与 stringDecryptorCodeLegacy 逐字节对应；不依赖原生库，因此该路径下
+// A2 不需要嵌入守卫库、也不注入 native 桥接类。
+func stringDecryptorAdditionLegacy(se *StringEncrypt) (Addition, error) {
 	protoStr := ProtoSpec{Ret: "Ljava/lang/String;", Params: []string{"Ljava/lang/String;"}}
 	protoInit := ProtoSpec{Ret: "V", Params: []string{"[B", "Ljava/lang/String;"}}
 	// android.util.Base64.decode(String, int) -> byte[]
@@ -399,13 +528,13 @@ func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 		return add, nil
 	}
 
-	code, err := stringDecryptorCode(se.Key, decB64, strInit, mdGet, mdDigest)
+	code, err := stringDecryptorCodeLegacy(se.Key, decB64, strInit, mdGet, mdDigest)
 	if err != nil {
 		return Addition{}, err
 	}
 	add.Classes = []ClassSpec{{
 		Name:  se.Class,
-		Super: "Ljava/lang/Object;",
+		Super: descObject,
 		// 类级标志只能是「类能用的那些位」：STATIC 是**成员**标志，
 		// 写在 class_def 上属于非法组合（真实工具链产出的 DEX 里
 		// 五万多个类没有一个这么写）。纯静态工具类用 PUBLIC | FINAL。
@@ -420,9 +549,124 @@ func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 	return add, nil
 }
 
-// stringDecryptorCode 生成解密方法的字节码。
+// stringDecryptorCodeSIV 生成新版解密方法的字节码。
 //
-// 等价 Java 源码（与 Go 侧 encryptString/keyStreamByte 必须逐字节一致）：
+// 等价 Java 源码（AD 为空数组，与 Go 侧 pack.EncryptNamed(plain, key, "") 对应）：
+//
+//	static String a(String s) {
+//	    byte[] blob  = android.util.Base64.decode(s, 0);
+//	    byte[] key   = { SECRET[0], …, SECRET[31] };   // 32 字节常量内联
+//	    byte[] ad    = new byte[0];
+//	    byte[] plain = Native.sivDecrypt(key, ad, blob);
+//	    if (plain == null) throw new RuntimeException();  // 校验失败必须可见
+//	    return new String(plain, "UTF-8");
+//	}
+//
+// 寄存器分配（registers=7、ins=1 → 入参 s 落在 v6）：
+//
+//	v0 = blob   v1 = key   v2 = ad   v3 = plain
+//	v4 = 临时/对象（异常、String 实例、数组长度）  v5 = 临时（下标、"UTF-8"）  v6 = s
+//
+// outs=3：方法内最大的一次 invoke 是 String.<init>(byte[], String) 的 3 个参数。
+func stringDecryptorCodeSIV(key [32]byte, decB64, strInit, sivDec, rtInit MethodSpec) (*CodeBlob, error) {
+	const (
+		rBlob  = 0
+		rKey   = 1
+		rAd    = 2
+		rPlain = 3
+		rObj   = 4
+		rTmp   = 5
+		rS     = 6
+	)
+	a := NewAsm()
+
+	// blob = Base64.decode(s, 0)
+	a.Const4(rTmp, 0)
+	if err := a.InvokeStatic([]int{rS, rTmp}, decB64); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rBlob)
+
+	// key = new byte[32]，逐字节填入常量密钥
+	a.Const16(rTmp, 32)
+	if err := a.NewArray(rKey, rTmp, "[B"); err != nil {
+		return nil, err
+	}
+	a.Const4(rTmp, 0)
+	for _, c := range key {
+		a.Const16(rObj, int16(c))
+		a.APutByte(rObj, rKey, rTmp)
+		a.AddIntLit8(rTmp, 1)
+	}
+
+	// ad = new byte[0]（零长度 AD 组件，等价于 EncryptNamed(name="")）
+	a.Const4(rObj, 0)
+	if err := a.NewArray(rAd, rObj, "[B"); err != nil {
+		return nil, err
+	}
+
+	// plain = Native.sivDecrypt(key, ad, blob)
+	if err := a.InvokeStatic([]int{rKey, rAd, rBlob}, sivDec); err != nil {
+		return nil, err
+	}
+	a.MoveResultObject(rPlain)
+
+	// if (plain == null) throw new RuntimeException();
+	// 解密失败必须可见：绝不静默返回原文，也不返回 null 让调用方继续。
+	a.IfNez(rPlain, "ok") // 非空则跳过抛异常分支
+	a.NewInstance(rObj, "Ljava/lang/RuntimeException;")
+	if err := a.InvokeDirect([]int{rObj}, rtInit); err != nil {
+		return nil, err
+	}
+	a.Throw(rObj)
+
+	// return new String(plain, "UTF-8");
+	a.Label("ok")
+	a.NewInstance(rObj, "Ljava/lang/String;")
+	a.ConstString(rTmp, utf8Charset)
+	if err := a.InvokeDirect([]int{rObj, rPlain, rTmp}, strInit); err != nil {
+		return nil, err
+	}
+	a.ReturnObject(rObj)
+
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		return nil, err
+	}
+	return &CodeBlob{
+		Registers: 7,
+		Ins:       1,
+		Outs:      3,
+		Insns:     insns,
+		Patches:   patches,
+	}, nil
+}
+
+// stringDecryptorClinit 生成解密器类的静态初始化块：加载守卫库。
+//
+// 等价 Java：
+//
+//	static { System.loadLibrary("<守卫库名>"); }
+//
+// 库名由 StringEncrypt.LibName 传入（留空回退 NativeLibName）；C7 启用时
+// 由 Pass 层传入改名后的假名，保证与实际文件名一致。
+func stringDecryptorClinit(libName string, loadLib MethodSpec) (*CodeBlob, error) {
+	a := NewAsm()
+	a.ConstString(0, libName)
+	if err := a.InvokeStatic([]int{0}, loadLib); err != nil {
+		return nil, err
+	}
+	a.ReturnVoid()
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		return nil, err
+	}
+	return &CodeBlob{Registers: 1, Ins: 0, Outs: 1, Insns: insns, Patches: patches}, nil
+}
+
+// stringDecryptorCodeLegacy 生成旧版（SHA-256 keystream）解密方法的字节码。
+//
+// 等价 Java 源码（与 Go 侧 legacyEncryptString/keyStreamByte 必须逐字节一致）：
 //
 //	static String a(String s) {
 //	    byte[] b = android.util.Base64.decode(s, 0);      // b = nonce ‖ cipher
@@ -450,7 +694,7 @@ func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 //	v9 = 255(掩码)  v10 = 数组下标临时   v11 = s（入参）
 //
 // outs=3：方法内最大的一次 invoke 是 String.<init>(byte[], String) 的 3 个参数。
-func stringDecryptorCode(key [32]byte, decB64, strInit, mdGet, mdDigest MethodSpec) (*CodeBlob, error) {
+func stringDecryptorCodeLegacy(key [32]byte, decB64, strInit, mdGet, mdDigest MethodSpec) (*CodeBlob, error) {
 	const (
 		rB    = 0
 		rI    = 1
@@ -740,4 +984,13 @@ func sameWords(a, b []uint16) bool {
 		}
 	}
 	return true
+}
+
+// Throw 生成 throw vReg（格式 11x，操作码 0x27）。
+//
+// 定义在 strenc.go 而不是 asm.go：它是 A2 的 SIV 解密器在「解密失败」分支
+// 专用的指令，asm.go 的通用指令集刻意不含异常语义。注册在这里可避免改动
+// 共享的汇编器文件。
+func (a *Asm) Throw(reg int) {
+	a.emit(0x27 | uint16(reg&0xff)<<8)
 }

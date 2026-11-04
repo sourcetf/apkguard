@@ -3,9 +3,7 @@ package passes
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"fmt"
 	"regexp"
 	"strings"
@@ -13,6 +11,7 @@ import (
 
 	"apkguard/internal/config"
 	"apkguard/internal/dex"
+	"apkguard/internal/pack"
 	"apkguard/internal/pipeline"
 	"apkguard/internal/zipx"
 )
@@ -79,21 +78,25 @@ func decryptorClassNames(t *testing.T, data []byte) []string {
 		if err != nil {
 			return err
 		}
-		// A2 解密器只有一个 static 的直接方法，没有虚方法。
-		if len(pcd.DirectMethods) != 1 || len(pcd.VirtualMethods) != 0 {
+		// A2 解密器没有虚方法；直接方法里必须有一个 (String)String 且带方法体。
+		// 新版解密器还带一个 <clinit>（加载守卫库），因此不能再用「恰好 1 个
+		// 直接方法」判定。
+		if len(pcd.VirtualMethods) != 0 {
 			return nil
 		}
-		m := pcd.DirectMethods[0]
-		desc, err := f.MethodDesc(m.Idx)
-		if err != nil {
-			return nil
-		}
-		rest, ok := strings.CutPrefix(desc, name+"->")
-		if !ok || !strings.HasSuffix(rest, "(Ljava/lang/String;)Ljava/lang/String;") {
-			return nil
-		}
-		if m.Acc&0x0008 != 0 && m.CodeOff != 0 {
-			out = append(out, name)
+		for _, m := range pcd.DirectMethods {
+			desc, err := f.MethodDesc(m.Idx)
+			if err != nil {
+				continue
+			}
+			rest, ok := strings.CutPrefix(desc, name+"->")
+			if !ok || !strings.HasSuffix(rest, "(Ljava/lang/String;)Ljava/lang/String;") {
+				continue
+			}
+			if m.Acc&0x0008 != 0 && m.CodeOff != 0 {
+				out = append(out, name)
+				break
+			}
 		}
 		return nil
 	})
@@ -128,30 +131,16 @@ func checkPerDexDecryptors(t *testing.T, dexes [][]byte) error {
 	return nil
 }
 
-// a2Encrypt 独立复刻 A2 的密文算法（Base64(nonce ‖ SHA-256 密钥流异或)）。
+// a2Encrypt 独立复刻 A2 的默认（AES-256-SIV）密文：Base64( pack.EncryptNamed(明文, key, "") )。
 //
-// 刻意不复用 internal/dex 的未导出实现：这里用它算出「已知密钥下某个明文的
-// 期望密文」，从而验证两个 DEX 的密文确实由同一把密钥产生（跨 DEX 密钥共享）。
+// 用它算出「已知密钥下某个明文的期望密文」，从而验证两个 DEX 的密文确实由
+// 同一把密钥产生（跨 DEX 密钥共享）。AD 为空组件（与 A2 注入的解密器一致）。
 func a2Encrypt(plain string, key [32]byte) string {
-	p := []byte(plain)
-	h := sha256.New()
-	h.Write(key[:])
-	h.Write([]byte{0x00})
-	h.Write(p)
-	nonce := h.Sum(nil)[:8]
-	buf := make([]byte, 8+len(p))
-	copy(buf, nonce)
-	for i, c := range p {
-		var idx [4]byte
-		binary.LittleEndian.PutUint32(idx[:], uint32(i))
-		kh := sha256.New()
-		kh.Write(key[:])
-		kh.Write([]byte{0x01})
-		kh.Write(nonce)
-		kh.Write(idx[:])
-		buf[8+i] = c ^ kh.Sum(nil)[0]
+	blob, err := pack.EncryptNamed([]byte(plain), key, "")
+	if err != nil {
+		panic(err)
 	}
-	return base64.StdEncoding.EncodeToString(buf)
+	return base64.StdEncoding.EncodeToString(blob)
 }
 
 // poolOf 返回 DEX 字符串池的内容集合。

@@ -377,18 +377,30 @@ type Options struct {
 	// 默认 false：维持现有强度，长度达标的串一律加密。开启会**降低**保护强度
 	// （多引用串以明文留在字符串池，strings/grep 可直接提取），仅用于让产物的
 	// 加密分布更像样本，不建议常规使用。
-	ObfStringSingleRefOnly bool   `json:"obf_string_single_ref"`
-	Seed                   string `json:"seed"`            // 随机种子（留空则随机）
-	FakeDexCount           int    `json:"fake_dex_count"`  // A9 伪 DEX 块数量
-	FakeDexSize            int    `json:"fake_dex_size"`   // A9 每块字节数
-	JunkTopCount           int    `json:"junk_top_count"`  // A10 非 ASCII 顶层文件数
-	JunkDirCount           int    `json:"junk_dir_count"`  // A10 随机深目录条目数
-	JunkDirDepth           int    `json:"junk_dir_depth"`  // A10 深目录最大层数
-	JunkMetaCount          int    `json:"junk_meta_count"` // A10 畸形 META-INF 条目数
-	ZipAtkCount            int    `json:"zip_atk_count"`   // A12 每类路径攻击条目数
-	ClassPadCount          int    `json:"class_pad_count"` // A13 膨胀类数量
-	StampTime              string `json:"stamp_time"`      // A14 统一时间戳（RFC3339，留空用固定值）
-	ManifestPadMB          int    `json:"manifest_pad_mb"` // A15 巨型 Manifest 填充量（MB，0=默认 100）
+	ObfStringSingleRefOnly bool `json:"obf_string_single_ref"`
+	// StrencLegacyKeystream 让 A2 回到旧的 SHA-256 keystream 实现（自造构造、
+	// 无完整性保护），而不是默认的 AES-256-SIV。
+	//
+	// 存在的理由：默认的 SIV 路径解密只能由守卫库的 Native.sivDecrypt 完成，
+	// 因此 A2 启用时产物会带上 lib/<abi>/libapkguard.so（约 3 个 ABI）。对
+	// 「不方便/不希望携带原生库」的极端兼容性场景，可用本开关回到纯 JCA 的
+	// 旧实现——代价是密文不再有完整性保护（篡改后解出的是乱码而非拒绝），
+	// 且不嵌入任何原生库。
+	//
+	// 默认 false。字段是普通 bool（零值即关闭），默认值由 CLI flag 默认值与
+	// Web 复选框默认未勾选提供，Options 本身保持零值语义。
+	StrencLegacyKeystream bool   `json:"strenc_legacy_keystream"`
+	Seed                  string `json:"seed"`            // 随机种子（留空则随机）
+	FakeDexCount          int    `json:"fake_dex_count"`  // A9 伪 DEX 块数量
+	FakeDexSize           int    `json:"fake_dex_size"`   // A9 每块字节数
+	JunkTopCount          int    `json:"junk_top_count"`  // A10 非 ASCII 顶层文件数
+	JunkDirCount          int    `json:"junk_dir_count"`  // A10 随机深目录条目数
+	JunkDirDepth          int    `json:"junk_dir_depth"`  // A10 深目录最大层数
+	JunkMetaCount         int    `json:"junk_meta_count"` // A10 畸形 META-INF 条目数
+	ZipAtkCount           int    `json:"zip_atk_count"`   // A12 每类路径攻击条目数
+	ClassPadCount         int    `json:"class_pad_count"` // A13 膨胀类数量
+	StampTime             string `json:"stamp_time"`      // A14 统一时间戳（RFC3339，留空用固定值）
+	ManifestPadMB         int    `json:"manifest_pad_mb"` // A15 巨型 Manifest 填充量（MB，0=默认 100）
 
 	// ---- 欺骗类手法（A16~A20 / C7）的参数 ----
 

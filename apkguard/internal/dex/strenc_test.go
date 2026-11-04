@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"strings"
 	"testing"
+
+	"apkguard/internal/pack"
 )
 
 // testKey 生成一个 32 字节测试密钥：首字节给定，其余按简单规则填充，
@@ -18,8 +20,105 @@ func testKey(b byte) [32]byte {
 	return k
 }
 
-// TestEncryptStringRoundTrip 验证加解密互为逆运算。
-func TestEncryptStringRoundTrip(t *testing.T) {
+// ---- AES-256-SIV 路径（默认） ----
+
+// TestEncryptStringSIVRoundTrip 验证默认路径的 Go 侧自洽：加密后能用
+// pack.DecryptNamed 逐字节还原，且密文是纯 ASCII 的 Base64。
+func TestEncryptStringSIVRoundTrip(t *testing.T) {
+	cases := []struct {
+		s   string
+		key [32]byte
+	}{
+		{"hello", testKey(0x5a)},
+		{"", testKey(0x00)},
+		{"https://api.example.com/v1/pay", testKey(0xff)},
+		{"中文测试字符串", testKey(0x37)},
+		{"emoji \U0001F600 ok", testKey(0x01)},
+		{"a", testKey(0x80)},
+		{strings.Repeat("A", 1024), testKey(0x42)},
+	}
+	for _, c := range cases {
+		ct, err := encryptString(c.s, c.key, false)
+		if err != nil {
+			t.Fatalf("%q 加密失败: %v", c.s, err)
+		}
+		assertBase64ASCII(t, ct)
+		// 密文长度：Base64( [SIV 16B] ‖ CTR(len) )。
+		wantLen := (len(c.s) + pack.BlockSize + 2) / 3 * 4
+		if len(ct) != wantLen {
+			t.Fatalf("%q 的密文长度应为 %d（Base64），实际 %d", c.s, wantLen, len(ct))
+		}
+		raw, err := base64.StdEncoding.DecodeString(ct)
+		if err != nil {
+			t.Fatalf("%q Base64 解码失败: %v", c.s, err)
+		}
+		if len(raw) != pack.BlockSize+len(c.s) {
+			t.Fatalf("%q 解出的 blob 长度应为 16+n=%d，实际 %d", c.s, pack.BlockSize+len(c.s), len(raw))
+		}
+		got, err := pack.DecryptNamed(raw, c.key, "")
+		if err != nil {
+			t.Fatalf("%q 用 pack.DecryptNamed 还原失败: %v", c.s, err)
+		}
+		if string(got) != c.s {
+			t.Fatalf("还原结果不符：%q -> %q", c.s, got)
+		}
+	}
+}
+
+// assertBase64ASCII 断言字符串是纯 Base64 ASCII。
+func assertBase64ASCII(t *testing.T, ct string) {
+	t.Helper()
+	for i := 0; i < len(ct); i++ {
+		ch := ct[i]
+		ok := ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' ||
+			ch >= '0' && ch <= '9' || ch == '+' || ch == '/' || ch == '='
+		if !ok {
+			t.Fatalf("密文含非 Base64 字符 %q", ch)
+		}
+	}
+}
+
+// TestEncryptStringSIVDeterministic 验证 SIV 路径可复现（同 key/明文 → 同密文）。
+func TestEncryptStringSIVDeterministic(t *testing.T) {
+	key := testKey(0x11)
+	s := "https://api.example.com/v1/pay"
+	first, _ := encryptString(s, key, false)
+	second, _ := encryptString(s, key, false)
+	if first != second {
+		t.Fatalf("同一输入两次加密不一致：%q vs %q", first, second)
+	}
+	other, _ := encryptString(s, testKey(0x12), false)
+	if other == first {
+		t.Fatal("换密钥后密文未变化")
+	}
+}
+
+// TestSIVTamperRejected 验证 SIV 的 AEAD 语义：篡改任意字节后解密必失败，
+// 而不是像旧的 keystream 那样「解出一段乱码」。
+func TestSIVTamperRejected(t *testing.T) {
+	key := testKey(0x9e)
+	ct, err := encryptString("https://api.example.com/v1/pay", key, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(ct)
+	for i := range raw {
+		bad := append([]byte(nil), raw...)
+		bad[i] ^= 0x01
+		if _, err := pack.DecryptNamed(bad, key, ""); err == nil {
+			t.Fatalf("篡改第 %d 字节后仍解密成功（SIV 校验失效）", i)
+		}
+	}
+	// 错误密钥必须失败。
+	if _, err := pack.DecryptNamed(raw, testKey(0x9f), ""); err == nil {
+		t.Fatal("错误密钥仍解密成功")
+	}
+}
+
+// ---- 旧 keystream 路径（逃生开关） ----
+
+// TestEncryptStringLegacyRoundTrip 验证旧路径加解密互为逆运算。
+func TestEncryptStringLegacyRoundTrip(t *testing.T) {
 	cases := []struct {
 		s   string
 		key [32]byte
@@ -32,35 +131,27 @@ func TestEncryptStringRoundTrip(t *testing.T) {
 		{"a", testKey(0x80)},
 	}
 	for _, c := range cases {
-		ct := encryptString(c.s, c.key)
-		// 密文必须是纯 ASCII 的 Base64：这是「可安全放进 DEX 字符串池」的前提
-		// （池是 MUTF-8 编码的 UTF-16，非 ASCII 可能产生孤立代理码元）。
-		for i := 0; i < len(ct); i++ {
-			ch := ct[i]
-			ok := ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' ||
-				ch >= '0' && ch <= '9' || ch == '+' || ch == '/' || ch == '='
-			if !ok {
-				t.Fatalf("%q 的密文含非 Base64 字符 %q", c.s, ch)
-			}
+		ct, err := encryptString(c.s, c.key, true)
+		if err != nil {
+			t.Fatalf("%q 加密失败: %v", c.s, err)
 		}
+		assertBase64ASCII(t, ct)
 		// Base64 是 4/3 膨胀；明文前额外前置 stringNonceSize 字节 nonce。
 		wantLen := (len(c.s) + stringNonceSize + 2) / 3 * 4
 		if len(ct) != wantLen {
 			t.Fatalf("%q 的密文长度应为 %d（Base64），实际 %d", c.s, wantLen, len(ct))
 		}
-		if got := decryptString(ct, c.key); got != c.s {
+		if got := legacyDecryptString(ct, c.key); got != c.s {
 			t.Fatalf("解密结果不符：%q -> %q -> %q", c.s, ct, got)
 		}
 	}
 }
 
-// decryptString 是 encryptString 的逆运算，独立实现以便交叉验证。
+// legacyDecryptString 是 legacyEncryptString 的逆运算，独立实现以便交叉验证。
 //
-// 它模拟注入到 DEX 中的解密方法的行为：先 Base64 解码，取出前 stringNonceSize
-// 字节 nonce，再按 SHA-256(secret‖0x01‖nonce‖LE32(i)) 逐字节异或还原。
-// 刻意不复用 encryptString / keyStreamByte 的任何内部步骤，避免「用同一份可能
-// 出错的代码校验自己」。
-func decryptString(ct string, key [32]byte) string {
+// 刻意不复用 legacyEncryptString / keyStreamByte 的任何内部步骤，避免
+// 「用同一份可能出错的代码校验自己」。
+func legacyDecryptString(ct string, key [32]byte) string {
 	raw, err := base64.StdEncoding.DecodeString(ct)
 	if err != nil || len(raw) < stringNonceSize {
 		return "!base64-decode-failed"
@@ -81,34 +172,35 @@ func decryptString(ct string, key [32]byte) string {
 	return string(out)
 }
 
-// TestEncryptStringDeterministic 验证加密可复现：同一密钥与明文必须得到同一密文。
-//
-// nonce 是明文的确定性函数（stringNonce），不含随机数，因此加固产物可复现；
-// 若这里改成随机 nonce，同一 APK 多次加固结果会不同，排查问题会变得困难。
-func TestEncryptStringDeterministic(t *testing.T) {
+// TestEncryptStringLegacyDeterministic 验证旧路径同样可复现。
+func TestEncryptStringLegacyDeterministic(t *testing.T) {
 	key := testKey(0x11)
 	s := "https://api.example.com/v1/pay"
-	first := encryptString(s, key)
-	second := encryptString(s, key)
+	first, _ := encryptString(s, key, true)
+	second, _ := encryptString(s, key, true)
 	if first != second {
 		t.Fatalf("同一输入两次加密不一致：%q vs %q", first, second)
 	}
-	// 换密钥必须换密文。
-	if other := encryptString(s, testKey(0x12)); other == first {
+	if other, _ := encryptString(s, testKey(0x12), true); other == first {
 		t.Fatal("换密钥后密文未变化")
 	}
 }
 
 // TestKnownPlaintextCannotRecoverKey 验证旧的单点已知明文攻击已失效。
 //
-// 旧实现 keyStream = key + i*17 的密钥只有 1 字节：攻击者拿到任意一个
-// (明文, 密文) 对后，遍历 256 种 key' 就能解出密钥、进而解出全部字符串。
-// 新实现的密钥是 32 字节、密钥流由 SHA-256 派生，这个攻击必须彻底失败。
+// 用「单字节密钥 + 仿射流 key+i*17」的旧实现：攻击者拿到任意一个 (明文, 密文)
+// 对后，遍历 256 种 key' 就能解出密钥。现行实现（无论 SIV 还是 SHA-256
+// keystream）的密钥都是 32 字节，这个攻击必须彻底失败。这里在 legacy 路径上
+// 验证（SIV 路径连「密钥流」概念都没有）。
 func TestKnownPlaintextCannotRecoverKey(t *testing.T) {
 	key := testKey(0x9e)
 	// "https://..." 这类常量在真实 APK 中必然存在，视为攻击者已知。
 	known := "https://api.example.com/v1/pay"
-	raw, err := base64.StdEncoding.DecodeString(encryptString(known, key))
+	ct, err := encryptString(known, key, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(ct)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +223,11 @@ func TestKnownPlaintextCannotRecoverKey(t *testing.T) {
 	// 攻击 2：把已知字符串的密钥流直接拿去解另一个字符串（同下标消元）。
 	// 若两个字符串的密钥流相同或只差常数，这一步就会得到明文。
 	other := "com.example.app.SecretToken"
-	oraw, err := base64.StdEncoding.DecodeString(encryptString(other, key))
+	oct, err := encryptString(other, key, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oraw, err := base64.StdEncoding.DecodeString(oct)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +262,11 @@ func TestKeyStreamNotAffine(t *testing.T) {
 	}
 	streams := make([][]byte, len(strs))
 	for j, s := range strs {
-		raw, err := base64.StdEncoding.DecodeString(encryptString(s, key))
+		ct, err := encryptString(s, key, true)
+		if err != nil {
+			t.Fatalf("%q: %v", s, err)
+		}
+		raw, err := base64.StdEncoding.DecodeString(ct)
 		if err != nil {
 			t.Fatalf("%q: %v", s, err)
 		}
@@ -367,10 +467,21 @@ func TestRebuildStringEncrypt(t *testing.T) {
 		if err != nil {
 			t.Fatalf("解密器 class_data 解析失败: %v", err)
 		}
-		if len(pcd.DirectMethods) != 1 {
-			t.Fatalf("解密器应有 1 个直接方法，实际 %d", len(pcd.DirectMethods))
+		// 新版解密器含 <clinit> + 解密方法（共 2 个直接方法），按签名定位解密方法。
+		var m EncodedMethod
+		ok := false
+		for _, dm := range pcd.DirectMethods {
+			d, err := g.MethodDesc(dm.Idx)
+			if err != nil {
+				continue
+			}
+			if strings.HasSuffix(d, "->a(Ljava/lang/String;)Ljava/lang/String;") {
+				m, ok = dm, true
+			}
 		}
-		m := pcd.DirectMethods[0]
+		if !ok {
+			t.Fatal("解密器类里找不到 (String)String 的解密方法")
+		}
 		if m.CodeOff == 0 {
 			t.Fatal("解密方法缺少方法体")
 		}
@@ -417,7 +528,10 @@ func TestRebuildStringEncrypt(t *testing.T) {
 		t.Fatal("没有任何明文被移出字符串池")
 	}
 	// 密文必须出现在池中
-	ct := encryptString("apkguard-probe", key)
+	ct, err := encryptString("apkguard-probe", key, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := newStrs[ct]; ok {
 		t.Fatal("探测字符串本不该出现在池中")
 	}
@@ -496,19 +610,31 @@ func TestDecryptorSemantics(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(pcd.DirectMethods) != 1 {
-			t.Fatalf("解密器方法数异常: %d", len(pcd.DirectMethods))
+		// 新版解密器除了解密方法还带一个 <clinit>（加载守卫库），因此按
+		// (String)String 签名定位解密方法，而不是假定直接方法恰有 1 个。
+		for _, m := range pcd.DirectMethods {
+			d, err := g.MethodDesc(m.Idx)
+			if err != nil {
+				continue
+			}
+			if !strings.HasSuffix(d, "->a(Ljava/lang/String;)Ljava/lang/String;") {
+				continue
+			}
+			codeOff = m.CodeOff
+			mIdx = m.Idx
+			found = true
 		}
-		codeOff = pcd.DirectMethods[0].CodeOff
-		mIdx = pcd.DirectMethods[0].Idx
-		found = true
 		return nil
 	})
 	if !found {
 		t.Fatal("未找到解密器类")
 	}
 
-	// 逐个跑明文，验证解密结果与原文一致（含多字节 UTF-8 与代理对）
+	// 逐个跑明文，验证解密结果与原文一致（含多字节 UTF-8 与代理对）。
+	//
+	// 新版解密器调用 Native.sivDecrypt，解释器需要一个用 internal/pack 真实现
+	// 的桩；安装后走「Go 加密 → 字节码解密」的真实往返。
+	defer installStrencSIVStub()()
 	for _, plain := range []string{
 		"hello",
 		"https://api.example.com/v1/pay",
@@ -517,7 +643,10 @@ func TestDecryptorSemantics(t *testing.T) {
 		"a",
 		"",
 	} {
-		ct := encryptString(plain, key)
+		ct, err := encryptString(plain, key, false)
+		if err != nil {
+			t.Fatalf("加密 %q 失败: %v", plain, err)
+		}
 		got, err := runDecryptor(g, mIdx, codeOff, ct)
 		if err != nil {
 			t.Fatalf("执行解密方法失败（明文 %q）: %v", plain, err)

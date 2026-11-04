@@ -68,6 +68,26 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		minLen = 0
 	}
 
+	// 默认走 AES-256-SIV：解密只能由守卫库的 Native.sivDecrypt 完成，因此
+	// A2 启用时必须嵌入守卫库（3 个 ABI，与该 APK 现有 ABI 取交集/补齐的规则
+	// 与 C1 完全一致，直接复用 embedGuardLibs）。这是本改动的主要体积代价。
+	//
+	// StrencLegacyKeystream 为 true 时回到旧的 SHA-256 keystream：纯 Java/JCA，
+	// 不依赖原生库，因此不嵌入 lib/。
+	legacy := opts.StrencLegacyKeystream
+	libName := dex.NativeLibName
+	if !legacy {
+		if libName, err = guardLibNameOf(opts); err != nil {
+			return err
+		}
+		added, libErr := EnsureGuardLibs(art)
+		if libErr != nil {
+			return fmt.Errorf("A2 嵌入守卫库失败: %w", libErr)
+		}
+		art.Note("A2 字符串加密走 AES-256-SIV：已嵌入 %d 个 ABI 的守卫库（解密由 Native.sivDecrypt 完成）", added)
+		art.Stat("A2.guard_libs", fmt.Sprint(added))
+	}
+
 	// 解密器类名由 seed 派生（同一 seed 可复现），形态对齐样本
 	// （Lcom/rjurepzl/cf/iimlqh;）：随机包1/随机包2/随机短名，全小写。
 	// used 先装入**全部 DEX 的全部字符串**（类型描述符也在池内），再逐 DEX
@@ -92,6 +112,10 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 
 	totalBefore, totalAfter, totalEnc, totalCls := 0, 0, 0, 0
 	ok := 0
+	// bridgeInjected：native 桥接类只需在**一个** DEX 里落地（所有 classes*.dex
+	// 由同一个 PathClassLoader 加载，类定义全局可见）。重复注入会在产物里形成
+	// 同名类的多份定义，ART 取首份并告警，属于不该有的形态。
+	bridgeInjected := false
 	var names []string
 	for _, u := range units {
 		cls, err := randomDecryptorClass(rnd, used)
@@ -107,6 +131,10 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 			InjectClass: true,
 			// 形态选项：只加密单引用串（默认 false，维持现有强度）。
 			SingleRefOnly: opts.ObfStringSingleRefOnly,
+			// 默认 AES-SIV；逃生开关为 true 时回到旧 keystream。
+			LegacyKeystream: legacy,
+			// 解密器 <clinit> 的 loadLibrary 实参；C7 启用时是假名。
+			LibName: libName,
 		}
 		// A7 登记的反射成员名：无论长度与引用次数，一律纳入本 DEX 的加密集合。
 		// 键与写入方见 passes/reflect.go 的 reflectionNameKey。
@@ -122,7 +150,21 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		if n == 0 {
 			continue
 		}
-		out, stats, err := dex.RebuildWithStats(u.file, dex.RebuildOptions{StringEncrypt: se})
+		// 新版解密器调用 Native.sivDecrypt，因此本 DEX 必须能解析到桥接类。
+		// 桥接类只需落地一次：首个含密文的 DEX 一并注入，其余 DEX 通过同一个
+		// 类加载器解析到它。旧 keystream 路径不需要桥接类。
+		var add *dex.Addition
+		if !legacy && !bridgeInjected {
+			ba, err := dex.NativeBridgeAddition(&dex.NativeBridgeSpec{
+				Class: dex.NativeBridgeClass, LibName: libName, NeedDecrypt: true,
+			})
+			if err != nil {
+				return fmt.Errorf("构造 native 桥接类失败: %w", err)
+			}
+			add = &ba
+			bridgeInjected = true
+		}
+		out, stats, err := dex.RebuildWithStats(u.file, dex.RebuildOptions{StringEncrypt: se, Addition: add})
 		if err != nil {
 			return fmt.Errorf("重建 %s 失败: %w", u.entry.NameString(), err)
 		}
@@ -146,8 +188,15 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 	// 这也是审计曾发现的问题（A2.key 曾等于空口令回退常量）。
 	// 指纹足以核对「两次构建是否用了同一把密钥」，但不泄露密钥本身。
 	keyFP := fmt.Sprintf("%x", key[:4])
-	art.Note("A2 字符串加密：%d 个含密文 DEX，每个自带解密器类（共 %d 个，形如 %s），加密 %d 个字符串（密钥指纹 %s，最短长度 %d，仅单引用串 %v）；%d → %d 字节（增加 %d）",
-		ok, totalCls, decryptorNamesBrief(names), totalEnc, keyFP, minLen, opts.ObfStringSingleRefOnly,
+	scheme := "AES-256-SIV"
+	libDesc := ""
+	if legacy {
+		scheme = "SHA-256 keystream（旧路径，无完整性、不嵌库）"
+	} else {
+		libDesc = fmt.Sprintf("，解密经 Native.sivDecrypt（库名 %s）", libName)
+	}
+	art.Note("A2 字符串加密：%d 个含密文 DEX，每个自带解密器类（共 %d 个，形如 %s），加密 %d 个字符串（%s%s，密钥指纹 %s，最短长度 %d，仅单引用串 %v）；%d → %d 字节（增加 %d）",
+		ok, totalCls, decryptorNamesBrief(names), totalEnc, scheme, libDesc, keyFP, minLen, opts.ObfStringSingleRefOnly,
 		totalBefore, totalAfter, totalAfter-totalBefore)
 	art.Stat("A2.dex", fmt.Sprint(ok))
 	art.Stat("A2.strings", fmt.Sprint(totalEnc))
@@ -337,6 +386,28 @@ func shellPkgOf(opts *config.Options) string {
 	return p
 }
 
+// guardLibNameOf 返回 A2 注入解密器 <clinit> 应调用的守卫库名。
+//
+// 与壳/C7 用的是同一套命名机制：
+//   - 默认（C7 未启用）用 dex.NativeLibName（"apkguard"），与 C1/ensurePayloadGuard
+//     注入的桥接类 <clinit> 一致；
+//   - C7 启用时用 C7 派生出的假名（fakeLibNames，与 C7 改写产物文件名、改写
+//     壳侧 loadLibrary 实参用的是同一个函数），避免 A2 的 loadLibrary 指向
+//     一个已被改名的文件而 UnsatisfiedLinkError。
+//
+// 注意：C7 只改写壳 DEX 的 loadLibrary 实参，不会碰 A2 写回的业务 DEX；因此
+// A2 必须在这里主动对齐 C7 的命名，而不是依赖 C7 事后改写。
+func guardLibNameOf(opts *config.Options) (string, error) {
+	if opts.IsEnabled("C7") {
+		_, lib, err := fakeLibNames(opts.LibFakeName)
+		if err != nil {
+			return "", err
+		}
+		return lib, nil
+	}
+	return dex.NativeLibName, nil
+}
+
 // deriveKey 从用户密钥或随机种子派生 32 字节主密钥。
 //
 // 这里只做「确定性派生」：同样的输入必须得到同样的密钥，
@@ -344,9 +415,8 @@ func shellPkgOf(opts *config.Options) string {
 // 真正「不以明文存在、按设备派生」的密钥管理由 C1 在阶段4接管。
 //
 // 取 SHA-256 的**全部 32 字节**：旧实现只取 sum[0] 一个字节，配合当时
-// 仿射密钥流可被单点已知明文攻破；现在密钥流由 SHA-256 派生，
-// 密钥宽度必须足够（32 字节），否则暴力枚举 256 种密钥即可解密全部字符串。
-// deriveKey 派生 A2 字符串加密的密钥。
+// 仿射密钥流可被单点已知明文攻破；现在交由 AES-256-SIV 使用，
+// 密钥宽度必须足够（32 字节）。
 //
 // 口令（dexKey 或 seed）都为空时**生成随机密钥**，绝不回退到固定常量：
 // 常量密钥意味着任何拿到产物的人都能解开全部字符串密文。

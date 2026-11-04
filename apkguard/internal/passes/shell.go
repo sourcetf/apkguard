@@ -901,6 +901,16 @@ func embedGuardLibs(art *pipeline.Artifact) (int, []native.AbiLib, error) {
 	return added, target, nil
 }
 
+// EnsureGuardLibs 把守卫库按产物支持的 ABI 补进 lib/，返回本次真正新增的库个数。
+//
+// 供「需要原生守卫库但不经由 C1」的 Pass 复用（当前是 A2：默认走 AES-SIV，
+// 解密只能由 Native.sivDecrypt 完成，因此必须自带守卫库）。ABI 选择规则与
+// C1 完全一致（复用 embedGuardLibs），此处只做导出与错误收窄。
+func EnsureGuardLibs(art *pipeline.Artifact) (int, error) {
+	added, _, err := embedGuardLibs(art)
+	return added, err
+}
+
 // injectNativeBridge 往壳 DEX 注入 native 桥接类（loadLibrary + sig，
 // needDerive 时再加 derive，sivDecrypt 始终声明）。
 //

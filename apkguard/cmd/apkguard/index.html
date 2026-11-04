@@ -107,6 +107,7 @@
         <label class="row"><span>库也改名</span><input type="checkbox" id="rename_libraries" title="A1 把第三方库（androidx/Kotlin stdlib 等）也纳入改名。默认关闭：库代码改名可能破坏反射/序列化/ServiceLoader 等按类名查找的机制，开启前请用目标应用回归。"></label>
         <label class="row"><span>最短加密</span><input type="number" id="obf_string_min" value="0" placeholder="0 = 全部（A2）"></label>
         <label class="row"><span>仅单引用串</span><input type="checkbox" id="obf_string_single_ref" title="A2 只加密恰好被 1 条 const-string 引用的字符串。会降低保护强度：多引用串将留明文，仅为让加密分布更像参考样本，不建议常规使用。"></label>
+        <label class="row"><span>旧密钥流</span><input type="checkbox" id="strenc_legacy_keystream" title="A2 回到旧的 SHA-256 keystream 实现（自造构造、无完整性保护），而不是默认的 AES-256-SIV。旧路径不嵌入守卫库 lib/，仅用于不方便携带原生库的兼容性场景。"></label>
         <label class="row"><span>垃圾顶文件</span><input type="number" id="junk_top_count" value="800" placeholder="800（A10）"></label>
         <label class="row"><span>垃圾深目录</span><input type="number" id="junk_dir_count" value="400" placeholder="400（A10）"></label>
         <label class="row"><span>深目录层数</span><input type="number" id="junk_dir_depth" value="16" placeholder="16（A10）"></label>
@@ -241,6 +242,7 @@ function collect() {
     rename_libraries: checked('rename_libraries'),
     obf_string_min: num('obf_string_min', 0),
     obf_string_single_ref: checked('obf_string_single_ref'),
+    strenc_legacy_keystream: checked('strenc_legacy_keystream'),
     seed: val('seed'),
     fake_dex_count: num('fake_dex_count', 1),
     fake_dex_size: num('fake_dex_size', 80000),
