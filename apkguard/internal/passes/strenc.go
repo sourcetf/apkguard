@@ -17,6 +17,27 @@ import (
 
 // ---- A2 字符串加密 ----
 
+// sharedKeyA2SivWrapper 是 A2 交给 B3 的共享键：值是非空的包装类描述符，
+// 表示「B3 需要在壳 DEX 里注入 Siv 包装类」。
+//
+// 只有 A2 知道是否真的有 DEX 被注入了密文（达到 MinLen）；无密文时不该往壳
+// DEX 里塞一个没人引用的类。因此由 A2 决定并写入，B3 读取。
+const sharedKeyA2SivWrapper = "A2.siv_wrapper"
+
+// mergePassAdditions 把 b 追加进 a（a 可为 nil），返回合并结果。
+//
+// 与 dex 包内部的 mergeAddition 同义，但 Pass 层需要它把「桥接类」与「Siv
+// 包装类」两个 Addition 合并后一次性重建（同一份 DEX 里）。
+func mergePassAdditions(a dex.Addition, b dex.Addition) *dex.Addition {
+	out := a
+	out.Types = append(out.Types, b.Types...)
+	out.Protos = append(out.Protos, b.Protos...)
+	out.Methods = append(out.Methods, b.Methods...)
+	out.Fields = append(out.Fields, b.Fields...)
+	out.Classes = append(out.Classes, b.Classes...)
+	return &out
+}
+
 // encryptString 把 DEX 中的 const-string 常量加密为密文，运行时调用解密方法还原。
 //
 // 多 DEX 场景的处理方式对齐参考样本：**每个含密文的 DEX 各自注入一份解密器**
@@ -88,6 +109,19 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		art.Stat("A2.guard_libs", fmt.Sprint(added))
 	}
 
+	// 跨类加载器的原生调用转发（见 dex.SivWrapperAddition 与 StringEncrypt.Bridge）。
+	//
+	// 加壳后（B1+B2+B3）业务 DEX 由我们自己的 DexClassLoader 加载，而现代 APK 的
+	// extractNativeLibs=false 让安装后的 lib/<abi>/ 是空目录——业务 DEX 里的
+	// System.loadLibrary 必然 UnsatisfiedLinkError（只有系统类加载器能按 APK 内
+	// 路径找到 .so）。因此：
+	//   - 有壳：解密器改为调用**壳 DEX**（系统类加载器）里的包装类 Siv，业务 DEX
+	//     不再 loadLibrary、不再引用 Native；包装类由 B3 注入壳 DEX。
+	//   - 无壳：业务 DEX 由系统类加载器加载，桥接类 + 包装类直接注入业务 DEX。
+	// 两条路径统一走包装类，解密器字节码完全一致。
+	shellActive := opts.IsEnabled("B1") && opts.IsEnabled("B2") && opts.IsEnabled("B3")
+	wrapperClass := "L" + shellPkgOf(opts) + "/Siv;"
+
 	// 解密器类名由 seed 派生（同一 seed 可复现），形态对齐样本
 	// （Lcom/rjurepzl/cf/iimlqh;）：随机包1/随机包2/随机短名，全小写。
 	// used 先装入**全部 DEX 的全部字符串**（类型描述符也在池内），再逐 DEX
@@ -136,6 +170,12 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 			// 解密器 <clinit> 的 loadLibrary 实参；C7 启用时是假名。
 			LibName: libName,
 		}
+		// 非 legacy：解密器一律经包装类转发原生解密（有壳时包装类在壳 DEX、
+		// 无壳时随桥接类一起注入业务 DEX），因此解密器不注入 <clinit>、不引用
+		// loadLibrary/Native。legacy 路径是纯 Java，不设 Bridge。
+		if !legacy {
+			se.Bridge = wrapperClass
+		}
 		// A7 登记的反射成员名：无论长度与引用次数，一律纳入本 DEX 的加密集合。
 		// 键与写入方见 passes/reflect.go 的 reflectionNameKey。
 		if v, ok := art.Get(reflectionNameKey).(map[string]bool); ok && len(v) > 0 {
@@ -150,18 +190,28 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		if n == 0 {
 			continue
 		}
-		// 新版解密器调用 Native.sivDecrypt，因此本 DEX 必须能解析到桥接类。
-		// 桥接类只需落地一次：首个含密文的 DEX 一并注入，其余 DEX 通过同一个
-		// 类加载器解析到它。旧 keystream 路径不需要桥接类。
+		// 无壳时：业务 DEX 由系统类加载器加载，桥接类（自带 loadLibrary）与
+		// 包装类都直接注入业务 DEX，两者只需落地一次（所有 classes*.dex 由同一个
+		// PathClassLoader 加载，类定义全局可见）。
+		//
+		// 有壳时这里**不注入**：桥接类由 B3（C1 未启用）或 C1 注入壳 DEX，包装类
+		// 由 B3 按 A2 登记的 sharedKeyA2SivWrapper 注入壳 DEX——业务 DEX 里既没有
+		// 桥接类也没有 loadLibrary。
+		//
+		// legacy 路径是纯 Java/JCA，不需要桥接类与包装类。
 		var add *dex.Addition
-		if !legacy && !bridgeInjected {
+		if !legacy && !shellActive && !bridgeInjected {
 			ba, err := dex.NativeBridgeAddition(&dex.NativeBridgeSpec{
 				Class: dex.NativeBridgeClass, LibName: libName, NeedDecrypt: true,
 			})
 			if err != nil {
 				return fmt.Errorf("构造 native 桥接类失败: %w", err)
 			}
-			add = &ba
+			wa, err := dex.SivWrapperAddition(&dex.SivWrapperSpec{Class: wrapperClass})
+			if err != nil {
+				return fmt.Errorf("构造 Siv 包装类失败: %w", err)
+			}
+			add = mergePassAdditions(ba, wa)
 			bridgeInjected = true
 		}
 		out, stats, err := dex.RebuildWithStats(u.file, dex.RebuildOptions{StringEncrypt: se, Addition: add})
@@ -182,6 +232,14 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 		ok++
 	}
 
+	// 有壳且确有解密器时，登记「壳 DEX 需要注入 Siv 包装类」给 B3。
+	//
+	// 用 Shared 而不是让 B3 自行推导：A2 是否真的注入了解密器（有 DEX 达到
+	// MinLen）只有 A2 知道；未注入时 B3 不该往壳 DEX 里塞一个用不到的类。
+	if !legacy && shellActive && ok > 0 {
+		art.Put(sharedKeyA2SivWrapper, wrapperClass)
+	}
+
 	// 只输出密钥的 4 字节指纹，绝不输出完整密钥。
 	//
 	// 日志与统计会随产物一起交付/存档，完整密钥写进去等于公开——
@@ -192,8 +250,10 @@ func (e *encryptString) Run(_ context.Context, art *pipeline.Artifact, opts *con
 	libDesc := ""
 	if legacy {
 		scheme = "SHA-256 keystream（旧路径，无完整性、不嵌库）"
+	} else if shellActive {
+		libDesc = fmt.Sprintf("，解密经壳侧包装类 %s 转发到 Native.sivDecrypt（库名 %s）", wrapperClass, libName)
 	} else {
-		libDesc = fmt.Sprintf("，解密经 Native.sivDecrypt（库名 %s）", libName)
+		libDesc = fmt.Sprintf("，解密经业务 DEX 内包装类 %s 转发到 Native.sivDecrypt（库名 %s）", wrapperClass, libName)
 	}
 	art.Note("A2 字符串加密：%d 个含密文 DEX，每个自带解密器类（共 %d 个，形如 %s），加密 %d 个字符串（%s%s，密钥指纹 %s，最短长度 %d，仅单引用串 %v）；%d → %d 字节（增加 %d）",
 		ok, totalCls, decryptorNamesBrief(names), totalEnc, scheme, libDesc, keyFP, minLen, opts.ObfStringSingleRefOnly,

@@ -473,6 +473,23 @@ func (c *classLoader) Run(_ context.Context, art *pipeline.Artifact, opts *confi
 	if err != nil {
 		return err
 	}
+	// A2 在有壳场景下把原生解密调用转发到壳 DEX 里的 Siv 包装类（见
+	// passes/strenc.go）。这里按 A2 登记的共享键把包装类注入壳 DEX：壳类由
+	// 系统类加载器加载，其命名空间能解析 APK 内 lib/<abi>/*.so，因此即使应用
+	// extractNativeLibs=false（业务 DEX 的 DexClassLoader 找不到 .so）也能工作。
+	//
+	// 桥接类（声明 sivDecrypt native 方法并 loadLibrary）由 ensurePayloadGuard
+	// 或 C1 注入同一份壳 DEX，包装类只登记对它的引用。
+	if w, _ := art.Get(sharedKeyA2SivWrapper).(string); w != "" && !dexHasClass(f, w) {
+		wa, werr := dex.SivWrapperAddition(&dex.SivWrapperSpec{Class: w})
+		if werr != nil {
+			return fmt.Errorf("构造 Siv 包装类失败: %w", werr)
+		}
+		add.Classes = append(add.Classes, wa.Classes...)
+		add.Types = append(add.Types, wa.Types...)
+		add.Protos = append(add.Protos, wa.Protos...)
+		add.Methods = append(add.Methods, wa.Methods...)
+	}
 	out, err := dex.Rebuild(f, dex.RebuildOptions{Addition: &add})
 	if err != nil {
 		return fmt.Errorf("注入 Loader 失败: %w", err)
@@ -649,6 +666,24 @@ func checkClassOf(info *shellInfo, id string) string {
 		return ""
 	}
 	return info.Checks[id]
+}
+
+// dexHasClass 判断一个已解析的 DEX 里是否已定义指定类（描述符）。
+//
+// 用于注入前的幂等保护：若壳 DEX 里恰好已有同名类（例如重复执行 B3），
+// 再次注入会产生 class_def 中 class_idx 重复的非法 DEX。
+func dexHasClass(f *dex.File, desc string) bool {
+	found := false
+	if f == nil {
+		return false
+	}
+	_ = f.Classes(func(_ uint32, _ dex.ClassDef, name string) error {
+		if name == desc {
+			found = true
+		}
+		return nil
+	})
+	return found
 }
 
 // injectShellClass 把一段类定义注入 B2 建好的壳 DEX。

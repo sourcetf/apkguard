@@ -397,3 +397,126 @@ func TestDecryptorStringsIncludesBridge(t *testing.T) {
 		}
 	}
 }
+
+// TestSivWrapperAdditionShape 断言 Siv 包装类的形态：
+//   - 只有一个 public static d([B[B[B)[B 方法，**没有** <clinit>；
+//   - 方法体调用桥接类的 sivDecrypt，自身不做 loadLibrary。
+//
+// 这是「业务 DEX 里发起的原生调用改由壳侧包装类转发」这一方案的核心构造。
+func TestSivWrapperAdditionShape(t *testing.T) {
+	const cls = "Lcom/apkguard/shell/Siv;"
+	add, err := SivWrapperAddition(&SivWrapperSpec{Class: cls})
+	if err != nil {
+		t.Fatalf("构造 Siv 包装类失败: %v", err)
+	}
+	if len(add.Classes) != 1 {
+		t.Fatalf("包装类应注入 1 个类，实际 %d", len(add.Classes))
+	}
+	c := add.Classes[0]
+	if c.Name != cls {
+		t.Fatalf("包装类名 = %q，期望 %q", c.Name, cls)
+	}
+	if len(c.Methods) != 1 {
+		t.Fatalf("包装类应只有 1 个方法（无 <clinit>），实际 %d", len(c.Methods))
+	}
+	m := c.Methods[0]
+	if m.Name != SivWrapperMethod {
+		t.Fatalf("包装方法名 = %q，期望 %q", m.Name, SivWrapperMethod)
+	}
+	if m.Code == nil {
+		t.Fatal("包装方法缺少方法体")
+	}
+	hasSiv := false
+	for _, p := range m.Code.Patches {
+		if p.Ref.Kind == RefMethod {
+			if p.Ref.Method.Class == NativeBridgeClass && p.Ref.Method.Name == NativeDecrypt {
+				hasSiv = true
+			}
+			if p.Ref.Method.Name == "loadLibrary" {
+				t.Fatal("包装类不应调用 loadLibrary（它不含 <clinit>）")
+			}
+		}
+	}
+	if !hasSiv {
+		t.Fatal("包装方法未调用桥接类的 sivDecrypt")
+	}
+	// 类体里不得出现 <clinit>，且 Addition 里不得登记 System/loadLibrary。
+	for _, cm := range c.Methods {
+		if cm.Name == "<clinit>" {
+			t.Fatal("包装类不应有 <clinit>")
+		}
+	}
+	for _, ty := range add.Types {
+		if ty == descSystem {
+			t.Fatal("包装类不应登记 java/lang/System 类型引用")
+		}
+	}
+	for _, ms := range add.Methods {
+		if ms.Name == "loadLibrary" {
+			t.Fatal("包装类不应登记 loadLibrary 方法引用")
+		}
+	}
+}
+
+// TestDecryptorBridgeShape 断言 StringEncrypt.Bridge 非空时解密器的形态：
+//   - 不再注入 <clinit>（不加载库）；
+//   - 解密方法调用的是包装类的 d，而不是 Native.sivDecrypt；
+//   - Addition 里不登记 System/loadLibrary，因此业务 DEX 字符串池不会出现
+//     "loadLibrary"，也不出现对桥接类的直接引用。
+func TestDecryptorBridgeShape(t *testing.T) {
+	const cls = "Lx/Dec;"
+	const wrap = "Lcom/apkguard/shell/Siv;"
+	add, err := stringDecryptorAddition(&StringEncrypt{
+		Class: cls, MethodName: "a", Key: testKey(0x22), InjectClass: true, Bridge: wrap,
+	})
+	if err != nil {
+		t.Fatalf("构造 Bridge 解密器失败: %v", err)
+	}
+	if len(add.Classes) != 1 {
+		t.Fatalf("应注入 1 个类，实际 %d", len(add.Classes))
+	}
+	c := add.Classes[0]
+	if len(c.Methods) != 1 || c.Methods[0].Name != "a" {
+		t.Fatalf("Bridge 路径解密器不应有 <clinit>，实际方法 %+v", methodNames(c.Methods))
+	}
+	hasWrapper, hasNative := false, false
+	for _, p := range c.Methods[0].Code.Patches {
+		if p.Ref.Kind != RefMethod {
+			continue
+		}
+		if p.Ref.Method.Class == wrap && p.Ref.Method.Name == SivWrapperMethod {
+			hasWrapper = true
+		}
+		if p.Ref.Method.Class == NativeBridgeClass {
+			hasNative = true
+		}
+	}
+	if !hasWrapper {
+		t.Fatal("解密方法未调用包装类的 d")
+	}
+	if hasNative {
+		t.Fatal("Bridge 路径解密方法仍直接引用 Native 桥接类")
+	}
+	for _, ty := range add.Types {
+		if ty == descSystem || ty == NativeBridgeClass {
+			t.Fatalf("Bridge 路径不应登记 %s 类型引用", ty)
+		}
+	}
+	for _, ms := range add.Methods {
+		if ms.Name == "loadLibrary" || ms.Name == NativeDecrypt {
+			t.Fatalf("Bridge 路径不应登记方法引用 %s", ms.Name)
+		}
+		if ms.Class == NativeBridgeClass {
+			t.Fatal("Bridge 路径不应登记对 Native 桥接类的方法引用")
+		}
+	}
+}
+
+// methodNames 返回方法名列表，仅用于测试报错可读性。
+func methodNames(ms []ClassMethod) []string {
+	out := make([]string, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.Name)
+	}
+	return out
+}

@@ -77,6 +77,89 @@ const (
 	NativeSig = "sig"
 )
 
+// SivWrapperMethod 是 Siv 包装类里转发方法的固定名字。
+//
+// 与装载器里的 r/c/w/i 一样是固定短名，不由 seed 派生：包装类位于壳包下，
+// 名字固定便于 Pass 层（A2 与 B3）两侧独立推导出同一个引用，无需共享状态。
+const SivWrapperMethod = "d"
+
+// SivWrapperSpec 描述一个「纯 Java 包装类」：它把原生解密调用转发给桥接类，
+// 自身不含任何 native 方法，也不做 loadLibrary。
+//
+// 为什么要单独一个包装类：当业务 DEX 由我们自己的 DexClassLoader 加载
+// （启用了 B1/B2/B3 加壳）时，业务 DEX 里的类处于 DexClassLoader 的命名空间，
+// 而现代 APK 的 extractNativeLibs=false 会让 lib/<abi>/ 在安装后是**空目录**，
+// 只有系统类加载器能按 APK 内路径找到 .so。于是业务 DEX 里的
+// System.loadLibrary 必然抛 UnsatisfiedLinkError。
+//
+// 把调用转发到壳 DEX（系统类加载器）里的这个包装类后：跨类加载器的 **Java**
+// 调用是允许的（我们的 DexClassLoader 的 parent 就是系统类加载器），而真正的
+// 原生绑定发生在系统类加载器的命名空间里——那里 loadLibrary 一直能成功。
+type SivWrapperSpec struct {
+	// Class 是包装类的描述符，形如 "Lcom/apkguard/shell/Siv;"。
+	Class string
+	// Bridge 是桥接类描述符（声明 sivDecrypt 的那个类）；留空回退
+	// NativeBridgeClass。
+	Bridge string
+}
+
+// SivWrapperAddition 构造包装类的 Addition。
+//
+// 等价 Java：
+//
+//	public final class Siv {
+//	    public static byte[] d(byte[] key, byte[] ad, byte[] blob) {
+//	        return com.apkguard.nativebridge.Native.sivDecrypt(key, ad, blob);
+//	    }
+//	}
+//
+// 包装类只登记对桥接类 sivDecrypt 的**引用**，不定义它：桥接类的类体由
+// C1/ensurePayloadGuard（壳侧）或 A2（纯混淆、无壳）另行注入到同一个 DEX。
+func SivWrapperAddition(spec *SivWrapperSpec) (Addition, error) {
+	if spec == nil || spec.Class == "" {
+		return Addition{}, fmt.Errorf("dex: Siv 包装类名为空")
+	}
+	if spec.Class == NativeBridgeClass {
+		return Addition{}, fmt.Errorf("dex: Siv 包装类不能与 native 桥接类同名（%s）", NativeBridgeClass)
+	}
+	bridge := spec.Bridge
+	if bridge == "" {
+		bridge = NativeBridgeClass
+	}
+	protoSiv := ProtoSpec{Ret: descByteArray, Params: []string{descByteArray, descByteArray, descByteArray}}
+	bridgeSiv := MethodSpec{Class: bridge, Name: NativeDecrypt, Proto: protoSiv}
+	wrapperD := MethodSpec{Class: spec.Class, Name: SivWrapperMethod, Proto: protoSiv}
+
+	// 3 个引用入参即全部寄存器（v0..v2），无需额外局部寄存器。
+	a := NewAsm()
+	if err := a.InvokeStatic([]int{0, 1, 2}, bridgeSiv); err != nil {
+		return Addition{}, err
+	}
+	a.MoveResultObject(0)
+	a.ReturnObject(0)
+	insns, patches, err := a.Assemble()
+	if err != nil {
+		return Addition{}, err
+	}
+
+	return Addition{
+		Types:   []string{spec.Class, bridge, descByteArray},
+		Protos:  []ProtoSpec{protoSiv},
+		Methods: []MethodSpec{wrapperD, bridgeSiv},
+		Classes: []ClassSpec{{
+			Name:   spec.Class,
+			Super:  descObject,
+			Access: accPublic | accFinal, // 纯静态转发类
+			Methods: []ClassMethod{{
+				Name:   SivWrapperMethod,
+				Proto:  protoSiv,
+				Access: accPublic | accStatic,
+				Code:   &CodeBlob{Registers: 3, Ins: 3, Outs: 3, Insns: insns, Patches: patches},
+			}},
+		}},
+	}, nil
+}
+
 // NativeBridgeAddition 构造桥接类定义。
 //
 // 等价 Java：

@@ -74,7 +74,22 @@ type StringEncrypt struct {
 	// 壳侧 loadLibrary 实参，但它只改写壳 DEX——因此 Pass 层在 C7 启用时必须
 	// 把 C7 派生出的假名传进来（见 passes/guardLibNameOf），否则 A2 注入的
 	// loadLibrary 会与实际文件名不符而 UnsatisfiedLinkError。
+	//
+	// 仅当 Bridge 为空（解密器直接调用 Native.sivDecrypt）时才使用。
 	LibName string
+	// Bridge 非空时，解密器改为调用该「纯 Java 包装类」的静态方法完成原生
+	// 解密（签名 (byte[],byte[],byte[]) -> byte[]），**不再**注入 <clinit>、
+	// 也不引用 loadLibrary 或 Native 桥接类。值形如 "Lcom/apkguard/shell/Siv;"，
+	// 见 SivWrapperAddition。
+	//
+	// 用于业务 DEX 由我们自己的 DexClassLoader 加载的场景（B1/B2/B3 加壳后）：
+	// 现代 APK 的 extractNativeLibs=false 让安装后的 lib/<abi>/ 是空目录，
+	// 业务 DEX 里的 System.loadLibrary 必然 UnsatisfiedLinkError。把调用转发到
+	// 壳侧（系统类加载器命名空间）的包装类即可，原生绑定发生在能解析 APK 内
+	// lib/<abi>/*.so 的那一侧。
+	//
+	// 留空时保持旧行为（解密器直接 Native.sivDecrypt + <clinit> loadLibrary）。
+	Bridge string
 	// Key 是主密钥，32 字节。
 	//
 	// 旧实现是单字节且密钥流可被单点已知明文攻破；现在是 32 字节主密钥，
@@ -445,7 +460,14 @@ func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 
 	strInit := MethodSpec{Class: "Ljava/lang/String;", Name: "<init>", Proto: protoInit}
 	decB64 := MethodSpec{Class: "Landroid/util/Base64;", Name: "decode", Proto: protoDecode}
-	sivDec := MethodSpec{Class: NativeBridgeClass, Name: NativeDecrypt, Proto: protoSiv}
+	// 原生解密的调用目标：默认是桥接类自身的 sivDecrypt（旧行为）；se.Bridge
+	// 非空时改指壳侧包装类的转发方法——此时解密器不注入 <clinit>、不引用
+	// loadLibrary/System，业务 DEX 里不再出现任何库名。
+	sivClass, sivName := NativeBridgeClass, NativeDecrypt
+	if se.Bridge != "" {
+		sivClass, sivName = se.Bridge, SivWrapperMethod
+	}
+	sivDec := MethodSpec{Class: sivClass, Name: sivName, Proto: protoSiv}
 	rtInit := MethodSpec{Class: "Ljava/lang/RuntimeException;", Name: "<init>", Proto: protoV}
 	loadLib := MethodSpec{Class: descSystem, Name: "loadLibrary", Proto: protoLoad}
 	decrypt := MethodSpec{Class: se.Class, Name: se.MethodName, Proto: protoStr}
@@ -460,10 +482,18 @@ func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 		Types: []string{
 			se.Class, "[B", "I", "V",
 			"Ljava/lang/String;", "Landroid/util/Base64;",
-			NativeBridgeClass, "Ljava/lang/RuntimeException;", descSystem,
+			sivClass, "Ljava/lang/RuntimeException;",
 		},
-		Protos:  []ProtoSpec{protoStr, protoInit, protoDecode, protoSiv, protoV, protoLoad},
-		Methods: []MethodSpec{decrypt, strInit, decB64, sivDec, rtInit, loadLib},
+		Protos:  []ProtoSpec{protoStr, protoInit, protoDecode, protoSiv, protoV},
+		Methods: []MethodSpec{decrypt, strInit, decB64, sivDec, rtInit},
+	}
+	// 只有在「解密器自己加载库」的分支才登记 System/loadLibrary：Bridge 路径
+	// 下多登记一个 loadLibrary 方法引用会把 "loadLibrary" 重新写进业务 DEX 的
+	// 字符串池，破坏「业务 DEX 不再出现库加载」这一形态断言。
+	if se.Bridge == "" {
+		add.Types = append(add.Types, descSystem)
+		add.Protos = append(add.Protos, protoLoad)
+		add.Methods = append(add.Methods, loadLib)
 	}
 	if !se.InjectClass {
 		return add, nil
@@ -473,22 +503,36 @@ func stringDecryptorAddition(se *StringEncrypt) (Addition, error) {
 	if err != nil {
 		return Addition{}, err
 	}
-	clinitCode, err := stringDecryptorClinit(libName, loadLib)
-	if err != nil {
-		return Addition{}, err
+	if se.Bridge == "" {
+		// 旧行为：解密器自带 <clinit> 加载守卫库（适用于业务 DEX 由系统类
+		// 加载器加载的场景，例如未加壳的纯混淆产物）。
+		clinitCode, err := stringDecryptorClinit(libName, loadLib)
+		if err != nil {
+			return Addition{}, err
+		}
+		add.Methods = append(add.Methods, clinit)
+		add.Classes = []ClassSpec{{
+			Name:  se.Class,
+			Super: descObject,
+			// 类级标志只能是「类能用的那些位」：STATIC 是**成员**标志，
+			// 写在 class_def 上属于非法组合（真实工具链产出的 DEX 里
+			// 五万多个类没有一个这么写）。纯静态工具类用 PUBLIC | FINAL。
+			Access: accPublic | accFinal, // 纯静态工具类
+			Methods: []ClassMethod{
+				// <clinit> 先加载守卫库：sivDecrypt 是 native 方法，库没加载
+				// 会以 UnsatisfiedLinkError 崩溃，且崩溃点离原因很远。
+				{Name: "<clinit>", Proto: protoV, Access: accStatic, Code: clinitCode},
+				{Name: se.MethodName, Proto: protoStr, Access: accPublic | accStatic, Code: code},
+			},
+		}}
+		return add, nil
 	}
-	add.Methods = append(add.Methods, clinit)
+	// Bridge 路径：无 <clinit>，原生加载由壳侧包装类所在命名空间完成。
 	add.Classes = []ClassSpec{{
-		Name:  se.Class,
-		Super: descObject,
-		// 类级标志只能是「类能用的那些位」：STATIC 是**成员**标志，
-		// 写在 class_def 上属于非法组合（真实工具链产出的 DEX 里
-		// 五万多个类没有一个这么写）。纯静态工具类用 PUBLIC | FINAL。
+		Name:   se.Class,
+		Super:  descObject,
 		Access: accPublic | accFinal, // 纯静态工具类
 		Methods: []ClassMethod{
-			// <clinit> 先加载守卫库：sivDecrypt 是 native 方法，库没加载
-			// 会以 UnsatisfiedLinkError 崩溃，且崩溃点离原因很远。
-			{Name: "<clinit>", Proto: protoV, Access: accStatic, Code: clinitCode},
 			{Name: se.MethodName, Proto: protoStr, Access: accPublic | accStatic, Code: code},
 		},
 	}}
