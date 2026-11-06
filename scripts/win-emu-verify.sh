@@ -40,7 +40,7 @@ run_app() { # $1=app $2=pkg $3=act $4=apk
   say "---- $app ----"
   [ -f "$apk" ] || { say "  缺少产物: $apk"; return; }
   $ADB uninstall "$pkg" >/dev/null 2>&1
-  say -n "  安装: "; $ADB install -r -t "$apk" 2>&1 | tr -d '\r' | tail -1
+  printf "  安装: "; $ADB install -r -t "$apk" 2>&1 | tr -d '\r' | tail -1
   $ADB shell am force-stop "$pkg" >/dev/null 2>&1
   $ADB logcat -c
   $ADB shell am start -n "$pkg/$act" >/dev/null 2>&1
@@ -74,14 +74,22 @@ run_app dhizuku-B5 com.rosan.dhizuku .ui.activity.SettingsActivity "$OUT/dhizuku
 say
 say "################ 4) B9 双 APK 投放器（宿主经原生 SIV 解密插件）################"
 $ADB uninstall "$HOST_PKG" >/dev/null 2>&1
-say -n "  宿主安装: "; $ADB install -r -t "$OUT/dhizuku-B9-host.apk" 2>&1 | tr -d '\r' | tail -1
+printf "  宿主安装: "; $ADB install -r -t "$OUT/dhizuku-B9-host.apk" 2>&1 | tr -d '\r' | tail -1
 $ADB logcat -c
 $ADB shell am start -n "$HOST_PKG/.B" >/dev/null 2>&1
 sleep 15
 say "  宿主 pid: $($ADB shell pidof "$HOST_PKG" 2>/dev/null | tr -d '\r')"
 say "  真实异常: $(real_crash)"
-say "  落地目录:"
-$ADB shell ls -la "/sdcard/Android/data/$HOST_PKG/files/plugins/" 2>/dev/null | tr -d '\r' | sed 's/^/    /'
+say "  落地目录（安装会话写完才出现，最多等 30 秒）:"
+found=""
+for _ in $(seq 1 10); do
+  found="$($ADB shell ls -la "/sdcard/Android/data/$HOST_PKG/files/plugins/" 2>/dev/null | tr -d '\r')"
+  case "$found" in
+    *.apk*) break ;;
+  esac
+  sleep 3
+done
+if [ -n "$found" ]; then printf '%s\n' "$found" | sed 's/^/    /'; else say "    （没找到落地文件）"; fi
 
 say
 say "=== DONE ==="
